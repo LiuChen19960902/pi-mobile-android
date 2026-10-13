@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 31 以下的全量备份同样排除偏好（网关地址列表） -->
+<full-backup-content>
+    <exclude domain="file" path="datastore/" />
+</full-backup-content>

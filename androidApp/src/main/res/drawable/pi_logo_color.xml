@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pi 官网 logo.svg 的原始路径；收紧画布留白，保持与现有单色标志相同的视觉大小。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group android:translateX="-144" android:translateY="-144">
+        <path
+            android:fillColor="@color/pi_logo_coral"
+            android:pathData="M165.29 165.29H517.36V400H400V282.65H165.29Z" />
+        <path
+            android:fillColor="@color/pi_logo_blue"
+            android:pathData="M165.29 282.65H282.65V400H400V517.36H282.65V634.72H165.29Z" />
+        <path
+            android:fillColor="@color/pi_logo_gold"
+            android:pathData="M517.36 400H634.72V634.72H517.36Z" />
+    </group>
+</vector>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="launcher_icon_background">#FFFFFF</color>
+    <color name="pi_logo_coral">#F09082</color>
+    <color name="pi_logo_blue">#4D9ABF</color>
+    <color name="pi_logo_gold">#F1BE58</color>
+    <color name="whale_foreground">#000000</color>
+    <color name="splash_background">#FFFFFF</color>
+</resources>

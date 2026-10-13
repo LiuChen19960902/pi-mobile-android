@@ -1,0 +1,46 @@
+# 构建产物与本地状态
+build/
+.gradle/
+.kotlin/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# 本地环境与凭据
+.env
+.env.*
+!.env.example
+
+# Android 签名密钥与可分发产物（误提交即泄漏，永不入库）
+*.jks
+*.keystore
+*.key
+*.pem
+*.p12
+*.pfx
+key.properties
+google-services.json
+*.apk
+*.aab
+
+# 私有开发资料与 agent 运行状态，不进入公开仓库
+# 已跟踪文件不受 ignore 影响；首次公开须从筛选后的快照发布。
+.agents/
+.pi/
+AGENTS.md
+Docs/reviews/
+bug-full.md
+gateway-optim.md
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# CodeGraph 索引（本机数据，不入库）
+.codegraph/

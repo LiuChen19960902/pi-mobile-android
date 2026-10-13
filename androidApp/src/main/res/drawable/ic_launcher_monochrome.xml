@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 系统主题图标仅使用标志的单色轮廓，不把图标背景纳入遮罩。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <size android:width="108dp" android:height="108dp" />
+            <solid android:color="@android:color/transparent" />
+        </shape>
+    </item>
+    <item
+        android:width="40dp"
+        android:height="40dp"
+        android:drawable="@drawable/pi_logo"
+        android:gravity="center" />
+</layer-list>

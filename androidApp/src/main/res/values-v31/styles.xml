@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PiMobile.Starting" parent="Theme.PiMobile">
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_whale</item>
+        <item name="android:windowSplashScreenAnimationDuration">200</item>
+        <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+    </style>
+</resources>

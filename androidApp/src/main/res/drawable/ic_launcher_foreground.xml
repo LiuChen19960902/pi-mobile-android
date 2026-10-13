@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 108dp 画布中居中放置40dp Pi标志，位于自适应遮罩安全区内。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <size
+                android:width="108dp"
+                android:height="108dp" />
+            <solid android:color="@android:color/transparent" />
+        </shape>
+    </item>
+    <item
+        android:width="40dp"
+        android:height="40dp"
+        android:drawable="@drawable/pi_logo_color"
+        android:gravity="center" />
+</layer-list>

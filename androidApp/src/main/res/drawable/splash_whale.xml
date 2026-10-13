@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Android 12+ 会遮罩启动图标；方形透明画布可避免非正方形鲸鱼被居中裁切。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <size
+                android:width="108dp"
+                android:height="108dp" />
+            <solid android:color="@android:color/transparent" />
+        </shape>
+    </item>
+    <item
+        android:width="56dp"
+        android:height="56dp"
+        android:drawable="@drawable/pi_logo"
+        android:gravity="center" />
+</layer-list>
