@@ -4,8 +4,6 @@
 
 https://github.com/user-attachments/assets/110ed9f9-a819-488e-ac77-33d44402a2b2
 
-[下载演示视频](https://github.com/LiuChen19960902/pi-mobile-android/releases/download/v1.0.0/pi-mobile-demo.mp4) · 46 秒，含声音
-
 链路只在你自己的电脑和手机之间：
 
 ```text
