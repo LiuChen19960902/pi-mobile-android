@@ -66,7 +66,8 @@ export ANDROID_HOME=/path/to/android-sdk
 
 ## 持续集成
 
-CI 流水线不在仓库文件里，在所用 Git 托管平台的 CI 界面按以下定义创建两条（手机仓一条、网关仓一条）：
+[Android CI](.github/workflows/ci.yml)在GitHub托管Linux上运行文档与脚本检查、共享层和Android JVM测试、debug构建，并要求网关一致性测试实际执行且没有跳过。配套网关固定到工作流中的提交，CI先安装其依赖。网关私有时需要名为GATEWAY_CI_SSH_KEY的只读单仓deploy key；公开后可删除该secret，使用普通公开检出。
 
-- 手机仓：Linux runner + JDK 17 + Node 22.19+ + [uv](https://docs.astral.sh/uv/)；先跑文档检查 `uv run --no-project python scripts/check-docs.py` 与 `uv run --no-project python -m unittest discover -s scripts -p 'test_*.py'`；同级检出网关仓（跨仓一致性测试 `GatewayConformanceTest` 需要它，缺失时用例自动跳过）；网关仓先 `npm ci`；手机仓跑 `./gradlew :shared:testAndroidHostTest :androidApp:testDebugUnitTest`
-- 网关仓（`pi-mobile-gateway`）：Node 22.19+；`npm ci` 后跑 `npm run check`（类型检查、格式检查和单测）
+网关仓的CI执行类型检查、lint与串行单测。两端有协议变化时同步维护配套提交与一致性用例。真实模型、真机、正式签名APK不属于普通PR检查；CI通过不代替这些验证。
+
+工作流与权限取舍见[GitHub协作记录](.agents/notes/implemented/process/2026-10-16-github-ci-and-maintenance.md)。

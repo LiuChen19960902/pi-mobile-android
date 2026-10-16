@@ -1,0 +1,88 @@
+name: Android CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: android-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  android:
+    name: Android checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: '3.12'
+    defaults:
+      run:
+        working-directory: pi-mobile-android
+    steps:
+      - name: Checkout Android
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: pi-mobile-android
+          persist-credentials: false
+      - name: Checkout paired gateway
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: LiuChen19960902/pi-mobile-gateway
+          ref: a201bd019ab9fb3cc602fd711aa32d9df3026242
+          path: pi-mobile-gateway
+          ssh-key: ${{ secrets.GATEWAY_CI_SSH_KEY }}
+          persist-credentials: false
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.11.31'
+      - name: Install Python
+        run: uv python install 3.12
+      - name: Install gateway dependencies
+        working-directory: pi-mobile-gateway
+        run: npm ci
+      - name: Install Android SDK and file finder
+        run: |
+          "${ANDROID_HOME:?}/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-36' 'build-tools;36.0.0'
+          if ! command -v fd >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y fd-find
+            mkdir -p "$RUNNER_TEMP/pi-mobile-bin"
+            ln -s "$(command -v fdfind)" "$RUNNER_TEMP/pi-mobile-bin/fd"
+            echo "$RUNNER_TEMP/pi-mobile-bin" >> "$GITHUB_PATH"
+          fi
+      - name: Check documents and scripts
+        run: |
+          uv run --no-project python scripts/check-docs.py
+          uv run --no-project python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Test and build
+        env:
+          PI_GATEWAY_DIR: ${{ github.workspace }}/pi-mobile-gateway
+        run: >-
+          ./gradlew --no-daemon --max-workers=2
+          -Dorg.gradle.jvmargs='-Xmx2g -Dfile.encoding=UTF-8'
+          -Pkotlin.compiler.execution.strategy=in-process
+          :shared:testAndroidHostTest :androidApp:testDebugUnitTest
+          :androidApp:assembleDebug
+      - name: Verify tests actually ran
+        run: uv run --no-project python scripts/check-ci-test-results.py
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-test-reports
+          path: |
+            pi-mobile-android/shared/build/test-results/**/*.xml
+            pi-mobile-android/androidApp/build/test-results/**/*.xml
+          retention-days: 7
+          if-no-files-found: warn
