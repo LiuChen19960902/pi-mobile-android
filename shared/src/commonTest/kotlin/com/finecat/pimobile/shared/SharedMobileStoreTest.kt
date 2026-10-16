@@ -125,6 +125,31 @@ class SharedMobileStoreTest {
     }
 
     @Test
+    fun dequeuedSnapshotClearsQueueButPreservesCurrentRun() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+        store.acceptFrame("""{"kind":"state","sessionId":"android-demo","isStreaming":true,"queuedMessages":{"steering":["s"],"followUp":["f"]}}""")
+        val snapshot = store.acceptFrame("""{"kind":"dequeued","sessionId":"android-demo","queueRequestId":"q-1","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["s","f"]}""")
+        assertTrue(snapshot.sessionStates.getValue("android-demo").isStreaming)
+        assertNull(snapshot.sessionStates.getValue("android-demo").queuedMessages)
+    }
+
+    @Test
+    fun abortedSnapshotClearsWorkingQueueWithoutInventingAgentEvents_andLegacyAckKeepsQueue() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+        store.acceptFrame("""{"kind":"state","sessionId":"android-demo","isStreaming":true,"queuedMessages":{"steering":[],"followUp":["pending"]}}""")
+        val legacy = store.acceptFrame("""{"kind":"aborted","sessionId":"android-demo"}""")
+        assertEquals(listOf("pending"), legacy.sessionStates.getValue("android-demo").queuedMessages?.followUp)
+        val stopped = store.acceptFrame("""{"kind":"aborted","sessionId":"android-demo","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["pending"]}""")
+        val state = stopped.sessionStates.getValue("android-demo")
+        assertEquals(false, state.isStreaming)
+        assertEquals(false, state.isCompacting)
+        assertNull(state.queuedMessages)
+        assertEquals(2, stopped.conversation.size)
+    }
+
+    @Test
     fun queueUpdateLiveEventsRefreshQueuedMessagesSnapshot() {
         // pi 原生 queue_update 归一：steer 消费后吸附条立即消失（对齐 TUI），
         // 不再依赖 turn/end 后的 state 请求-应答。
@@ -166,6 +191,85 @@ class SharedMobileStoreTest {
         assertTrue(!store.snapshot().sessionStates.getValue(sessionId).isCompacting)
         // notice/compact 进对话流；compact/start/end 不进。
         assertTrue(failure.conversation.any { it.title == "上下文压缩" && it.isError })
+    }
+
+    @Test
+    fun manualCompactionUpdatesDrawerWithoutAnAgentSettledEvent() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+        fun feed(seq: Int, type: String) = store.acceptLiveEvents(listOf(
+            SessionEvent("android-demo", seq, 100.0 + seq, GatewayEvent(type = type))
+        ))
+        feed(1, "compact/start")
+        assertTrue(store.snapshot().sessions.single().isRunning)
+        feed(2, "compact/end")
+        assertTrue(!store.snapshot().sessions.single().isRunning)
+        assertTrue(!store.snapshot().sessions.single().hasUnread)
+        assertTrue(store.snapshot().conversation.none { it.title == "compact/start" || it.title == "compact/end" })
+    }
+
+    @Test
+    fun finishedSnapshotClearsStaleRemoteRunningAndMarksOnlyUnviewedSessionUnread() {
+        val store = SharedMobileStore()
+        store.acceptFrame("""{"kind":"sessions","items":[{"id":"a","running":true},{"id":"b","running":false}]}""")
+        store.selectSession("b")
+        store.acceptFrame("""{"kind":"compact-finished","sessionId":"a","isStreaming":false,"isCompacting":false}""")
+        val sessions = store.snapshot().sessions.associateBy { it.id }
+        assertTrue(!sessions.getValue("a").isRunning)
+        assertTrue(sessions.getValue("a").hasUnread)
+        assertTrue(!sessions.getValue("b").hasUnread)
+        assertTrue(!store.selectSession("a").sessions.first { it.id == "a" }.hasUnread)
+    }
+
+    @Test
+    fun lifecycleKeepsRunningUntilBothChatAndCompactionHaveEnded() {
+        for (firstEnd in listOf("turn/end", "compact/end")) {
+            val store = SharedMobileStore()
+            store.loadManualTestFixture()
+            listOf("turn/start", "compact/start", firstEnd).forEachIndexed { i, type ->
+                store.acceptLiveEvents(listOf(SessionEvent("android-demo", i + 1, 100.0 + i, GatewayEvent(type))))
+            }
+            assertTrue(store.snapshot().sessions.single().isRunning)
+            val lastEnd = if (firstEnd == "turn/end") "compact/end" else "turn/end"
+            store.acceptLiveEvents(listOf(SessionEvent("android-demo", 4, 104.0, GatewayEvent(lastEnd))))
+            assertTrue(!store.snapshot().sessions.single().isRunning)
+        }
+    }
+
+    @Test
+    fun stateAndHistorySnapshotsReconcileDrawerAfterMissedEndEvent() {
+        for (kind in listOf("state", "history", "model-set", "compact-finished")) {
+            val store = SharedMobileStore()
+            store.loadManualTestFixture()
+            store.acceptFrame("""{"kind":"compact-started","sessionId":"android-demo","isStreaming":false,"isCompacting":true}""")
+            assertTrue(store.snapshot().sessions.single().isRunning)
+            store.acceptFrame("""{"kind":"$kind","sessionId":"android-demo","isStreaming":false,"isCompacting":false}""")
+            assertTrue(!store.snapshot().sessions.single().isRunning)
+            assertTrue(!store.snapshot().sessions.single().hasUnread)
+        }
+    }
+
+    @Test
+    fun backgroundCompactionBecomesUnreadOnlyWhenItFinishes() {
+        val store = SharedMobileStore()
+        store.acceptFrame("""{"kind":"sessions","items":[{"id":"a","running":false},{"id":"b","running":false}]}""")
+        store.selectSession("b")
+        store.acceptLiveEvents(listOf(SessionEvent("a", 1, 100.0, GatewayEvent("compact/start"))))
+        val started = store.snapshot().sessions.first { it.id == "a" }
+        assertTrue(started.isRunning)
+        assertTrue(!started.hasUnread)
+        store.acceptLiveEvents(listOf(SessionEvent("a", 2, 101.0, GatewayEvent("compact/end"))))
+        val finished = store.snapshot().sessions.first { it.id == "a" }
+        assertTrue(!finished.isRunning)
+        assertTrue(finished.hasUnread)
+    }
+
+    @Test
+    fun finishedSnapshotDoesNotStopAnActuallyRunningChat() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+        store.acceptFrame("""{"kind":"compact-finished","sessionId":"android-demo","isStreaming":true,"isCompacting":false}""")
+        assertTrue(store.snapshot().sessions.single().isRunning)
     }
 
     @Test

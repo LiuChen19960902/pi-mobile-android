@@ -9,6 +9,8 @@ import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
@@ -91,6 +93,360 @@ class FineCatProviderDirectEntryDeviceTest {
     /** 迟到回执用例：本类实例内已注入的回执（进快照与失败消息）。 */
     private val receiptLog = mutableListOf<String>()
     private var evidenceFileReady = false
+
+    @Test
+    fun newProvider_syncBeforeTest_emptyModelsCannotTestOrSave() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        runBlocking { waitUntil { holder.providers.size == 2 } }
+        openSettingsViaRealEntry()
+        compose.onNodeWithTag("finecat.providerNew").performScrollTo().performClick()
+        waitUntilTagPresent("finecat.providerEdit")
+        compose.onNodeWithTag("finecat.formId").performTextInput("new-sync-first")
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://models.example.invalid/ bad")
+        scrollToInForm("finecat.pullModels")
+        compose.onNodeWithTag("finecat.pullModels").assertIsNotEnabled()
+        scrollToInForm("finecat.formBaseUrl")
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextClearance()
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://models.example.invalid/v1")
+        compose.onNodeWithTag("finecat.formApiKey").performTextInput("synthetic-key")
+        scrollToInForm("finecat.pullModels")
+        compose.onNodeWithTag("finecat.pullModels").assertIsEnabled()
+        compose.onNodeWithTag("finecat.providerTest").assertIsNotEnabled()
+        compose.onNodeWithTag("finecat.sheetDone").performClick()
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.pullModels").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("provider-models").isNotEmpty() } }
+        transport.receive("""{"kind":"provider-models-result","id":"new-sync-first","ok":true,"ids":["model-one"]}""")
+        waitUntilTagPresent("finecat.modelRow.0")
+        scrollToInForm("finecat.providerTest")
+        compose.onNodeWithTag("finecat.providerTest").assertIsEnabled()
+        compose.onNodeWithTag("finecat.sheetDone").performClick()
+        waitUntilTagPresent("finecat.formError")
+        assertTrue(transport.payloadsOfType("provider-test").isEmpty())
+        assertTrue(transport.payloadsOfType("provider-put").isEmpty())
+    }
+
+    @Test
+    fun offlineCachedSettings_blocksProviderAndScopeEntries_withoutRequests() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        runBlocking { waitUntil { holder.providers.size == 2 } }
+        openSettingsViaRealEntry()
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" }
+        val before = configurationRequestCount()
+        compose.onNodeWithTag("finecat.modelConfigOffline").assertIsDisplayed()
+        listOf("finecat.modelScopeEntry", "finecat.providerRow.$PROVIDER_A_ID", "finecat.providerNew").forEach { tag ->
+            val entry = compose.onNodeWithTag(tag)
+            entry.performScrollTo().assertIsNotEnabled().performTouchInput { click() }
+        }
+        assertTrue(compose.onAllNodesWithTag("finecat.providerEdit").fetchSemanticsNodes().isEmpty())
+        assertTrue(compose.onAllNodesWithTag("finecat.modelScopeSheet").fetchSemanticsNodes().isEmpty())
+        assertEquals(before, configurationRequestCount())
+        reconnectAfterOffline()
+        compose.onNodeWithTag("finecat.providerRow.$PROVIDER_A_ID").assertIsEnabled()
+        compose.onNodeWithTag("finecat.modelScopeEntry").assertIsEnabled()
+    }
+
+    @Test
+    fun saveValidation_hidesOffline_andRecomputesForCurrentDraftAfterReconnect() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        openSettingsViaRealEntry()
+        openEditFormFor(PROVIDER_A_ID)
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextClearance()
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://offline-gate.example.invalid/v1")
+        compose.onNodeWithTag("finecat.sheetDone").performClick()
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请先测试连接")
+
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" }
+        waitUntilTagGone("finecat.formError")
+        compose.onNodeWithText("网关未连接，草稿已保留。").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.sheetDone").assertIsNotEnabled()
+        scrollToInForm("finecat.providerTest")
+        compose.onNodeWithTag("finecat.providerTest").assertIsNotEnabled()
+        assertTrue(transport.payloadsOfType("provider-put").isEmpty())
+        assertTrue(transport.payloadsOfType("provider-test").isEmpty())
+
+        reconnectAfterOffline()
+        answerPendingReads()
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请先测试连接")
+        scrollToInForm("finecat.formBaseUrl")
+        compose.onNodeWithTag("finecat.formBaseUrl").assertTextContains("https://offline-gate.example.invalid/v1")
+        scrollToInForm("finecat.modelRemove.0")
+        compose.onNodeWithTag("finecat.modelRemove.0").performClick()
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请先同步模型或手动添加模型")
+        assertTrue("本地删除和连接恢复不能自动提交", transport.payloadsOfType("provider-put").isEmpty())
+        assertTrue("本地模型行删除不能直接删除宿主Provider", transport.payloadsOfType("provider-delete").isEmpty())
+    }
+
+    @Test
+    fun saveUnconfirmed_staysVisibleAlongsideOfflineDraftNotice() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        openSettingsViaRealEntry()
+        fillNewProviderFormAndPassTestGate("离线未确认保留", "128K")
+        saveAndAwaitPut(1)
+        transport.fail()
+        compose.waitUntil(5_000) {
+            holder.providerSaveTerminal?.status == AndroidSharedStateHolder.ProviderSaveTerminal.Status.Unconfirmed
+        }
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.formError").assertTextContains("未确认")
+        compose.onNodeWithText("网关未连接，草稿已保留。").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.sheetDone").assertIsNotEnabled()
+        compose.onNodeWithTag("finecat.formName").assertTextContains("离线未确认保留")
+        assertEquals("断网后没有自动重提保存", 1, transport.payloadsOfType("provider-put").size)
+    }
+
+    @Test
+    fun providerDraft_survivesDisconnectAndReloadEmptyList_thenReconnect() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        runBlocking { waitUntil { holder.providers.size == 2 } }
+        openSettingsViaRealEntry()
+        openEditFormFor(PROVIDER_A_ID)
+        compose.onNodeWithTag("finecat.formName").performTextClearance()
+        compose.onNodeWithTag("finecat.formName").performTextInput("离线保护草稿")
+        val inputId = compose.onNodeWithTag("finecat.formName").fetchSemanticsNode().id
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" }
+        val before = configurationRequestCount()
+        compose.onNodeWithTag("finecat.providerOffline").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.sheetDone").assertIsNotEnabled()
+        listOf("finecat.modelRow.0", "finecat.addModel", "finecat.pullModels", "finecat.providerTest", "finecat.providerDelete").forEach { tag ->
+            scrollToInForm(tag)
+            compose.onNodeWithTag(tag).assertIsNotEnabled()
+        }
+        assertEquals(before, configurationRequestCount())
+        reconnectAfterOffline()
+        transport.receive("""{"kind":"providers","providers":[]}""")
+        compose.waitUntil(5_000) { holder.providers.isEmpty() }
+        compose.waitForIdle()
+        assertEquals("输入树不能因列表空态重建", inputId, compose.onNodeWithTag("finecat.formName").fetchSemanticsNode().id)
+        compose.onNodeWithTag("finecat.formName").assertTextContains("离线保护草稿")
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        scrollToInForm("finecat.modelRow.0")
+        compose.onNodeWithTag("finecat.modelRow.0").assertIsEnabled().performClick()
+        waitUntilTagPresent("finecat.modelDetail")
+    }
+
+    @Test
+    fun newProviderOfflineClose_reopensWithInputsAndKey_thenOnlineCancelDiscards() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        openSettingsViaRealEntry()
+        fillNewProviderFormAndPassTestGate("离线新增草稿", "500K", apiKey = "synthetic-offline-key_Ab9")
+        assertTrue("关卡前已有真实测试成功回执", holder.providerTestResult?.ok == true)
+        val values = mapOf(
+            "finecat.formId" to NEW_SAVE_ID,
+            "finecat.formName" to "离线新增草稿",
+            "finecat.formBaseUrl" to SAVE_BASE_URL,
+            "finecat.formApiKey" to "synthetic-offline-key_Ab9",
+        )
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" }
+        val before = configurationRequestCount()
+        compose.onNodeWithTag("finecat.providerClose").performClick()
+        waitUntilTagGone("finecat.providerEdit")
+        val context = holder.endpoint.trim() to NEW_PROVIDER_ID
+        assertEquals(values.getValue("finecat.formApiKey"), holder.providerEditorDrafts[context]?.apiKey)
+        assertEquals(NEW_SAVE_ID, holder.providerEditorDrafts[context]?.id)
+        assertEquals("500K", holder.providerEditorDrafts[context]?.rows?.single()?.contextWindow)
+        reconnectAfterOffline()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        compose.onNodeWithTag("finecat.providerNew").performScrollTo().performClick()
+        waitUntilTagPresent("finecat.providerEdit")
+        values.forEach { (tag, value) ->
+            scrollToInForm(tag)
+            compose.onNodeWithTag(tag).assert(SemanticsMatcher.expectValue(
+                SemanticsProperties.EditableText, AnnotatedString(value),
+            ))
+        }
+        assertNull("草稿取回后只由当前卡片持有", holder.providerEditorDrafts[context])
+        assertEquals("关闭和恢复不能自动写配置", before, configurationRequestCount())
+        scrollToInForm("finecat.modelRow.0")
+        compose.onNodeWithTag("finecat.modelRow.0").performClick()
+        waitUntilTagPresent("finecat.modelDetail")
+        scrollToInForm("finecat.modelContext", hostTag = "finecat.modelDetail")
+        compose.onNodeWithTag("finecat.modelContext").assertTextContains("500K")
+        compose.onNodeWithTag("finecat.sheetBack").performClick()
+        waitUntilTagGone("finecat.modelDetail")
+        compose.onNodeWithTag("finecat.sheetDone").performClick()
+        assertTrue("草稿不能恢复旧测试通行证", transport.payloadsOfType("provider-put").isEmpty())
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请先测试连接")
+        compose.onNodeWithTag("finecat.providerClose").performClick()
+        waitUntilTagGone("finecat.providerEdit")
+        compose.onNodeWithTag("finecat.providerNew").performScrollTo().performClick()
+        waitUntilTagPresent("finecat.providerEdit")
+        compose.onNodeWithTag("finecat.formId").assert(SemanticsMatcher.expectValue(
+            SemanticsProperties.EditableText, AnnotatedString(""),
+        ))
+    }
+
+    @Test
+    fun offlineExistingDraft_isScopedToProviderAndGatewayEntry() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        openSettingsViaRealEntry()
+        openEditFormFor(PROVIDER_A_ID)
+        compose.onNodeWithTag("finecat.formName").performTextClearance()
+        compose.onNodeWithTag("finecat.formName").performTextInput("A离线草稿")
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" }
+        val before = configurationRequestCount()
+        compose.onNodeWithTag("finecat.providerClose").performClick()
+        waitUntilTagGone("finecat.providerEdit")
+        reconnectAfterOffline()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        openEditFormFor(PROVIDER_B_ID)
+        compose.onNodeWithTag("finecat.formName").assert(SemanticsMatcher.expectValue(
+            SemanticsProperties.EditableText, AnnotatedString(PROVIDER_B_NAME),
+        ))
+        compose.onNodeWithTag("finecat.providerClose").performClick()
+        waitUntilTagGone("finecat.providerEdit")
+        val originalEntry = holder.endpoint
+        compose.runOnIdle { holder.endpoint = "ws://other.fixture.invalid:3082/ws/mobile" }
+        openEditFormFor(PROVIDER_A_ID)
+        compose.onNodeWithTag("finecat.formName").assert(SemanticsMatcher.expectValue(
+            SemanticsProperties.EditableText, AnnotatedString(PROVIDER_A_NAME),
+        ))
+        compose.onNodeWithTag("finecat.providerClose").performClick()
+        waitUntilTagGone("finecat.providerEdit")
+        compose.runOnIdle { holder.endpoint = originalEntry }
+        openEditFormFor(PROVIDER_A_ID)
+        compose.onNodeWithTag("finecat.formName").assertTextContains("A离线草稿")
+        assertEquals(before, configurationRequestCount())
+    }
+
+    @Test
+    fun deletedProviderCannotBeRevivedOrConsumeAnOfflineDraft() {
+        connectFakeGateway()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        val initial = holder.providers.single { it.id == PROVIDER_A_ID }
+        val draft = ProviderEditorDraft(initial, initial.id, "离线草稿", initial.baseUrl.orEmpty(),
+            "", FineCatProviderForm.initialRows(initial), emptyList())
+        val key = holder.endpoint.trim() to initial.id
+        holder.providerEditorDrafts[key] = draft
+        val frame = kotlinx.serialization.json.Json.parseToJsonElement(PROVIDERS_AB_FRAME).jsonObject
+        val remaining = frame.getValue("providers").jsonArray.filter {
+            it.jsonObject.getValue("id").jsonPrimitive.content != initial.id
+        }
+        transport.receive(JsonObject(frame.toMutableMap().apply {
+            this["providers"] = kotlinx.serialization.json.JsonArray(remaining)
+        }).toString())
+        compose.waitUntil(5_000) { holder.providers.size == 1 }
+        val before = configurationRequestCount()
+        val showing = androidx.compose.runtime.mutableStateOf(true)
+        compose.setContent {
+            FineCatTheme {
+                if (showing.value) FineCatProviderEditSheet(holder, initial.id, isNew = false,
+                    onDismiss = { showing.value = false })
+            }
+        }
+        compose.waitUntil(5_000) { !showing.value }
+        assertTrue(compose.onAllNodesWithTag("finecat.providerEdit").fetchSemanticsNodes().isEmpty())
+        assertTrue("缺失的远端对象不应消费离线草稿", holder.providerEditorDrafts[key] === draft)
+        assertEquals(before, configurationRequestCount())
+    }
+
+    @Test
+    fun mountedEditorIdentitySwitch_doesNotReuseAnotherProvidersInputsOrKey() {
+        connectFakeGateway()
+        transport.receive(PROVIDERS_AB_FRAME)
+        compose.waitUntil(5_000) { holder.providers.size == 2 }
+        val editing = androidx.compose.runtime.mutableStateOf(PROVIDER_A_ID)
+        compose.setContent {
+            FineCatTheme {
+                FineCatProviderEditSheet(holder, editing.value, isNew = false, onDismiss = {})
+            }
+        }
+        compose.onNodeWithTag("finecat.formName").performTextClearance()
+        compose.onNodeWithTag("finecat.formName").performTextInput("A未提交内容")
+        scrollToInForm("finecat.formApiKey")
+        compose.onNodeWithTag("finecat.formApiKey").performTextInput("synthetic-A-secret")
+        // 模拟退出动画仍挂载期间，单一编辑slot换为B。
+        compose.runOnIdle { editing.value = PROVIDER_B_ID }
+        compose.onNodeWithTag("finecat.formName").assert(SemanticsMatcher.expectValue(
+            SemanticsProperties.EditableText, AnnotatedString(PROVIDER_B_NAME),
+        ))
+        compose.onNodeWithTag("finecat.formApiKey").assert(SemanticsMatcher.expectValue(
+            SemanticsProperties.EditableText, AnnotatedString(""),
+        ))
+        compose.onNodeWithTag("finecat.formApiKey").performTextInput("synthetic-B-secret")
+        compose.runOnIdle { holder.endpoint = "ws://different.fixture.invalid:3082/ws/mobile" }
+        compose.onNodeWithTag("finecat.formApiKey").assert(SemanticsMatcher.expectValue(
+            SemanticsProperties.EditableText, AnnotatedString(""),
+        ))
+        assertTrue(transport.payloadsOfType("provider-put").isEmpty())
+    }
+
+    @Test
+    fun scopeDraft_survivesDisconnect_andSavesSameSelectionAfterReconnect() {
+        val hello = """{"kind":"hello","connection":{"state":"connected"},"sessions":[],"contextUsage":null,"model":null,"capabilities":["model-scope-v1","providers","sessions","models"]}"""
+        val scope = """{"patterns":["scope-p/first"],"groups":[{"provider":"scope-p","models":[{"id":"first","name":"First"},{"id":"second","name":"Second"}]}],"selected":[{"provider":"scope-p","modelId":"first","thinkingLevel":"high"}],"unmatchedPatterns":[]}"""
+        connectFakeGateway(helloFrame = hello)
+        setContentFromRealRoot()
+        openSettingsViaRealEntry()
+        compose.onNodeWithTag("finecat.modelScopeEntry").performClick()
+        awaitProviderFrame("model-scope", 1, "读取合成scope")
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" && !holder.modelScopeIsLoading }
+        compose.onNodeWithTag("finecat.modelScopeOffline").assertIsDisplayed()
+        reconnectAfterOffline(hello)
+        awaitProviderFrame("model-scope", 2, "首读取消后重连自动补读")
+        transport.receive("""{"kind":"model-scope","scope":$scope}""")
+        waitUntilTagPresent("finecat.modelScope.scope-p.second")
+        compose.onNodeWithTag("finecat.modelScope.scope-p.second").performClick().assertIsOn()
+        transport.fail()
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "FAILED" }
+        val before = configurationRequestCount()
+        compose.onNodeWithTag("finecat.modelScopeOffline").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.modelScopeSave").assertIsNotEnabled()
+        compose.onNodeWithTag("finecat.modelScope.scope-p.second").assertIsOn().assertIsNotEnabled()
+        assertEquals(before, configurationRequestCount())
+        reconnectAfterOffline(hello)
+        compose.onNodeWithTag("finecat.modelScope.scope-p.second").assertIsOn()
+        assertEquals("重连不能重载覆盖已有草稿", 2, transport.payloadsOfType("model-scope").size)
+        compose.onNodeWithTag("finecat.modelScopeSave").assertIsEnabled().performClick()
+        awaitProviderFrame("model-scope-put", 1, "重连后保存scope草稿")
+        val models = transport.payloadsOfType("model-scope-put").single().getValue("models").jsonArray
+        assertEquals(setOf("first", "second"), models.map { it.jsonObject.getValue("modelId").jsonPrimitive.content }.toSet())
+        assertEquals("high", models.first { it.jsonObject.getValue("modelId").jsonPrimitive.content == "first" }.jsonObject.getValue("thinkingLevel").jsonPrimitive.content)
+    }
+
+    private fun configurationRequestCount(): Int = listOf(
+        "provider-put", "provider-test", "provider-models", "provider-delete", "model-scope", "model-scope-put",
+    ).sumOf { transport.payloadsOfType(it).size }
+
+    private fun reconnectAfterOffline(hello: String = HELLO_CONNECTED_FRAME) {
+        val openedBefore = transport.specs.size
+        compose.runOnIdle { holder.connect() }
+        compose.waitUntil(5_000) { transport.specs.size > openedBefore }
+        transport.open()
+        transport.receive(hello)
+        compose.waitUntil(5_000) { holder.gatewayState.connection.name == "CONNECTED" }
+    }
 
     @Test
     fun renameMismatchingReceipt_reportsUnconfirmed_andAllowsRetry() {
@@ -396,8 +752,7 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.formId").performTextInput(newId)
         compose.onNodeWithTag("finecat.formName").performTextInput("F01 保存样例")
         compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://f01-save.example/v1")
-        // 保存必须有完整有效模型：手动添加一个，id + 上下文窗口都填
-        // （不填窗口的行挂「待配置」，本地校验会正确拒存）
+        // 手动添加模型并覆盖默认容量；无元数据也可直接在手机配置。
         scrollToInForm("finecat.addModel")
         compose.onNodeWithTag("finecat.addModel").performClick()
         waitUntilTagPresent("finecat.modelDetail")
@@ -1190,7 +1545,7 @@ class FineCatProviderDirectEntryDeviceTest {
     }
 
     /** 新建表单：id/名称/URL + 一个模型（填上下文窗口）+ 测试门槛跑通。 */
-    private fun fillNewProviderFormAndPassTestGate(name: String, contextWindow: String) {
+    private fun fillNewProviderFormAndPassTestGate(name: String, contextWindow: String, apiKey: String = "") {
         compose.onNodeWithTag("finecat.providerNew").performScrollTo()
         compose.waitForIdle()
         compose.onNodeWithTag("finecat.providerNew").performClick()
@@ -1198,6 +1553,10 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.formId").performTextInput(NEW_SAVE_ID)
         compose.onNodeWithTag("finecat.formName").performTextInput(name)
         compose.onNodeWithTag("finecat.formBaseUrl").performTextInput(SAVE_BASE_URL)
+        if (apiKey.isNotEmpty()) {
+            scrollToInForm("finecat.formApiKey")
+            compose.onNodeWithTag("finecat.formApiKey").performTextInput(apiKey)
+        }
         scrollToInForm("finecat.addModel")
         compose.onNodeWithTag("finecat.addModel").performClick()
         waitUntilTagPresent("finecat.modelDetail")
@@ -1700,7 +2059,7 @@ class FineCatProviderDirectEntryDeviceTest {
      * 这条终态在用例里可及时发生（生产默认 30s，见 GatewayRuntime 的
      * `DEFAULT_REQUEST_TIMEOUT_MILLISECONDS`）。
      */
-    private fun connectFakeGateway(requestTimeoutMillis: Long? = null) {
+    private fun connectFakeGateway(requestTimeoutMillis: Long? = null, helloFrame: String = HELLO_CONNECTED_FRAME) {
         transport = FakeTransport()
         graph = AndroidAppGraph(
             application = androidx.test.core.app.ApplicationProvider.getApplicationContext<Application>(),
@@ -1716,10 +2075,7 @@ class FineCatProviderDirectEntryDeviceTest {
         runBlocking {
             waitUntil { transport.specs.isNotEmpty() }
             transport.open()
-            transport.receive(
-                """{"kind":"hello","connection":{"state":"connected"},"sessions":[],""" +
-                    """"contextUsage":null,"model":null}"""
-            )
+            transport.receive(helloFrame)
             waitUntil { holder.gatewayState.connection.name == "CONNECTED" }
         }
     }

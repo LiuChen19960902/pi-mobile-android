@@ -59,4 +59,15 @@ class FcContextUsageTest {
             assertEquals(0f, display.progress)
         }
     }
+
+    @Test
+    fun postCompactionUnknownDoesNotFabricateImprovement() {
+        // CTX02：压缩后 SDK 统计合法 unknown（percent/tokens 同为 null）显示 —，
+        // 不得沿用旧 percent 伪造“已改善”。
+        val display = contextUsageDisplay(GatewayContextUsage(percent = null, tokens = null, contextWindow = null))
+        assertEquals("—", display.percent)
+        assertEquals("—", display.tokens)
+        assertEquals("—", display.window)
+        assertEquals(0f, display.progress)
+    }
 }

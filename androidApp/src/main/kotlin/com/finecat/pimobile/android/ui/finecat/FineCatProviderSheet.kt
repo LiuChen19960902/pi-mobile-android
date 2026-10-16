@@ -60,6 +60,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -157,7 +158,9 @@ internal fun FineCatProviderSheet(
                 )
             }
             providers.forEach { provider ->
-                ProviderRow(provider = provider, onEdit = { editingId = provider.id })
+                ProviderRow(provider = provider, enabled = connected, onEdit = {
+                    if (stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED) editingId = provider.id
+                })
             }
             FcTextButton(
                 text = "新增 Provider",
@@ -221,11 +224,9 @@ internal fun FineCatProviderEditSheet(
     }
     val retainedExisting = remember(providerId, isNew) { mutableStateOf(currentExisting) }
     SideEffect { if (currentExisting != null) retainedExisting.value = currentExisting }
-    val existing = currentExisting ?: retainedExisting.value.takeIf {
-        // 旧快照只画完退场或等待一致缺失列表触发收起；加载/空列表仍沿用原来的无表单分支。
-        closing || (!stateHolder.providerListIsLoading && providers.isNotEmpty())
-    }
-    if (!isNew && currentExisting == null && !stateHolder.providerListIsLoading && providers.isNotEmpty()) {
+    // 已打开的编辑树在掉线/重载空列表期间持续挂载，保留文字、密钥和模型草稿。
+    val existing = currentExisting ?: retainedExisting.value
+    if (!closing && connected && !isNew && currentExisting == null && !stateHolder.providerListIsLoading && providers.isNotEmpty()) {
         LaunchedEffect(providerId) { onDismiss() }
     }
     when {
@@ -276,6 +277,7 @@ internal fun compatOverrides(provider: GatewayProvider): Int =
 @Composable
 private fun ProviderRow(
     provider: GatewayProvider,
+    enabled: Boolean,
     onEdit: () -> Unit,
 ) {
     val colors = LocalFineCatColors.current
@@ -283,7 +285,7 @@ private fun ProviderRow(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(role = Role.Button, onClick = onEdit)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onEdit)
             .padding(horizontal = 20.dp, vertical = 10.dp)
             .testTag("finecat.providerRow.${provider.id}"),
     ) {
@@ -355,24 +357,54 @@ private fun ProviderEditSheet(
     connected: Boolean,
     onDismiss: () -> Unit,
 ) {
+    val editorId = if (isNew) NEW_PROVIDER_ID else requireNotNull(existing).id
+    // 退出动画尚未卸载时切换对象，也不能复用上一份表单或密钥。
+    key(stateHolder, stateHolder.endpoint.trim(), editorId) {
+        ProviderEditorForm(stateHolder, existing, isNew, connected, onDismiss)
+    }
+}
+
+@Composable
+private fun ProviderEditorForm(
+    stateHolder: AndroidSharedStateHolder,
+    existing: GatewayProvider?,
+    isNew: Boolean,
+    connected: Boolean,
+    onDismiss: () -> Unit,
+) {
     val colors = LocalFineCatColors.current
     val type = LocalFineCatType.current
-    var id by rememberSaveable { mutableStateOf(existing?.id ?: "") }
-    var name by rememberSaveable { mutableStateOf(existing?.name ?: "") }
-    val initialProvider = remember { existing }
-    var baseUrl by rememberSaveable { mutableStateOf(existing?.baseUrl ?: "") }
+    val draftKey = remember {
+        stateHolder.endpoint.trim() to if (isNew) NEW_PROVIDER_ID else requireNotNull(existing).id
+    }
+    val resumedDraft = remember { stateHolder.providerEditorDrafts[draftKey] }
+    // 完成挂载后才取走；退出动画期间新存的草稿不能被旧卡片的重组消费。
+    SideEffect {
+        if (resumedDraft != null && stateHolder.providerEditorDrafts[draftKey] === resumedDraft) {
+            stateHolder.providerEditorDrafts.remove(draftKey)
+        }
+    }
+    val initialProvider = remember { resumedDraft?.initialProvider ?: existing }
+    var id by rememberSaveable { mutableStateOf(resumedDraft?.id ?: existing?.id ?: "") }
+    var name by rememberSaveable { mutableStateOf(resumedDraft?.name ?: existing?.name ?: "") }
+    var baseUrl by rememberSaveable { mutableStateOf(resumedDraft?.baseUrl ?: existing?.baseUrl ?: "") }
     // API Key 只在内存：rememberSaveable 会把它写进 Bundle（进程重建/备份/抓取都可能
     // 把凭据带出去），而它的语义本来就是「留空=保留已存值」，不需要过旋转。
-    var apiKey by remember { mutableStateOf("") }
+    var apiKey by remember { mutableStateOf(resumedDraft?.apiKey.orEmpty()) }
     val rows = remember {
-        mutableStateListOf<ProviderModelDraft>().apply { addAll(FineCatProviderForm.initialRows(existing)) }
+        mutableStateListOf<ProviderModelDraft>().apply {
+            addAll(resumedDraft?.rows ?: FineCatProviderForm.initialRows(existing))
+        }
     }
-    var modelViewOrder by remember { mutableStateOf(stateHolder.providerModelViewOrder(id.trim())) }
+    var modelViewOrder by remember {
+        mutableStateOf(resumedDraft?.modelViewOrder ?: stateHolder.providerModelViewOrder(id.trim()))
+    }
     val viewIndices = FineCatProviderForm.viewIndices(rows.toList(), modelViewOrder)
     val hasChanges = FineCatProviderForm.hasChanges(initialProvider, id, name, baseUrl, apiKey, rows.toList())
     /** 二级模型卡对应的行下标；null = 收起 */
     var detailIndex by remember { mutableStateOf<Int?>(null) }
     var localError by remember { mutableStateOf<String?>(null) }
+    var showSaveValidation by remember { mutableStateOf(false) }
     var pullReceipt by remember { mutableStateOf<String?>(null) }
     // 删除是高危动作：沿旧 UI 的二次确认 + 8s 自动解除（防误触即删）
     var confirmDelete by rememberSaveable { mutableStateOf(false) }
@@ -387,7 +419,7 @@ private fun ProviderEditSheet(
     val fingerprint = FineCatProviderForm.fingerprint(baseUrl, apiKey, rows.toList())
     val initialFingerprint = remember {
         // rememberSaveable恢复的输入可能已被编辑，不能把它当作未编辑/已测的原配置。
-        FineCatProviderForm.fingerprint(existing?.baseUrl.orEmpty(), "", FineCatProviderForm.initialRows(existing))
+        FineCatProviderForm.fingerprint(initialProvider?.baseUrl.orEmpty(), "", FineCatProviderForm.initialRows(initialProvider))
     }
     var testedFingerprint by remember { mutableStateOf<String?>(null) }
     var pendingTestFingerprint by remember { mutableStateOf<String?>(null) }
@@ -443,7 +475,10 @@ private fun ProviderEditSheet(
         pendingSave = null
         when (terminal.status) {
             AndroidSharedStateHolder.ProviderSaveTerminal.Status.Saved -> {
-                if (submittedDraft == (Triple(id, name, fingerprint) to rows.toList())) onDismiss()
+                if (submittedDraft == (Triple(id, name, fingerprint) to rows.toList())) {
+                    stateHolder.providerEditorDrafts.remove(draftKey)
+                    onDismiss()
+                }
                 else localError = "提交时的内容已保存，随后编辑的内容尚未保存。"
             }
             // 拒绝是真失败；取消/超时只表示未确认，原因照实写进卡内错误位，
@@ -463,11 +498,24 @@ private fun ProviderEditSheet(
     val saveBlockedReason = when {
         gatePassed -> null
         testTargets.isEmpty() ->
-            "这个表单还没有模型：先手动添加或从上游拉取一个模型，才能测试并保存。"
+            "请先同步模型或手动添加模型。"
         stateHolder.providerTestIsLoading ->
-            "连接测试还在路上，结论回来前这份表单还不能保存。"
-        else -> "请先测试连接，至少一个模型测试通过后才能保存。"
+            "测试中，请稍候。"
+        else -> "请先测试连接。"
     }
+    // 本地校验随当前草稿重算；离线时由连接提示说明原因，业务失败/未确认仍保留。
+    val saveValidationError = if (showSaveValidation && connected) {
+        validateForSave(
+            connected = connected,
+            id = id,
+            name = name.trim().takeIf(String::isNotEmpty),
+            baseUrl = baseUrl.trim().takeIf(String::isNotEmpty),
+            apiKey = apiKey.trim().takeIf(String::isNotEmpty),
+            parsed = FineCatProviderForm.parseModels(rows.toList(), existing),
+            saveGateMessage = saveBlockedReason,
+        )
+    } else null
+    val formError = localError ?: saveValidationError
 
     // 上游拉取结果：一次性消费 → 按表单归属 → 只新增不覆盖 → 回执
     LaunchedEffect(stateHolder.providerModelsResult) {
@@ -513,7 +561,8 @@ private fun ProviderEditSheet(
             saveGateMessage = saveBlockedReason,
         )
         // 本地不过：错误留在本卡可见，不发 provider-put、不收卡
-        localError = error
+        showSaveValidation = error != null
+        localError = null
         if (error != null) return
         // 发出后不收卡：等这一次保存自己的终态。saveProvider 返回本次请求的在途
         // 标记，返回 null = 根本没发出去（本地二次校验不过 / 发送被挡），
@@ -539,23 +588,38 @@ private fun ProviderEditSheet(
         }
     }
 
+    fun closeEditor() {
+        // 用当前连接与输入值，不把重连进行中或同帧输入当成已在线/空稿。
+        val online = stateHolder.gatewayState.connection ==
+            com.finecat.pimobile.shared.gateway.GatewayConnectionState.CONNECTED
+        if (!online && FineCatProviderForm.hasChanges(initialProvider, id, name, baseUrl, apiKey, rows.toList())) {
+            stateHolder.providerEditorDrafts[draftKey] = ProviderEditorDraft(
+                initialProvider, id, name, baseUrl, apiKey, rows.toList(), modelViewOrder.toList(),
+            )
+        } else {
+            stateHolder.providerEditorDrafts.remove(draftKey)
+        }
+        onDismiss()
+    }
+
     fun deleteProvider() {
         if (!connected) {
             localError = "未连接 Pi 网关，删除发不出去。"
             return
         }
         stateHolder.deleteProvider(existing?.id ?: id)
+        stateHolder.providerEditorDrafts.remove(draftKey)
         onDismiss()
     }
 
     FcSheet(
         visible = true,
-        onDismiss = onDismiss,
+        onDismiss = { closeEditor() },
         onOutsideClick = {
             when {
                 stateHolder.providerSaveIsLoading -> Unit
                 confirmDelete -> confirmDelete = false
-                !hasChanges -> onDismiss()
+                !connected || !hasChanges -> closeEditor()
                 else -> submit()
             }
         },
@@ -571,9 +635,10 @@ private fun ProviderEditSheet(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 FcIconButton(
-                    icon = FineCatIcons.X, contentDescription = "取消编辑",
-                    onClick = onDismiss, enabled = !stateHolder.providerSaveIsLoading,
+                    icon = FineCatIcons.X, contentDescription = if (connected) "取消编辑" else "关闭并保留草稿",
+                    onClick = { closeEditor() }, enabled = !stateHolder.providerSaveIsLoading,
                     buttonSize = 48.dp, iconSize = 20.dp,
+                    modifier = Modifier.testTag("finecat.providerClose"),
                 )
                 Column(Modifier.weight(1f).padding(end = 12.dp)) {
                     Text(if (isNew) "新增 Provider" else existing?.name ?: id,
@@ -599,7 +664,17 @@ private fun ProviderEditSheet(
                     style = type.sm.copy(lineHeight = 20.sp, fontWeight = FontWeight.Medium), maxLines = 1) }
             }
             HorizontalDivider(color = colors.line.copy(alpha = 0.6f))
-            localError?.let { message ->
+            if (!connected) {
+                Row(Modifier.fillMaxWidth().testTag("finecat.providerOffline"), verticalAlignment = Alignment.CenterVertically) {
+                    Text("网关未连接，草稿已保留。", style = type.xs, color = colors.warn,
+                        modifier = Modifier.weight(1f).padding(start = 20.dp))
+                    FcTextButton("重新连接", onClick = stateHolder::connect,
+                        enabled = stateHolder.gatewayState.connection !in setOf(GatewayConnectionState.CONNECTING,
+                            GatewayConnectionState.AUTHENTICATING, GatewayConnectionState.WAITING_FOR_NETWORK),
+                        modifier = Modifier.padding(end = 12.dp).testTag("finecat.providerReconnect"))
+                }
+            }
+            formError?.let { message ->
                 Text(
                     text = message,
                     style = type.xs,
@@ -673,11 +748,19 @@ private fun ProviderEditSheet(
                                 api = FineCatProviderForm.pullApi(rows.toList()),
                             )
                         },
-                        enabled = connected && !stateHolder.providerModelsIsLoading &&
+                        enabled = connected && baseUrl.trim().matches(Regex("https?://\\S+")) &&
+                            !stateHolder.providerModelsIsLoading &&
                             !stateHolder.providerTestIsLoading && stateHolder.supportsRequest("provider-models"),
-                        colors = ButtonDefaults.textButtonColors(contentColor = colors.text2),
-                        modifier = Modifier.heightIn(min = 48.dp).testTag("finecat.pullModels"),
-                    ) { Text("同步模型", style = type.sm, maxLines = 1) }
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        colors = ButtonDefaults.textButtonColors(
+                            containerColor = if (testTargets.isEmpty()) Color.Black else Color.Transparent,
+                            contentColor = if (testTargets.isEmpty()) Color.White else colors.text2,
+                            disabledContainerColor = Color.Transparent,
+                            disabledContentColor = colors.text3,
+                        ),
+                        modifier = Modifier.heightIn(min = 36.dp).testTag("finecat.pullModels"),
+                    ) { Text("同步模型", style = type.sm.copy(lineHeight = 20.sp, fontWeight = FontWeight.Medium), maxLines = 1) }
                     Spacer(Modifier.width(6.dp))
                     Button(
                         onClick = {
@@ -702,9 +785,9 @@ private fun ProviderEditSheet(
                             !stateHolder.providerModelsIsLoading && testTargets.isNotEmpty() &&
                             stateHolder.supportsRequest("provider-test"),
                         shape = RoundedCornerShape(10.dp),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White,
-                            disabledContainerColor = colors.surface2, disabledContentColor = colors.text3),
+                            disabledContainerColor = Color.Transparent, disabledContentColor = colors.text3),
                         modifier = Modifier.heightIn(min = 36.dp).testTag("finecat.providerTest"),
                     ) { Text("测试连接", style = type.sm.copy(lineHeight = 20.sp, fontWeight = FontWeight.Medium), maxLines = 1) }
                 }
@@ -771,7 +854,7 @@ private fun ProviderEditSheet(
                             .semantics { liveRegion = LiveRegionMode.Polite }
                             .testTag("finecat.pullReceipt"))
                 }
-                stateHolder.providerResult?.takeUnless { it == localError }?.let { result ->
+                stateHolder.providerResult?.takeUnless { it == formError }?.let { result ->
                     Text(result, style = type.xs, color = providerReceiptColor(result),
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)
                             .testTag("finecat.providerResultInEdit"))
@@ -782,20 +865,20 @@ private fun ProviderEditSheet(
                     ModelRow(
                         index = index,
                         row = row,
-                        // 「待配置」只给这次新加/拉回来的行：已有模型没写窗口是 pi 走目录默认，
-                        // 不该被误标成没配好。
-                        unconfigured = FineCatProviderForm.unconfigured(existing, row),
                         attempt = FineCatProviderForm.currentTestAttempt(
                             row.id, fingerprint, testOutcomeFingerprint, testOutcome?.attempts.orEmpty(),
                         ),
                         showTestStatus = testOutcome != null && testOutcomeFingerprint == fingerprint,
+                        enabled = connected,
                         canMoveUp = viewIndex > 0 && row.id.isNotBlank() &&
                             rows[viewIndices[viewIndex - 1]].id.isNotBlank(),
                         onMoveUp = {
                             modelViewOrder = FineCatProviderForm.moveViewUp(rows.toList(), modelViewOrder, index)
                             stateHolder.updateProviderModelViewOrder(id.trim(), modelViewOrder)
                         },
-                        onClick = { detailIndex = index },
+                        onClick = {
+                            if (stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED) detailIndex = index
+                        },
                         onRemove = {
                             rows.removeAt(index)
                             detailIndex = null
@@ -805,10 +888,11 @@ private fun ProviderEditSheet(
                 FcTextButton(
                     text = "手动添加模型",
                     onClick = {
+                        if (stateHolder.gatewayState.connection != GatewayConnectionState.CONNECTED) return@FcTextButton
                         rows.add(FineCatProviderForm.newRow(rows.toList()))
                         detailIndex = rows.lastIndex
                     },
-                    // 填表不依赖连接（离线也能先把表单搭好）；只有网络动作 gated。
+                    enabled = connected,
                     modifier = Modifier
                         .padding(horizontal = 20.dp)
                         .testTag("finecat.addModel"),
@@ -823,6 +907,7 @@ private fun ProviderEditSheet(
                             } else confirmDelete = true
                         },
                         muted = !confirmDelete,
+                        enabled = connected,
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
                             .testTag("finecat.providerDelete"),
                     )
@@ -863,7 +948,7 @@ private fun ProviderEditSheet(
  * 任一不过就把错误留在当前卡内可见；全过时由调用方发出请求并等它自己的结论，
  * 这里不发保存、不收卡（保存失败不该把草稿一起丢了）。
  *
- * 判据顺序沿用既有口径：连接 → id → 测试门槛 → 数值/待配置解析 → 网关同口径兜底。
+ * 判据顺序：连接 → id → 测试门槛 → 数值解析 → 网关同口径兜底。
  * “把已有模型全删”不再另加限制：模型为空时门槛本来就要“先有一个能测的模型”。
  */
 private fun validateForSave(
@@ -895,15 +980,14 @@ private fun validateForSave(
 
 /**
  * Provider 模型行沿用选择器的主副行层次；保留 ID 辨识和独立的上移/移除操作。
- * 同一个判据 [FineCatProviderForm.unconfigured] 也用于保存拦截，不会出现标了红却还能存。
  */
 @Composable
 private fun ModelRow(
     index: Int,
     row: ProviderModelDraft,
-    unconfigured: Boolean,
     attempt: ProviderTestAttempt?,
     showTestStatus: Boolean,
+    enabled: Boolean,
     canMoveUp: Boolean,
     onMoveUp: () -> Unit,
     onClick: () -> Unit,
@@ -915,7 +999,7 @@ private fun ModelRow(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 56.dp)
-            .clickable(role = Role.Button, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .padding(start = 24.dp, end = 12.dp, top = 4.dp, bottom = 4.dp)
             .testTag("finecat.modelRow.$index"),
         verticalAlignment = Alignment.CenterVertically,
@@ -929,9 +1013,6 @@ private fun ModelRow(
                 overflow = TextOverflow.Ellipsis,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                if (unconfigured) {
-                    Text("待配置", style = type.xs, color = colors.err, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
                 Text(
                     text = listOfNotNull(
                         row.api.ifBlank { "未选协议" },
@@ -962,7 +1043,7 @@ private fun ModelRow(
                 icon = FineCatIcons.ArrowUp,
                 contentDescription = "上移模型 ${row.id.ifBlank { "新模型" }}",
                 onClick = onMoveUp,
-                enabled = canMoveUp,
+                enabled = enabled && canMoveUp,
                 buttonSize = 48.dp,
                 iconSize = 18.dp,
                 modifier = Modifier.testTag("finecat.modelMoveUp.$index"),
@@ -971,6 +1052,7 @@ private fun ModelRow(
                 icon = FineCatIcons.Trash,
                 contentDescription = "移除模型 ${row.id.ifBlank { "新模型" }}",
                 onClick = onRemove,
+                enabled = enabled,
                 buttonSize = 48.dp,
                 iconSize = 18.dp,
                 modifier = Modifier.testTag("finecat.modelRemove.$index"),
@@ -1005,6 +1087,7 @@ private fun FineCatModelDetailSheet(
     onRemove: () -> Unit,
 ) {
     // 协议改成贴锚点浮层（原型 mv-api-pop）：锚点就是“方言”那一行，浮层悬在二级卡上。
+    val connected = stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED
     var apiPop by remember { mutableStateOf(false) }
     var apiAnchor by remember { mutableStateOf(IntRect.Zero) }
     /** 有损失待确认的候选：非 null 时浮层只给确认/取消，compat 不被静默清空。 */
@@ -1019,7 +1102,7 @@ private fun FineCatModelDetailSheet(
     var validateDetail by remember { mutableStateOf(false) }
     val detailError = if (validateDetail) FineCatProviderForm.parseModels(listOf(row), existing).error else null
     val declaredThinking = FineCatThinkingMap.declaredLevels(stateHolder.snapshot.modelCatalog, providerId, row.id)
-    val thinkingLevels = thinkingColumns ?: FineCatThinkingMap.orderedLevels(declaredThinking.orEmpty(), row.thinkingMap.keys)
+    val thinkingLevels = thinkingColumns ?: FineCatThinkingMap.editableLevels(declaredThinking, row.thinkingMap.keys)
     // F12 compat 编辑区：展开态、枚举取值浮层。展开态跟着这张卡走（切模型即换新状态，
     // 不跨模型串草稿）；浮层锚点是那一行的取值。
     var compatExpanded by remember { mutableStateOf(false) }
@@ -1042,7 +1125,7 @@ private fun FineCatModelDetailSheet(
     val confirmDetail: () -> Unit = {
         if (apiPop || compatPopKey != null || thinkPopLevel != null) {
             collapse()
-        } else {
+        } else if (connected) {
             validateDetail = true
             if (FineCatProviderForm.parseModels(listOf(row), existing).error == null) onBack()
         }
@@ -1081,11 +1164,18 @@ private fun FineCatModelDetailSheet(
                 }
                 Button(
                     onClick = confirmDetail,
+                    enabled = connected,
                     shape = RoundedCornerShape(10.dp),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White,
+                        disabledContainerColor = colors.surface2, disabledContentColor = colors.text3),
                     modifier = Modifier.heightIn(min = 36.dp).testTag("finecat.sheetDone"),
                 ) { Text("完成", style = type.sm.copy(lineHeight = 20.sp, fontWeight = FontWeight.Medium), maxLines = 1) }
+            }
+            if (!connected) {
+                Text("网关未连接，修改已保留在草稿中。", style = type.xs, color = colors.warn,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)
+                        .testTag("finecat.modelDetailOffline"))
             }
             HorizontalDivider(color = colors.line.copy(alpha = 0.6f))
             detailError?.let { message ->
@@ -1149,12 +1239,12 @@ private fun FineCatModelDetailSheet(
                     Box(Modifier.weight(1f)) {
                         ProviderInput(label = "上下文", value = row.contextWindow,
                             onValueChange = { onChange(row.copy(contextWindow = it)) },
-                            placeholder = if (idLocked) "如 128K" else "必填，如 128K", fieldTag = "finecat.modelContext")
+                            placeholder = if (idLocked) "留空保留" else "默认 128K", fieldTag = "finecat.modelContext")
                     }
                     Box(Modifier.weight(1f)) {
                         ProviderInput(label = "最大输出", value = row.maxTokens,
                             onValueChange = { onChange(row.copy(maxTokens = it)) },
-                            placeholder = "如 8K", fieldTag = "finecat.modelMax")
+                            placeholder = if (idLocked) "留空保留" else "默认 16.384K", fieldTag = "finecat.modelMax")
                     }
                 }
                 Text("协议与能力", style = type.sm.copy(fontWeight = FontWeight.SemiBold), color = colors.text,
@@ -1280,13 +1370,13 @@ private fun FineCatModelDetailSheet(
       if (thinkPickKey) {
         ThinkingKeyPopover(
             level = openLevel,
-            levels = thinkingLevels,
+            draftMap = row.thinkingMap,
             anchor = thinkAnchor,
             onDismiss = { thinkPopLevel = null },
             onPick = { picked ->
                 val next = FineCatThinkingMap.renameLevel(row.thinkingMap, thinkingLevels, openLevel, picked)
                 if (next != null) {
-                    thinkingColumns = thinkingLevels.map { if (it == openLevel) picked else it }
+                    thinkingColumns = FineCatThinkingMap.renamedColumns(thinkingLevels, openLevel, picked)
                     onChange(row.copy(thinkingMap = next))
                     thinkPopLevel = null
                 }
@@ -1831,13 +1921,13 @@ private fun ThinkingColumn(
 @Composable
 private fun ThinkingKeyPopover(
     level: String,
-    levels: List<String>,
+    draftMap: Map<String, String>,
     anchor: IntRect,
     onDismiss: () -> Unit,
     onPick: (String) -> Unit,
 ) {
     FcPopover(expanded = true, onDismissRequest = onDismiss, anchorBoundsInWindow = anchor) {
-        PI_THINKING_LEVELS.filter { it == level || it !in levels }.forEach { value ->
+        FineCatThinkingMap.keyChoices(draftMap, level).forEach { value ->
             FcPopoverItem(text = value, selected = value == level, onClick = { onPick(value) },
                 modifier = Modifier.testTag("finecat.thinkingKeyPick.$value"))
         }
@@ -1946,7 +2036,9 @@ private fun ProviderInput(
         maxLines = if (url) 4 else 1,
         textStyle = type.sm.copy(color = colors.text, textAlign = TextAlign.Start),
         keyboardOptions = KeyboardOptions(
-            keyboardType = when { password -> KeyboardType.Password; url -> KeyboardType.Uri; else -> KeyboardType.Text },
+            keyboardType = if (url) KeyboardType.Uri else KeyboardType.Text,
+            capitalization = KeyboardCapitalization.None,
+            autoCorrectEnabled = if (password) false else null,
             imeAction = if (password) ImeAction.Done else ImeAction.Next,
         ),
         visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,

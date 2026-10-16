@@ -9,10 +9,13 @@ import androidx.datastore.preferences.preferencesDataStoreFile
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import com.finecat.pimobile.shared.platform.GatewayPreferences
 import com.finecat.pimobile.shared.platform.GatewayPreferencesSnapshot
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import java.io.IOException
 
 class AndroidGatewayPreferences(context: Context) : GatewayPreferences {
@@ -20,9 +23,16 @@ class AndroidGatewayPreferences(context: Context) : GatewayPreferences {
         produceFile = { context.preferencesDataStoreFile(FILE_NAME) }
     )
 
+    private val mutableReadFailed = MutableStateFlow(false)
+    val readFailed: StateFlow<Boolean> = mutableReadFailed
+
     override val snapshots: Flow<GatewayPreferencesSnapshot> = dataStore.data
+        .onEach { mutableReadFailed.value = false }
         .catch { error ->
-            if (error is IOException) emit(androidx.datastore.preferences.core.emptyPreferences())
+            if (error is IOException) {
+                mutableReadFailed.value = true
+                emit(androidx.datastore.preferences.core.emptyPreferences())
+            }
             else throw error
         }
         .map(::toSnapshot)

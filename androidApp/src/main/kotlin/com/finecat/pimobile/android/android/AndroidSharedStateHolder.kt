@@ -1,5 +1,10 @@
 package com.finecat.pimobile.android
 
+import com.finecat.pimobile.shared.platform.GatewayPreferences
+import com.finecat.pimobile.shared.platform.GatewayPreferencesSnapshot
+
+import com.finecat.pimobile.shared.gateway.GatewayErrorText
+
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Base64
@@ -7,8 +12,10 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.finecat.pimobile.android.platform.AndroidGatewayPreferences
@@ -17,6 +24,7 @@ import com.finecat.pimobile.android.platform.AndroidImagePreprocessor
 import com.finecat.pimobile.android.platform.AndroidPreparedImage
 import com.finecat.pimobile.android.platform.BoundedLruCache
 import com.finecat.pimobile.android.platform.RecentPhotosProvider
+import com.finecat.pimobile.android.ui.finecat.ProviderEditorDraft
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineStart
@@ -61,7 +69,10 @@ class AndroidSharedStateHolder(
     private val graph: AndroidAppGraph? = null,
     /** 测试注入口：默认取 graph.recentPhotos；另配 scope 以便单测控制调度。 */
     private val recentPhotosProvider: RecentPhotosProvider? = null,
-    private val recentPhotosScopeOverride: CoroutineScope? = null
+    private val recentPhotosScopeOverride: CoroutineScope? = null,
+    /** 测试注入口（F2'）：无 graph 的 JVM 测试用这个 scope 挂压缩启动 watch，
+     *  使按会话独立与重挂语义可断言；生产用 graph.gatewayScope。 */
+    private val compactWatchScopeForTest: CoroutineScope? = null,
 ) {
     private val scope = graph?.let { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
     private var runtimeCollection: Job? = null
@@ -94,17 +105,34 @@ class AndroidSharedStateHolder(
     /** providerResult 的自动清除任务（showProviderResult 重置）。 */
     private var appGraphResultAutoClearJob: Job? = null
     private var providerTestBatchActive = false
+    private var providerTestJob: Job? = null
     private var pendingProviderProbe: CompletableDeferred<ProviderProbeReply>? = null
     private var providerProbeId: String? = null
     /** 手动注入的 event 帧按会话持有归一器，与 GatewayRuntime 的实时路径同语义。 */
     private val wirePayloadNormalizers = mutableMapOf<String, PiEventNormalizer>()
     private var inputGeneration = 0L
-    private var branchRestoredDraft: Pair<String, Long>? = null
-    private data class PendingBranchDraft(
-        val sessionId: String, val leafId: String, val generation: Long,
-        val history: GatewayFrame? = null,
+    private var nextInputGeneration = 0L
+    private fun advanceInputGeneration() { inputGeneration = ++nextInputGeneration }
+    /** 草稿仅保存在当前进程；null 是当前新建页，重新新建时换成空稿。 */
+    private data class ComposerDraft(
+        val text: String, val images: List<AndroidPreparedImage>, val uris: List<String>,
+        val preparations: Map<String, Long>, val generation: Long,
+        val restoredSend: Pair<String, Long>?,
     )
-    private var pendingBranchDraft: PendingBranchDraft? = null
+    private val sessionDrafts = mutableMapOf<String?, ComposerDraft>()
+    private var composerSessionId: String? = null
+    private var composerNavigationEpoch = 0L
+    internal data class BranchDraftConfirmation(
+        val sessionId: String, val entryId: String, val generation: Long, val navigationEpoch: Long,
+    )
+    internal var branchDraftConfirmation: BranchDraftConfirmation? by mutableStateOf(null)
+        private set
+    private data class BranchNavigation(
+        val sessionId: String, val entryId: String, val generation: Long,
+        val navigationEpoch: Long, val replaceDraft: Boolean,
+    )
+    private var branchNavigation: BranchNavigation? = null
+    private var branchRestoredDraft: Pair<String, Long>? = null
     private var pendingSelectedSessionId: String? = null
     private val sessionControlsRefresh = SessionControlsRefresh()
     private val thumbnailCache = BoundedLruCache<String, ImageBitmap>(MAXIMUM_THUMBNAIL_BYTES) {
@@ -141,8 +169,12 @@ class AndroidSharedStateHolder(
     var endpointCandidates: List<String> by mutableStateOf(emptyList<String>())
         private set
     var pairingPayload: String by mutableStateOf("")
+    var gatewayUiEpoch: Long by mutableLongStateOf(0L)
+        private set
     /** 本次App进程中的Provider列表视图顺序；不写Pi配置，也不改变模型scope。 */
     private val providerModelViewOrders = mutableMapOf<String, List<String>>()
+    /** 首入口与Provider隔离；仅内存，关闭离线编辑卡后可继续，重配时清除。 */
+    internal val providerEditorDrafts = mutableMapOf<Pair<String, String>, ProviderEditorDraft>()
 
     internal fun providerModelViewOrder(providerId: String): List<String> =
         providerModelViewOrders[providerId].orEmpty()
@@ -201,6 +233,7 @@ class AndroidSharedStateHolder(
     var pingResult: String? by mutableStateOf(null)
         private set
     var directoryPath: String? by mutableStateOf(null)
+    private var requestedDirectoryPath: String? = null
     /** 目录面板内错误（null=无）：面板内展示+重试，不只靠全局弹窗。 */
     var directoryError: String? by mutableStateOf(null)
         private set
@@ -228,7 +261,7 @@ class AndroidSharedStateHolder(
         set(value) {
             if (messageDraftState != value) {
                 messageDraftState = value
-                inputGeneration += 1
+                advanceInputGeneration()
             }
         }
     private var preparedImagesState: List<AndroidPreparedImage> by mutableStateOf(emptyList())
@@ -237,7 +270,7 @@ class AndroidSharedStateHolder(
         private set(value) {
             if (preparedImagesState != value) {
                 preparedImagesState = value
-                inputGeneration += 1
+                advanceInputGeneration()
             }
         }
     /** 与 preparedImages 同序的来源 uri（P4c：托盘勾选态/按 uri 移除的真源）。 */
@@ -245,17 +278,28 @@ class AndroidSharedStateHolder(
         private set
     private var imagePreparationSequence = 0L
     private var imagePreparations: Map<String, Long> by mutableStateOf(emptyMap())
-    private val imagePreparationJobs = mutableMapOf<String, Job>()
+    private val imagePreparationJobs = mutableMapOf<Long, Job>()
     val preparingPhotoUris: Set<String>
         get() = imagePreparations.keys
     var attachmentThumbnails: Map<String, ImageBitmap> by mutableStateOf(emptyMap())
         private set
     var attachmentStates: Map<String, AttachmentLoadState> by mutableStateOf(emptyMap())
         private set
-    var platformError: String? by mutableStateOf(null)
+    var modelCatalogIsLoading by mutableStateOf(false)
         private set
-    /** 全局错误弹窗的确认动作：按错误来源给对的键，默认重连。 */
-    var platformErrorAction: PlatformErrorAction by mutableStateOf(PlatformErrorAction.RECONNECT)
+    var modelCatalogError: String? by mutableStateOf(null)
+        private set
+
+    private var platformErrorValue: String? by mutableStateOf(null)
+    var platformError: String?
+        get() = platformErrorValue
+        private set(value) {
+            platformErrorValue = value
+            platformErrorAction = if (GatewayErrorText.isConnectionFailure(value)) PlatformErrorAction.RECONNECT
+                else PlatformErrorAction.DISMISS_ONLY
+        }
+    /** 每次新错误重置动作，避免上一次目录重试/重连动作串到本地失败。 */
+    var platformErrorAction: PlatformErrorAction by mutableStateOf(PlatformErrorAction.DISMISS_ONLY)
         private set
 
     /** 全局错误弹窗确认键动作。 */
@@ -275,6 +319,100 @@ class AndroidSharedStateHolder(
         val target = latestEntryId(sessionId) ?: return
         switchBranchTo(target)
     }
+
+    // ---- 手动压缩上下文（CTX02）：真实 compact 生命周期与本地等待记账 ----
+
+    /** 一次本地请求的身份；重置时同时取消尚未发送的任务与提示计时器。 */
+    private class PendingCompact {
+        var watch: Job? = null
+        var send: Job? = null
+    }
+
+    private val compactPendingSessions: SnapshotStateMap<String, PendingCompact> = mutableStateMapOf()
+    private val compactStartupWatchMillis = 8_000L
+    private val compactSeenEvents = mutableSetOf<String>()
+
+    fun canStartManualCompact(): Boolean {
+        val sessionId = snapshot.selectedSessionId ?: return false
+        return supportsRequest("compact") &&
+            (gatewayState.connection == GatewayConnectionState.CONNECTED || compactGateForceOpenForTest) &&
+            sessionId !in compactPendingSessions &&
+            snapshot.sessionStates[sessionId]?.isCompacting != true &&
+            !selectedSessionRecalling() && !selectedSessionStopping()
+    }
+
+    internal var compactGateForceOpenForTest: Boolean = false
+    internal val compactRequestsForTest = mutableListOf<String>()
+
+    private fun finishCompactPending(sessionId: String?, notice: String? = null) {
+        val pending = compactPendingSessions.remove(sessionId ?: return) ?: return
+        pending.watch?.cancel()
+        pending.send?.cancel()
+        if (notice != null && snapshot.selectedSessionId == sessionId) showTransientNotice(notice)
+    }
+
+    /** Runtime 的三种请求终态共用同一处理，不把后台会话提示弹到当前页。 */
+    internal fun finishManualCompactRequest(requestType: String, sessionId: String?, notice: String) {
+        if (requestType == "compact") finishCompactPending(sessionId, notice)
+    }
+
+    private fun clearPendingManualCompacts() {
+        compactPendingSessions.values.forEach { pending ->
+            pending.watch?.cancel()
+            pending.send?.cancel()
+        }
+        compactPendingSessions.clear()
+    }
+
+    /** 8秒只是启动提示时间，不能据此推断请求未执行或安全地再次触发。
+     *  等待由实际开始/结束、明确拒绝、断连请求终态或重置收尾。 */
+    private fun watchCompactStartup(scope: CoroutineScope, sessionId: String, pending: PendingCompact) {
+        if (compactPendingSessions[sessionId] !== pending) return
+        pending.watch?.cancel()
+        pending.watch = scope.launch {
+            delay(compactStartupWatchMillis)
+            withContext(Dispatchers.Main.immediate) {
+                if (compactPendingSessions[sessionId] === pending && snapshot.selectedSessionId == sessionId) {
+                    showTransientNotice("压缩仍在启动，请稍候")
+                }
+            }
+        }
+    }
+
+    internal fun compactWatchJobForTest(sessionId: String): Job? = compactPendingSessions[sessionId]?.watch
+
+    internal fun rearmCompactWatchForTest(sessionId: String) {
+        val pending = compactPendingSessions[sessionId] ?: return
+        compactWatchScopeForTest?.let { watchCompactStartup(it, sessionId, pending) }
+    }
+
+    private fun observeCompactingStarted(sessionId: String?) {
+        if (sessionId != null && snapshot.sessionStates[sessionId]?.isCompacting == true) {
+            finishCompactPending(sessionId)
+        }
+    }
+
+    /** 压缩收尾（compact/end、notice/compact）后补拉一次会话 state：SDK 压缩后
+     *  统计可能为 null（圆环显示 —）；只在事件归属当前选中会话时补拉，避免挤掉
+     *  其他会话排队中的 state 请求（M4）；重复/迟到事件由 [compactSeenEvents] 吸收
+     *  （键带 seq，同会话第二轮压缩不受首轮残留键影响，R1）。 */
+    private fun requestStateAfterCompaction(
+        appGraph: AndroidAppGraph?,
+        sessionId: String?,
+    ) {
+        if (sessionId.isNullOrBlank()) return
+        if (sessionId != snapshot.selectedSessionId) return
+        // 外层事件键已带 seq 去重（R1）：同帧多路径到达由外层拦截，这里直接发请求。
+        if (appGraph == null) {
+            // 测试缝（R2）：仅无 graph 的 JVM 测试记录补拉意图（R3-2：生产不写）。
+            stateRequestsAfterCompactionForTest.add(sessionId)
+            return
+        }
+        appGraph.gatewayScope.launch { appGraph.gatewayRuntime.requestState(sessionId) }
+    }
+
+    /** 测试缝（R2）：记录收尾后实际发出的 state 补拉目标（含无 graph 测试路径）。 */
+    internal val stateRequestsAfterCompactionForTest = mutableListOf<String>()
 
     /** 非阻断提示条：lane 挡回、未连接重试这类“预期内失败”不该弹模态窗。 */
     var transientNotice: String? by mutableStateOf(null)
@@ -354,6 +492,13 @@ class AndroidSharedStateHolder(
                 launch {
                     // 黑名单只在首次发射时加载：之后以内存为准（hide/restore 乐观更新 +
                     // 异步落盘）。否则磁盘回灌会把连续两次操作的前一次结果闪回列表。
+                    (appGraph.preferences as? AndroidGatewayPreferences)?.let { preferences ->
+                        launch {
+                            preferences.readFailed.collect { failed ->
+                                if (failed) withContext(Dispatchers.Main.immediate) { notifyUser("本地设置读取失败，请重试") }
+                            }
+                        }
+                    }
                     var hiddenSessionsLoaded = false
                     appGraph.preferences.snapshots.collect { value ->
                         withContext(Dispatchers.Main.immediate) {
@@ -374,7 +519,6 @@ class AndroidSharedStateHolder(
                 launch {
                     appGraph.gatewayRuntime.state.collect { state ->
                         appGraph.diagnostics.runtimeState(state)
-                        var shouldCatchUpSelectedHistory = false
                         withContext(Dispatchers.Main.immediate) {
                             val didReconnect = state.connection == GatewayConnectionState.CONNECTED &&
                                 lastObservedConnection != GatewayConnectionState.CONNECTED
@@ -400,23 +544,7 @@ class AndroidSharedStateHolder(
                             // 驱动旧 job 收尾（FAILED 终态，手动 retry 才重取）；这里若
                             // 把 active 塞回队首重派，旧 job 按同 cacheKey 收尾会误清
                             // 重派的 active，产生重复请求与乱序。history catch-up 不受影响。
-                            if (didReconnect) {
-                                inputAssist.reset()
-                                refreshInputResources()
-                                if (supportsRequest("providers")) loadProviders()
-                                refreshModelCatalog()
-                                shouldCatchUpSelectedHistory = snapshot.selectedSessionId != null
-                                // 清单会话级且廉价：重连后重拉一次。
-                                slashCommands = null
-                                commandsLoading = false
-                                snapshot.selectedSessionId?.let { refreshSlashCommands(it) }
-                            }
                             lastObservedConnection = state.connection
-                        }
-                        // 订阅只补发重连后的实时事件。重新拉取 latest history，按 seq 与
-                        // 本地 live tail 合并，补齐应用在后台断线期间由其他端发送的用户消息。
-                        if (shouldCatchUpSelectedHistory) {
-                            projectionActor.catchUpSelectedHistoryAfterReconnect()
                         }
                     }
                 }
@@ -425,6 +553,7 @@ class AndroidSharedStateHolder(
                         appGraph.diagnostics.runtimeEvent(event)
                         when (event) {
                             is GatewayRuntimeEvent.Frame -> {
+                                if (event.gatewayRevision != appGraph.gatewayRuntime.state.value.gatewayRevision) return@collect
                                 if (event.frame.kind == "session-named") {
                                     withContext(Dispatchers.Main.immediate) {
                                         val pending = pendingSessionName
@@ -460,6 +589,19 @@ class AndroidSharedStateHolder(
                                     }
                                     false
                                 }
+                                if (event.frame.kind == "hello") {
+                                    withContext(Dispatchers.Main.immediate) {
+                                        gatewayState = appGraph.gatewayRuntime.state.value
+                                        inputAssist.reset()
+                                        refreshInputResources()
+                                        if (supportsRequest("providers")) loadProviders()
+                                        refreshModelCatalog()
+                                        slashCommands = null
+                                        commandsLoading = false
+                                        snapshot.selectedSessionId?.let { refreshSlashCommands(it) }
+                                    }
+                                    projectionActor.catchUpSelectedHistoryAfterReconnect()
+                                }
                                 if (!isStreamingChunk) {
                                     if (event.frame.kind == "sent") {
                                         event.frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
@@ -488,8 +630,16 @@ class AndroidSharedStateHolder(
                             is GatewayRuntimeEvent.RequestQueued -> Unit
                             is GatewayRuntimeEvent.RequestCancelled -> {
                                 withContext(Dispatchers.Main.immediate) {
+                                    finishBranchDraftRequest(event.requestType, event.targetSessionId)
+                                    if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
+                                    if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
+                                    if (event.requestType == "compact") {
+                                        finishManualCompactRequest(event.requestType, event.targetSessionId, "压缩请求未确认，请重连后核对")
+                                    }
+                                    handleWorkspaceRequestCancelled(event)
+                                    finishModelCatalogFailure(event.requestType, "模型加载已中断，请重试")
                                     inputAssist.fail(event.requestType, event.correlationId, "加载已中断")
-                                    failSessionName(event.requestType, event.targetSessionId, "改名保存未确认，请重试")
+                                    failSessionName(event.requestType, event.targetSessionId, "保存未确认，请重新打开核对")
                                     if (event.requestType == "ping" && pingStarted != null &&
                                         (event.correlationId == null || event.correlationId == activePingId)) finishPing(
                                         if (gatewayState.connection == GatewayConnectionState.CONNECTED) "测速未完成" else "未连接"
@@ -506,12 +656,15 @@ class AndroidSharedStateHolder(
                                         treeLoading = false
                                         treeError = "加载被中断"
                                     }
+                                    // 树页动作（复制/标签）被取消：必须终态，否则动作卡按钮
+                                    // 永久停在“处理中”且回调泄漏。
+                                    failTreeAction(event.requestType, event.targetSessionId, "操作已中断，请重试")
                                     // provider 系（含 provider-test）被取消时不能把 loading 卡住，
                                     // 否则“测试中…”永久 disable 且后续点击被静默丢弃。
                                     clearProviderRequestLoading(event.requestType, "连接测试已取消，请重试")
                                     finishModelScopeFailure(event.requestType, event.correlationId,
                                         if (event.requestType == "model-scope") "加载已中断，请重新加载"
-                                        else "请求已中断；保存结果未确认，请重新加载核对")
+                                        else "保存未确认，请重新打开核对")
                                     if (event.requestType in PROVIDER_REQUEST_TYPES) {
                                         // 经 showProviderResult 统一管理清除任务：直接赋值会
                                         // 绕过旧 timer 的取消，旧成功提示的 4s 清除会把本终态
@@ -540,8 +693,18 @@ class AndroidSharedStateHolder(
                             }
                             is GatewayRuntimeEvent.RequestTimedOut -> {
                                 withContext(Dispatchers.Main.immediate) {
-                                    inputAssist.fail(event.requestType, event.correlationId, "加载超时，点击重试")
-                                    failSessionName(event.requestType, event.targetSessionId, "改名保存未确认，请重试")
+                                    finishBranchDraftRequest(event.requestType, event.targetSessionId)
+                                    if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
+                                    if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
+                                    if (event.requestType == "compact") {
+                                        finishManualCompactRequest(event.requestType, event.targetSessionId, "压缩请求未确认，请重连后核对")
+                                    }
+                                    if (event.requestType in WORKSPACE_REQUEST_TYPES) directoryError =
+                                        if (event.requestType == "directories") "请求超时，请重试"
+                                        else "创建未确认，请重新打开核对"
+                                    finishModelCatalogFailure(event.requestType, "请求超时，请重试")
+                                    inputAssist.fail(event.requestType, event.correlationId, "请求超时，请重试")
+                                    failSessionName(event.requestType, event.targetSessionId, "保存未确认，请重新打开核对")
                                     if (event.requestType == "ping" && pingStarted != null &&
                                         (event.correlationId == null || event.correlationId == activePingId)) finishPing("测速超时")
                                     clearWorkspaceRequestLoading(event.requestType)
@@ -549,8 +712,8 @@ class AndroidSharedStateHolder(
                                     // RequestTimedOut 结束在途请求）。
                                     clearProviderRequestLoading(event.requestType, "连接测试超时，请重试")
                                     finishModelScopeFailure(event.requestType, event.correlationId,
-                                        if (event.requestType == "model-scope") "加载超时，请重新加载"
-                                        else "请求超时；保存结果未确认，请重新加载核对")
+                                        if (event.requestType == "model-scope") "请求超时，请重试"
+                                        else "保存未确认，请重新打开核对")
                                     if (event.requestType in PROVIDER_REQUEST_TYPES) {
                                         // 同 RequestCancelled：走 showProviderResult 管理 4s 清除。
                                         val detail = providerUnconfirmedResultText(event.requestType, "超时")
@@ -564,6 +727,7 @@ class AndroidSharedStateHolder(
                                         treeLoading = false
                                         treeError = "加载超时"
                                     }
+                                    failTreeAction(event.requestType, event.targetSessionId, "请求超时，请重试")
                                     // 清单失败静默：联想入口隐藏，不打断对话。
                                     if (event.requestType == "commands") {
                                         commandsLoading = false
@@ -586,28 +750,40 @@ class AndroidSharedStateHolder(
                             }
                             is GatewayRuntimeEvent.RequestRejected -> {
                                 withContext(Dispatchers.Main.immediate) {
-                                    if (event.requestType in setOf("input-resources", "input-completions")) {
-                                        inputAssist.fail(event.requestType, event.correlationId, "加载失败，点击重试")
+                                    finishBranchDraftRequest(event.requestType, event.targetSessionId)
+                                    if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
+                                    if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
+                                    if (event.requestType == "compact") {
+                                        // 压缩请求被拒/启动失败（如未选模型）：收尾本地等待并给
+                                        // 瞬态提示，不接全局错误面（压缩是可重试的常规动作）。
+                                        finishManualCompactRequest(
+                                            event.requestType, event.targetSessionId,
+                                            GatewayErrorText.request("compact", event.reason)
+                                        )
                                         return@withContext
                                     }
-                                    failSessionName(event.requestType, event.targetSessionId, "改名失败：${event.reason}")
+                                    if (event.requestType == "models") {
+                                        finishModelCatalogFailure("models", GatewayErrorText.request("models", event.reason))
+                                        return@withContext
+                                    }
+                                    if (event.requestType in setOf("input-resources", "input-completions")) {
+                                        inputAssist.fail(event.requestType, event.correlationId, GatewayErrorText.request(event.requestType, event.reason))
+                                        return@withContext
+                                    }
+                                    failSessionName(event.requestType, event.targetSessionId, GatewayErrorText.request("session-name", event.reason))
                                     clearWorkspaceRequestLoading(event.requestType)
                                     if (event.requestType == "model-scope" || event.requestType == "model-scope-put") {
-                                        finishModelScopeFailure(event.requestType, event.correlationId, when (event.reason) {
-                                            "scope-conflict" -> "范围已被电脑端或其他设备更改，请重新加载后再保存"
-                                            "scope-read-failed" -> "Pi 设置读取失败，请检查电脑端配置后重试"
-                                            "scope-save-failed" -> "保存结果未确认，请重新加载核对"
-                                            else -> "模型范围请求未完成，请重试"
-                                        })
+                                        finishModelScopeFailure(event.requestType, event.correlationId,
+                                            GatewayErrorText.request(event.requestType, event.reason))
                                         return@withContext
                                     }
                                     if (event.requestType in PROVIDER_REQUEST_TYPES) {
                                         // Runtime 将网关 error 转为 RequestRejected，不再发布原帧。
                                         // 这里必须结束 loading 并给表单回执；只展示稳定错误码。
-                                        clearProviderRequestLoading(event.requestType, "Provider 操作失败：${event.reason}")
+                                        clearProviderRequestLoading(event.requestType, GatewayErrorText.request(event.requestType, event.reason))
                                         // 同上：走 showProviderResult 管理 4s 清除；reason 是
                                         // Runtime 稳定错误码，不回显原始 upstream message。
-                                        val detail = "Provider 操作失败：${event.reason}"
+                                        val detail = GatewayErrorText.request(event.requestType, event.reason)
                                         showProviderResult(detail)
                                         // 只有 provider-put 的拒绝才是保存的终态（真失败）。
                                         if (event.requestType == "provider-put") {
@@ -617,7 +793,15 @@ class AndroidSharedStateHolder(
                                     }
                                     if (event.requestType == "tree") {
                                         treeLoading = false
-                                        treeError = event.reason ?: "加载失败"
+                                        treeError = GatewayErrorText.request("tree", event.reason)
+                                    }
+                                    // 树页动作的服务端拒绝（entry-not-found / entry-copy-empty /
+                                    // session-not-found / bad-request）：只给动作卡回执，不进全局
+                                    // 错误面（该面带重连动作，对这类例行拒绝是误导）。
+                                    if (event.requestType == "entry-copy" || event.requestType == "label-put") {
+                                        failTreeAction(event.requestType, event.targetSessionId,
+                                            GatewayErrorText.request(event.requestType, event.reason))
+                                        return@withContext
                                     }
                                     if (event.requestType == "commands") {
                                         // 联想清单失败真静默：不进通用错误面。
@@ -636,24 +820,23 @@ class AndroidSharedStateHolder(
                                         // send-failed 等连接级原因仍落全局错误面（审查 m5）。
                                         val text = switchBranchRejectionText(event.reason)
                                         if (text != null) showTransientNotice(text)
-                                        else platformError = "${event.requestType}: ${event.reason}"
+                                        else {
+                                            platformError = GatewayErrorText.request(event.requestType, event.reason)
+                                            if (GatewayErrorText.isConnectionFailure(event.reason)) platformErrorAction = PlatformErrorAction.RECONNECT
+                                        }
                                     } else if (event.requestType in WORKSPACE_REQUEST_TYPES) {
                                         // 目录读取/新建失败（DEC-F09-CWD）：面板内错误行+重试，
                                         // 全局弹窗的确认键是「重试」当前目录而不是重连。原
                                         // handleWorkspaceFrame 的 error 分支收不到这类失败——
                                         // Runtime 不发布 error 原帧（F10 实测）。
-                                        directoryError = event.reason
-                                        platformError = "${event.requestType}: ${event.reason}"
-                                        platformErrorAction = PlatformErrorAction.RETRY_DIRECTORY
-                                    } else {
-                                        platformError = "${event.requestType}: ${event.reason}"
+                                        directoryError = GatewayErrorText.request(event.requestType, event.reason)
+                                        platformError = GatewayErrorText.request(event.requestType, event.reason)
+                                        platformErrorAction = if (event.requestType == "directories") PlatformErrorAction.RETRY_DIRECTORY else PlatformErrorAction.DISMISS_ONLY
+                                    } else if (event.requestType != "history" && event.requestType != "tree") {
+                                        platformError = GatewayErrorText.request(event.requestType, event.reason)
+                                        if (GatewayErrorText.isConnectionFailure(event.reason)) platformErrorAction = PlatformErrorAction.RECONNECT
                                     }
-                                    // 服务端明确拒绝 message（协议声明码，非本地 busy/未连接）：
-                                    // 收敛为 FAILED（手动恢复保留）并按收窄范围回填——只有
-                                    // 新会话首条纯文本（DEC-F09-CWD）；带图草稿不自动回填。
-                                    if (event.requestType == "message" && event.reason in SERVER_REJECTION_CODES) {
-                                        handleOutgoingServerReject()
-                                    }
+                                    handleOutgoingMessageRejection(event)
                                     if (event.requestType == "history") {
                                         event.targetSessionId?.let {
                                             historyPagingSessionIds = historyPagingSessionIds - it
@@ -661,7 +844,7 @@ class AndroidSharedStateHolder(
                                     }
                                 }
                                 event.targetSessionId?.takeIf { event.requestType == "history" }
-                                    ?.let { projectionActor.historyCancelled(it) }
+                                    ?.let { projectionActor.historyRejected(it, event.reason) }
                                 // attachment 拒绝终态由 fetchAttachment 返回 null 收敛。
                                 // 同步拒绝（request-busy/未连接/发送异常）不走这里：
                                 // runtime.sendMessage 返回 false 后由回写按 token 权威收敛，
@@ -677,7 +860,7 @@ class AndroidSharedStateHolder(
                     runCatching { appGraph.gatewayRuntime.connectStoredIfPaired() }
                         .onFailure {
                             withContext(Dispatchers.Main.immediate) {
-                                platformError = "stored-connect-failed"
+                                showPlatformError("stored-connect-failed")
                             }
                         }
                 }
@@ -707,7 +890,7 @@ class AndroidSharedStateHolder(
                     // 不再要求测试手工调 handleOutgoingEcho 作弊。
                     afterFramePublish(null, frame, frame.sessionId, normalizedEvents)
                 }
-                .onFailure { platformError = "decode-failed" }
+                .onFailure { showPlatformError("decode-failed") }
             return
         }
         appGraph.gatewayScope.launch {
@@ -724,7 +907,7 @@ class AndroidSharedStateHolder(
                     }
                 }
                 .onFailure {
-                    withContext(Dispatchers.Main.immediate) { platformError = "decode-failed" }
+                    withContext(Dispatchers.Main.immediate) { showPlatformError("decode-failed") }
                 }
         }
     }
@@ -738,20 +921,55 @@ class AndroidSharedStateHolder(
         return normalizer.normalize(frame.seq ?: 0, frame.time ?: 0.0, event, frame.entryId)
     }
 
+    private fun currentComposerDraft() = ComposerDraft(
+        messageDraft, preparedImages, preparedUris, imagePreparations, inputGeneration, autoRestoredDraft,
+    )
+
+    private fun isUneditedBranchDraft() = branchRestoredDraft == (composerSessionId to inputGeneration) &&
+        preparedImages.isEmpty() && preparedUris.isEmpty() && imagePreparations.isEmpty()
+
+    private fun showComposerDraft(owner: String?, draft: ComposerDraft?) {
+        composerSessionId = owner
+        // 导航恢复同一修订；之后的编辑始终从全局单调序列领取新修订，迟到发送可精确清原稿。
+        messageDraftState = draft?.text.orEmpty()
+        preparedImagesState = draft?.images.orEmpty()
+        preparedUris = draft?.uris.orEmpty()
+        imagePreparations = draft?.preparations.orEmpty()
+        inputGeneration = draft?.generation ?: ++nextInputGeneration
+        autoRestoredDraft = draft?.restoredSend
+        branchRestoredDraft = null
+    }
+
+    private fun prepareComposerForNavigation(targetSessionId: String?, newPage: Boolean = false) {
+        composerNavigationEpoch += 1
+        branchNavigation = null
+        branchDraftConfirmation = null
+        if (!newPage && composerSessionId == targetSessionId) return
+        val current = currentComposerDraft()
+        if (!isUneditedBranchDraft() && (current.text.isNotEmpty() || current.images.isNotEmpty() ||
+                current.preparations.isNotEmpty())) sessionDrafts[composerSessionId] = current
+        else sessionDrafts.remove(composerSessionId)
+        if (newPage) sessionDrafts.remove(null)?.preparations?.values?.forEach { imagePreparationJobs.remove(it)?.cancel() }
+        showComposerDraft(targetSessionId, sessionDrafts.remove(targetSessionId))
+        closePhotosTray()
+    }
+
     fun selectSession(sessionId: String) {
+        prepareComposerForNavigation(sessionId)
+        if (sessionId != snapshot.selectedSessionId) clearTreeActions()
         sessionControlsRefresh.reset()
         graph?.diagnostics?.intent(GatewayDiagnosticAction.SELECT_SESSION, hasSession = true)
         pendingSelectedSessionId = sessionId
         pendingModelSelection = null
         // 进入已有会话即消费掉「退出新建时沿用的目录」：它只对紧接的那一页空白页有效。
         pendingNewSessionCwd = null
-        inputGeneration += 1
         val afterPublish = {
             if (pendingSelectedSessionId == sessionId) pendingSelectedSessionId = null
             visibleAttachmentKeys = emptySet()
             pruneAttachmentStateForSession()
             // 切换后“可见上下文”变了，重算一次终态预览的保留集。
             refreshOutgoingPreviews()
+            restoreStoppedQueueDraft(sessionId)
         }
         val appGraph = graph
         if (appGraph == null) {
@@ -777,6 +995,8 @@ class AndroidSharedStateHolder(
      * 则保留既有沿用值，不把刚定格的上下文退回成“猜最近会话目录”。
      */
     fun prepareNewSession(cwd: String? = null) {
+        prepareComposerForNavigation(null, newPage = true)
+        clearTreeActions()
         sessionControlsRefresh.reset()
         pendingSelectedSessionId = null
         pendingModelSelection = null
@@ -785,7 +1005,6 @@ class AndroidSharedStateHolder(
             selectedDirectoryPath = null
             pendingNewSessionCwd = cwd
         }
-        inputGeneration += 1
         // 未绑定 sessionId 的发送预览只属于发起时的那个新建对话页：重开新会话
         // 页换代后旧预览不再显示（回显匹配与移除不受显示过滤影响）。
         newSessionEpoch += 1
@@ -831,6 +1050,7 @@ class AndroidSharedStateHolder(
         }
         directoryIsLoading = true
         directoryError = null
+        requestedDirectoryPath = path
         appGraph.gatewayScope.launch {
             val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.directories(path))
             if (!accepted) withContext(Dispatchers.Main.immediate) {
@@ -838,6 +1058,12 @@ class AndroidSharedStateHolder(
                 platformError = "目录请求正在处理中，请稍后重试"
             }
         }
+    }
+
+    fun retryDirectoryBrowsing() {
+        val path = requestedDirectoryPath
+        clearPlatformError()
+        browseDirectories(path)
     }
 
     fun createDirectory(parentPath: String, name: String) {
@@ -883,13 +1109,26 @@ class AndroidSharedStateHolder(
         pendingNewSessionCwd = null
     }
 
+    private suspend fun saveLocalPreference(
+        preferences: GatewayPreferences,
+        transform: (GatewayPreferencesSnapshot) -> GatewayPreferencesSnapshot,
+    ) {
+        try {
+            preferences.updateFields(transform)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            withContext(Dispatchers.Main.immediate) { notifyUser("设置保存失败，请重试") }
+        }
+    }
+
     /** 保存外观模式；切换即时生效（组合内直接读 [appearanceMode]）。 */
     fun updateAppearanceMode(mode: String) {
         val appGraph = graph ?: return
         val normalized = when (mode) { "light", "dark" -> mode; else -> "system" }
         appearanceMode = normalized
         appGraph.gatewayScope.launch {
-            appGraph.preferences.updateFields { it.copy(appearanceMode = normalized) }
+            saveLocalPreference(appGraph.preferences) { it.copy(appearanceMode = normalized) }
         }
     }
 
@@ -899,7 +1138,7 @@ class AndroidSharedStateHolder(
         val value = title.trim().takeIf { it.isNotEmpty() }
         heroTitle = value
         appGraph.gatewayScope.launch {
-            appGraph.preferences.updateFields { it.copy(heroTitle = value) }
+            saveLocalPreference(appGraph.preferences) { it.copy(heroTitle = value) }
         }
     }
 
@@ -909,7 +1148,7 @@ class AndroidSharedStateHolder(
         val value = tagline.trim().takeIf { it.isNotEmpty() }
         heroTagline = value
         appGraph.gatewayScope.launch {
-            appGraph.preferences.updateFields { it.copy(heroTagline = value) }
+            saveLocalPreference(appGraph.preferences) { it.copy(heroTagline = value) }
         }
     }
 
@@ -967,7 +1206,7 @@ class AndroidSharedStateHolder(
         hiddenSessionIds = hiddenSessionIds + sessionId
         appGraph.gatewayScope.launch {
             // 事务内基于磁盘当前值合并，避免用调用时的快照覆盖并发写入。
-            appGraph.preferences.updateFields { current ->
+            saveLocalPreference(appGraph.preferences) { current ->
                 current.copy(hiddenSessionIds = (current.hiddenSessionIds + sessionId).distinct())
             }
         }
@@ -978,7 +1217,7 @@ class AndroidSharedStateHolder(
         if (sessionId !in hiddenSessionIds) return
         hiddenSessionIds = hiddenSessionIds - sessionId
         appGraph.gatewayScope.launch {
-            appGraph.preferences.updateFields { current ->
+            saveLocalPreference(appGraph.preferences) { current ->
                 current.copy(hiddenSessionIds = current.hiddenSessionIds - sessionId)
             }
         }
@@ -990,7 +1229,7 @@ class AndroidSharedStateHolder(
         hiddenSessionIds = emptyList()
         hiddenDirectoryPaths = emptyList()
         appGraph.gatewayScope.launch {
-            appGraph.preferences.updateFields {
+            saveLocalPreference(appGraph.preferences) {
                 it.copy(hiddenSessionIds = emptyList(), hiddenDirectoryPaths = emptyList())
             }
         }
@@ -1006,7 +1245,7 @@ class AndroidSharedStateHolder(
         hiddenDirectoryPaths = hiddenDirectoryPaths + directoryPath
         appGraph.gatewayScope.launch {
             // 事务内合并，同 hideSession 的防并发考量。
-            appGraph.preferences.updateFields { current ->
+            saveLocalPreference(appGraph.preferences) { current ->
                 current.copy(
                     hiddenDirectoryPaths =
                         (current.hiddenDirectoryPaths + directoryPath).distinct()
@@ -1020,7 +1259,7 @@ class AndroidSharedStateHolder(
         if (directoryPath !in hiddenDirectoryPaths) return
         hiddenDirectoryPaths = hiddenDirectoryPaths - directoryPath
         appGraph.gatewayScope.launch {
-            appGraph.preferences.updateFields { current ->
+            saveLocalPreference(appGraph.preferences) { current ->
                 current.copy(hiddenDirectoryPaths = current.hiddenDirectoryPaths - directoryPath)
             }
         }
@@ -1146,11 +1385,22 @@ class AndroidSharedStateHolder(
      */
     fun refreshModelCatalog() {
         val appGraph = graph ?: return
-        if (gatewayState.connection != GatewayConnectionState.CONNECTED) return
-        if (!supportsRequest("models")) return
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED || !supportsRequest("models")) return
+        if (modelCatalogIsLoading) return
+        modelCatalogIsLoading = true
+        modelCatalogError = null
         appGraph.gatewayScope.launch {
-            appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+            if (!accepted) withContext(Dispatchers.Main.immediate) {
+                finishModelCatalogFailure("models", GatewayErrorText.request("models", "send-failed"))
+            }
         }
+    }
+
+    private fun finishModelCatalogFailure(requestType: String, message: String) {
+        if (requestType != "models") return
+        modelCatalogIsLoading = false
+        modelCatalogError = message
     }
 
     fun loadModelScope() {
@@ -1337,14 +1587,16 @@ class AndroidSharedStateHolder(
             return
         }
         val capturedTargets = targets.toList()
+        val ownerEpoch = gatewayUiEpoch
         providerTestBatchActive = true
         providerTestIsLoading = true
         providerTestResult = null
-        uiScope.launch {
+        providerTestJob = uiScope.launch {
             try {
-                providerTestResult = testProviderModelsUntilSuccess(
+                val outcome = testProviderModelsUntilSuccess(
                     targets = capturedTargets,
                     onAttempt = { index, total, target ->
+                        if (ownerEpoch != gatewayUiEpoch) throw CancellationException("gateway-replaced")
                         providerTestProgress = "测试 $index/$total · ${target.modelId ?: "默认模型"}"
                     },
                     probe = { target ->
@@ -1374,6 +1626,8 @@ class AndroidSharedStateHolder(
                         }
                     },
                 )
+                if (ownerEpoch != gatewayUiEpoch) return@launch
+                providerTestResult = outcome
                 if (supportsRequest("providers")) loadProviders()
                 if (supportsRequest("models")) appGraph.gatewayScope.launch {
                     appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
@@ -1382,13 +1636,17 @@ class AndroidSharedStateHolder(
                 throw cancelled
             } catch (_: Exception) {
                 // 不把网络/平台异常原文放进长期显示的表单结果。
-                providerTestResult = ProviderTestOutcome(false, "连接测试未完成，请重试", id)
+                if (ownerEpoch == gatewayUiEpoch) {
+                    providerTestResult = ProviderTestOutcome(false, "连接测试未完成，请重试", id)
+                }
             } finally {
-                pendingProviderProbe = null
-                providerProbeId = null
-                providerTestProgress = null
-                providerTestBatchActive = false
-                providerTestIsLoading = false
+                if (ownerEpoch == gatewayUiEpoch) {
+                    pendingProviderProbe = null
+                    providerProbeId = null
+                    providerTestProgress = null
+                    providerTestBatchActive = false
+                    providerTestIsLoading = false
+                }
             }
         }
     }
@@ -1427,15 +1685,15 @@ class AndroidSharedStateHolder(
     private fun switchBranchRejectionText(code: String?): String? = when (code) {
         "bad-request" -> SWITCH_REJECT_NOTICE
         "session-not-found" -> "会话已不可用，切换分支失败"
-        "internal" -> "切换分支失败，请稍后再试"
+        "internal" -> "节点跳转失败，请重试"
         else -> null
     }
 
     private fun benignRejectionText(requestType: String?, reason: String?): String = when {
-        requestType == "message" && reason == "not-connected" -> "网关未连接，这条消息没发出去；重连后可再按发送"
-        requestType == "message" -> "上一条消息还在处理中，等它结束后再发"
+        requestType == "message" && reason == "not-connected" -> "网关未连接，草稿已保留"
+        requestType == "message" -> "消息处理中，请稍后发送"
         reason == "not-connected" -> "网关未连接，正在重连"
-        else -> "同类请求还在处理中，本次刷新已跳过"
+        else -> "请求处理中，请稍后重试"
     }
 
     /**
@@ -1597,7 +1855,26 @@ class AndroidSharedStateHolder(
                 return SlashCommandOutcome.CONSUMED
             }
             "/compact" -> {
-                showTransientNotice("点上下文占用圆环，从详情里压缩")
+                // C07：/compact 引导直达真实动作（CTX02 接线）。压缩会中止当前
+                // 回答（浮层按钮上方有说明行）；不满足条件时按原因分支给文案（M2），
+                // 只有圆环路径确实可用时才指过去。
+                if (snapshot.selectedSessionId == null) {
+                    showTransientNotice("请先选择或新建一个会话，再压缩上下文")
+                } else if (canStartManualCompact()) {
+                    startManualCompact()
+                } else if (selectedSessionCompacting() ||
+                    snapshot.selectedSessionId in compactPendingSessions
+                ) {
+                    showTransientNotice("正在压缩上下文，请稍候")
+                } else if (gatewayState.connection != GatewayConnectionState.CONNECTED) {
+                    showTransientNotice("尚未连接网关，请连接后再压缩")
+                } else if (!supportsRequest("compact")) {
+                    showTransientNotice("网关不支持手动压缩，请升级网关")
+                } else if (selectedSessionRecalling() || selectedSessionStopping()) {
+                    showTransientNotice("正在撤回或停止，请稍后再压缩")
+                } else {
+                    showTransientNotice("请点上下文占用圆环，从详情里压缩")
+                }
                 messageDraft = ""
                 return SlashCommandOutcome.CONSUMED
             }
@@ -1670,16 +1947,257 @@ class AndroidSharedStateHolder(
         }
     }
 
-    /** 切换分支（pi /tree 的点击语义；PROTOCOL §4.19）。 */
+    /** 浏览节点不改草稿；明确跳转且会覆盖手写/附件时先确认。 */
     fun switchBranchTo(entryId: String) {
-        val sessionId = snapshot.selectedSessionId ?: return
-        pendingBranchDraft = null
+        val sessionId = snapshot.selectedSessionId?.takeIf { it == composerSessionId } ?: return
+        if (branchNavigation != null) { showTransientNotice("正在跳转，请稍候"); return }
+        val target = sessionTree?.takeIf { it.first == sessionId }?.third?.firstOrNull { it.id == entryId }
+        // Pi只有user/custom_message返回editorText；assistant仅移动leaf，不改编辑器。
+        val restoresEditor = target == null || target.type == "custom_message" ||
+            (target.type == "message" && target.role == "user")
+        if (!restoresEditor) {
+            sendBranchNavigation(sessionId, entryId, replaceDraft = false)
+            return
+        }
+        if (!canRestoreOutgoingDraft && !isUneditedBranchDraft()) {
+            branchDraftConfirmation = BranchDraftConfirmation(sessionId, entryId, inputGeneration, composerNavigationEpoch)
+            return
+        }
+        sendBranchNavigation(sessionId, entryId, replaceDraft = true)
+    }
+
+    internal fun dismissBranchDraftConfirmation() { branchDraftConfirmation = null }
+
+    internal fun confirmBranchDraftNavigation(useNodeDraft: Boolean) {
+        val confirmation = branchDraftConfirmation ?: return
+        branchDraftConfirmation = null
+        if (confirmation.sessionId != composerSessionId || confirmation.generation != inputGeneration ||
+            confirmation.navigationEpoch != composerNavigationEpoch) {
+            showTransientNotice("草稿已变化，请重新跳转")
+            return
+        }
+        sendBranchNavigation(confirmation.sessionId, confirmation.entryId, useNodeDraft)
+    }
+
+    private fun sendBranchNavigation(sessionId: String, entryId: String, replaceDraft: Boolean) {
+        val navigation = BranchNavigation(sessionId, entryId, inputGeneration, composerNavigationEpoch, replaceDraft)
+        branchNavigation = navigation
         val appGraph = graph ?: return
         appGraph.gatewayScope.launch {
-            appGraph.gatewayRuntime.sendRequest(
-                GatewayRequests.switchBranch(sessionId, entryId)
-            )
+            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.switchBranch(sessionId, entryId))
+            if (!accepted) withContext(Dispatchers.Main.immediate) {
+                if (branchNavigation === navigation) branchNavigation = null
+            }
         }
+    }
+
+    // -- 树页动作：整条 entry 复制 / 标签写（PROTOCOL §4.26–§4.27）-------------
+
+    /** 复制结果：成功只给**整条 entry 的全文**；失败给可直接展示的稳定文案。
+     *  网关超 512 KiB 时不回文本只回 oversized+bytes，这里如实转成失败文案，
+     *  绝不把 preview 或截断内容当全文塞进剪贴板。 */
+    sealed interface TreeCopyOutcome {
+        data class Copied(val text: String) : TreeCopyOutcome
+        data class Failed(val message: String) : TreeCopyOutcome
+    }
+
+    /** 标签写结果：Saved 带写入后的标签（null=已清除）；Failed 带可展示文案。 */
+    sealed interface TreeLabelOutcome {
+        data class Saved(val entryId: String, val label: String?) : TreeLabelOutcome
+        data class Failed(val entryId: String, val message: String) : TreeLabelOutcome
+    }
+
+    private class PendingTreeCopy(val sessionId: String, val entryId: String) {
+        var send: Job? = null
+    }
+    private class PendingTreeLabel(val sessionId: String, val entryId: String) {
+        var send: Job? = null
+    }
+
+    // 快照状态：动作卡按 treeCopyInFlight/treeLabelInFlight 禁用按钮，
+    // 置位/清除本身必须触发重组（普通字段不会让读取点失效，审查B major）。
+    private var pendingTreeCopy: PendingTreeCopy? by mutableStateOf(null)
+    private var pendingTreeLabel: PendingTreeLabel? by mutableStateOf(null)
+
+    /**
+     * 最近一次动作结果（UI 消费后调 consume* 清空）。
+     *
+     * 用发布状态而不是回调：写系统剪贴板必须在主线程，而帧收尾
+     * （afterFramePublish）不保证在 Main 上；快照状态写入线程安全，由 UI 的
+     * LaunchedEffect 在主线程消费。
+     */
+    var treeCopyOutcome: TreeCopyOutcome? by mutableStateOf(null)
+        private set
+    var treeLabelOutcome: TreeLabelOutcome? by mutableStateOf(null)
+        private set
+
+    fun consumeTreeCopyOutcome() {
+        treeCopyOutcome = null
+    }
+
+    fun consumeTreeLabelOutcome() {
+        treeLabelOutcome = null
+    }
+
+    /** 动作在途（复制/标签各一份）：动作卡据此禁用按钮，不重复提交。 */
+    val treeCopyInFlight: Boolean get() = pendingTreeCopy != null
+    val treeLabelInFlight: Boolean get() = pendingTreeLabel != null
+
+    /** 树页动作是否可用：网关必须明确宣告 `tree-actions-v1`（复制+标签成对上线）。
+     *  与 tree-view-v1 同口径，不沿用 supportsRequest 的“能力表为空即支持”放宽：
+     *  旧网关上直接隐藏入口，而不是点了再报 unknown-command。 */
+    val treeActionsSupported: Boolean
+        get() = "tree-actions-v1" in gatewayState.capabilities
+
+    internal fun beginTreeCopyRequest(sessionId: String, entryId: String) {
+        check(pendingTreeCopy == null)
+        treeCopyOutcome = null
+        pendingTreeCopy = PendingTreeCopy(sessionId, entryId)
+    }
+
+    internal fun beginTreeLabelRequest(sessionId: String, entryId: String) {
+        check(pendingTreeLabel == null)
+        treeLabelOutcome = null
+        pendingTreeLabel = PendingTreeLabel(sessionId, entryId)
+    }
+
+    /** 复制当前选中 entry 的可复制全文（Pi Ctrl+X）。
+     *  迟到/错会话/错条目的应答不认领当前请求。 */
+    fun copyTreeEntry(entryId: String) {
+        val sessionId = snapshot.selectedSessionId
+        val appGraph = graph
+        when {
+            pendingTreeCopy != null -> treeCopyOutcome = TreeCopyOutcome.Failed("上一次复制还没结束")
+            entryId.isBlank() -> treeCopyOutcome = TreeCopyOutcome.Failed("没有选中的条目")
+            sessionId == null -> treeCopyOutcome = TreeCopyOutcome.Failed("当前没有选中的会话")
+            appGraph == null || gatewayState.connection != GatewayConnectionState.CONNECTED ->
+                treeCopyOutcome = TreeCopyOutcome.Failed("请先连接 Pi 网关")
+            !treeActionsSupported -> treeCopyOutcome = TreeCopyOutcome.Failed("网关不支持复制条目全文，请升级网关")
+            else -> {
+                beginTreeCopyRequest(sessionId, entryId)
+                val pending = checkNotNull(pendingTreeCopy)
+                val epoch = gatewayUiEpoch
+                val send = appGraph.gatewayScope.launch(start = CoroutineStart.LAZY) {
+                    val current = withContext(Dispatchers.Main.immediate) {
+                        epoch == gatewayUiEpoch && pendingTreeCopy === pending && snapshot.selectedSessionId == sessionId
+                    }
+                    if (!current) return@launch
+                    val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.entryCopy(sessionId, entryId))
+                    if (!accepted) {
+                        withContext(Dispatchers.Main.immediate) {
+                            if (epoch == gatewayUiEpoch && pendingTreeCopy === pending) {
+                                finishTreeCopy(sessionId, entryId, TreeCopyOutcome.Failed("复制请求未发出，请重试"))
+                            }
+                        }
+                    }
+                }
+                pending.send = send
+                send.start()
+            }
+        }
+    }
+
+    /** 写标签（Pi Shift+L）：`label` 为 null/空白即清除。成功后重拉会话树——追加
+     *  LabelEntry 会推进叶子，树投影的当前行/选择必须由网关重算，客户端不自己猜。 */
+    fun setTreeEntryLabel(entryId: String, label: String?) {
+        val sessionId = snapshot.selectedSessionId
+        val appGraph = graph
+        val normalized = label?.trim()?.takeIf(String::isNotEmpty)
+        when {
+            pendingTreeLabel != null -> treeLabelOutcome =
+                TreeLabelOutcome.Failed(entryId, "上一次标签保存还没结束")
+            entryId.isBlank() -> treeLabelOutcome = TreeLabelOutcome.Failed(entryId, "没有选中的条目")
+            sessionId == null -> treeLabelOutcome = TreeLabelOutcome.Failed(entryId, "当前没有选中的会话")
+            appGraph == null || gatewayState.connection != GatewayConnectionState.CONNECTED ->
+                treeLabelOutcome = TreeLabelOutcome.Failed(entryId, "请先连接 Pi 网关")
+            !treeActionsSupported -> treeLabelOutcome =
+                TreeLabelOutcome.Failed(entryId, "网关不支持标签，请升级网关")
+            // 与网关 LABEL_MAX_CHARS 同口径：超长直接本地拒绝，不发一个必被
+            // bad-request 挡回的请求，也不静默截断成另一个标签。
+            (normalized?.length ?: 0) > TREE_LABEL_MAX_CHARS ->
+                treeLabelOutcome = TreeLabelOutcome.Failed(entryId, "标签最多 $TREE_LABEL_MAX_CHARS 个字符")
+            else -> {
+                beginTreeLabelRequest(sessionId, entryId)
+                val pending = checkNotNull(pendingTreeLabel)
+                val epoch = gatewayUiEpoch
+                val send = appGraph.gatewayScope.launch(start = CoroutineStart.LAZY) {
+                    val current = withContext(Dispatchers.Main.immediate) {
+                        epoch == gatewayUiEpoch && pendingTreeLabel === pending && snapshot.selectedSessionId == sessionId
+                    }
+                    if (!current) return@launch
+                    val accepted = appGraph.gatewayRuntime.sendRequest(
+                        GatewayRequests.labelPut(sessionId, entryId, normalized)
+                    )
+                    if (!accepted) {
+                        withContext(Dispatchers.Main.immediate) {
+                            if (epoch == gatewayUiEpoch && pendingTreeLabel === pending) {
+                                finishTreeLabel(sessionId, entryId, "标签请求未发出，请重试")
+                            }
+                        }
+                    }
+                }
+                pending.send = send
+                send.start()
+            }
+        }
+    }
+
+    /** 结算在途复制：只有会话+条目都对得上才认领（迟到/错目标应答丢弃）。 */
+    private fun finishTreeCopy(sessionId: String?, entryId: String?, outcome: TreeCopyOutcome): Boolean {
+        val pending = pendingTreeCopy ?: return false
+        if (pending.sessionId != sessionId || pending.entryId != entryId) return false
+        pendingTreeCopy = null
+        if (snapshot.selectedSessionId == pending.sessionId) treeCopyOutcome = outcome
+        return true
+    }
+
+    /** 结算在途标签写（失败/中断）：message 是可直接展示的文案。 */
+    private fun finishTreeLabel(sessionId: String?, entryId: String?, message: String): Boolean {
+        val pending = settleTreeLabel(sessionId, entryId) ?: return false
+        if (snapshot.selectedSessionId == pending.sessionId) treeLabelOutcome = TreeLabelOutcome.Failed(pending.entryId, message)
+        return true
+    }
+
+    /** 结算在途标签写（成功）：`label` 取应答帧的权威值（null = 已清除），
+     *  不用客户端输入框的文本冒充网关结果。 */
+    private fun finishTreeLabelSaved(sessionId: String?, entryId: String?, label: String?): Boolean {
+        val pending = settleTreeLabel(sessionId, entryId) ?: return false
+        if (snapshot.selectedSessionId == pending.sessionId) treeLabelOutcome = TreeLabelOutcome.Saved(pending.entryId, label)
+        return true
+    }
+
+    /** 只有会话+条目都对得上才认领在途标签写（迟到/错目标应答丢弃）。 */
+    private fun settleTreeLabel(sessionId: String?, entryId: String?): PendingTreeLabel? {
+        val pending = pendingTreeLabel ?: return null
+        if (pending.sessionId != sessionId || pending.entryId != entryId) return null
+        pendingTreeLabel = null
+        return pending
+    }
+
+    /** 请求级失败（Runtime 把网关 error 帧转 RequestRejected，不再发布原帧）：
+     *  事件只带 requestType/targetSessionId，因此按会话结算该类型的唯一在途请求。 */
+    internal fun failTreeAction(requestType: String?, targetSessionId: String?, message: String) {
+        if (requestType != "entry-copy" && requestType != "label-put") return
+        val matches = { pendingSessionId: String -> targetSessionId == null || pendingSessionId == targetSessionId }
+        if (requestType == "entry-copy") {
+            pendingTreeCopy?.takeIf { matches(it.sessionId) }?.let {
+                finishTreeCopy(it.sessionId, it.entryId, TreeCopyOutcome.Failed(message))
+            }
+        } else {
+            pendingTreeLabel?.takeIf { matches(it.sessionId) }?.let {
+                finishTreeLabel(it.sessionId, it.entryId, message)
+            }
+        }
+    }
+
+    /** 导航或改配后丢弃旧动作发布态，不把旧回执或剪贴板内容带到新页面。 */
+    private fun clearTreeActions() {
+        pendingTreeCopy?.send?.cancel()
+        pendingTreeLabel?.send?.cancel()
+        pendingTreeCopy = null
+        pendingTreeLabel = null
+        treeCopyOutcome = null
+        treeLabelOutcome = null
     }
 
     /** 会话改名（顶部栏点击 / 会话列表长按共用）。
@@ -1721,8 +2239,8 @@ class AndroidSharedStateHolder(
         }
     }
 
-    /** 手动压缩上下文（ctx 圆环弹层入口）。
-     *  会话未选/网关过旧时以 transient notice 提示，不弹错误页。 */
+    /** 圆环主入口。compact-started只表示受理，结束仍以Pi事件和最终state为准。
+     *  请求身份保护迟到续体；压缩不清除当前草稿或附件。 */
     fun startManualCompact() {
         val sessionId = snapshot.selectedSessionId
         if (sessionId == null) {
@@ -1733,12 +2251,48 @@ class AndroidSharedStateHolder(
             showTransientNotice("网关不支持手动压缩，请升级网关")
             return
         }
-        graph?.let { appGraph ->
-            appGraph.gatewayScope.launch {
-                appGraph.gatewayRuntime.sendRequest(GatewayRequests.compact(sessionId))
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED && !compactGateForceOpenForTest) {
+            showTransientNotice("尚未连接网关，请连接后重试")
+            return
+        }
+        if (sessionId in compactPendingSessions) {
+            showTransientNotice("压缩请求已发出，请稍候")
+            return
+        }
+        if (selectedSessionCompacting()) {
+            showTransientNotice("正在压缩上下文，请稍候")
+            return
+        }
+        if (selectedSessionRecalling() || selectedSessionStopping()) {
+            showTransientNotice("正在撤回或停止，请稍候")
+            return
+        }
+        val pending = PendingCompact()
+        compactPendingSessions[sessionId] = pending
+        val appGraph = graph ?: run {
+            compactRequestsForTest.add(sessionId)
+            compactWatchScopeForTest?.let { watchCompactStartup(it, sessionId, pending) }
+            return
+        }
+        val epoch = gatewayUiEpoch
+        pending.send = appGraph.gatewayScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            val current = withContext(Dispatchers.Main.immediate) {
+                gatewayUiEpoch == epoch && compactPendingSessions[sessionId] === pending
+            }
+            if (!current) return@launch
+            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.compact(sessionId))
+            withContext(Dispatchers.Main.immediate) {
+                if (gatewayUiEpoch != epoch || compactPendingSessions[sessionId] !== pending) return@withContext
+                if (!accepted) {
+                    finishCompactPending(sessionId, "压缩请求未发出，请稍候重试")
+                } else if (snapshot.sessionStates[sessionId]?.isCompacting == true) {
+                    finishCompactPending(sessionId)
+                } else {
+                    watchCompactStartup(appGraph.gatewayScope, sessionId, pending)
+                }
             }
         }
-        showTransientNotice("已开始压缩上下文，完成后对话会变精简")
+        pending.send?.start()
     }
 
     fun selectModel(provider: String, modelId: String, thinkingLevel: String?) {
@@ -1781,16 +2335,114 @@ class AndroidSharedStateHolder(
     }
 
     fun reset() {
+        prepareComposerForNavigation(null, newPage = true)
+        clearTreeActions()
         sessionControlsRefresh.reset()
-        inputGeneration += 1
+        advanceInputGeneration()
         pendingSelectedSessionId = null
         pendingModelSelection = null
         wirePayloadNormalizers.clear()
         outgoingPreviewTracker.clearAll()
+        pendingExistingSessionTexts.clear()
+        pendingComposerSends.clear()
+        outgoingDraftRevisions.clear()
+        stoppingSessionId = null
+        pendingQueueRecall = null
+        stoppedQueueDrafts.clear()
+        clearPendingManualCompacts()
+        compactSeenEvents.clear()
+        compactRequestsForTest.clear()
+        stateRequestsAfterCompactionForTest.clear()
         refreshOutgoingPreviews()
         val appGraph = graph
         if (appGraph == null) projectionActor.resetImmediate(::clearAttachmentUiState)
         else appGraph.gatewayScope.launch { projectionActor.reset(::clearAttachmentUiState) }
+    }
+
+    /** 只在收到真正的paired回执后丢弃旧网关派生状态；普通断线保留草稿。 */
+    private fun clearPairedGatewayUiState() {
+        gatewayUiEpoch += 1
+        sessionDrafts.clear()
+        imagePreparationJobs.values.forEach { it.cancel() }
+        imagePreparationJobs.clear()
+        imagePreparations = emptyMap()
+        composerSessionId = null
+        composerNavigationEpoch += 1
+        branchNavigation = null
+        branchDraftConfirmation = null
+        advanceInputGeneration()
+        modelCatalogIsLoading = false
+        modelCatalogError = null
+        pingStarted = null
+        activePingId = null
+        pingResult = null
+        finishSessionName("网关已切换，请重新确认会话标题")
+        sessionControlsRefresh.reset()
+        providerTestJob?.cancel()
+        providerTestJob = null
+        providerTestBatchActive = false
+        pendingProviderProbe = null
+        providerProbeId = null
+        clearProviderRequestLoading()
+        providerTestResult = null
+        providerTestProgress = null
+        providerModelsResult = null
+        providerSaveTerminal = null
+        inFlightSaveToken = null
+        providerResult = null
+        appGraphResultAutoClearJob?.cancel()
+        providers = emptyList()
+        catalogProviders = emptyList()
+        catalogError = null
+        modelScope = null
+        modelScopeIsLoading = false
+        modelScopeIsSaving = false
+        modelScopeError = null
+        modelScopeSavedRequestId = null
+        activeScopeRequestId = null
+        providerEditorDrafts.clear()
+        providerModelViewOrders.clear()
+        pendingSelectedSessionId = null
+        pendingModelSelection = null
+        selectedDirectoryPath = null
+        pendingNewSessionCwd = null
+        requestedDirectoryPath = null
+        directoryPath = null
+        directoryHome = null
+        directoryEntries = emptyList()
+        directoryCrumbs = emptyList()
+        directoryError = null
+        createdDirectoryPathToReveal = null
+        clearWorkspaceRequestLoading()
+        sessionTree = null
+        treeSelectedId = null
+        treeLoading = false
+        treeError = null
+        treeViewSessionId = null
+        treeViewOptions = null
+        clearTreeActions()
+        slashCommands = null
+        commandsLoading = false
+        inputAssist.reset(InputAssistContext())
+        historyPagingSessionIds = emptySet()
+        trajectoryNodes = emptyList()
+        branchRestoredDraft = null
+        wirePayloadNormalizers.clear()
+        outgoingPreviewTracker.clearAll()
+        pendingExistingSessionTexts.clear()
+        pendingComposerSends.clear()
+        outgoingDraftRevisions.clear()
+        stoppingSessionId = null
+        pendingQueueRecall = null
+        stoppedQueueDrafts.clear()
+        clearPendingManualCompacts()
+        compactSeenEvents.clear()
+        compactRequestsForTest.clear()
+        stateRequestsAfterCompactionForTest.clear()
+        refreshOutgoingPreviews()
+        clearAttachmentUiState()
+        platformError = null
+        platformErrorAction = PlatformErrorAction.DISMISS_ONLY
     }
 
     private fun clearAttachmentUiState() {
@@ -1810,7 +2462,7 @@ class AndroidSharedStateHolder(
         val target = endpoint.trim()
         appGraph.gatewayScope.launch {
             val failed = runCatching { appGraph.gatewayRuntime.connect(target) }.isFailure
-            if (failed) withContext(Dispatchers.Main.immediate) { platformError = "connect-failed" }
+            if (failed) withContext(Dispatchers.Main.immediate) { showPlatformError("connect-failed") }
         }
     }
 
@@ -1830,13 +2482,14 @@ class AndroidSharedStateHolder(
             val result = runCatching { appGraph.gatewayRuntime.pair(payload) }
             withContext(Dispatchers.Main.immediate) {
                 if (result.isSuccess) {
+                    providerEditorDrafts.clear()
                     if (pairingPayload == payload) pairingPayload = ""
                     // 扫码/粘贴成功后给显式反馈：不然只有首页状态点隐式变绿，
                     // 用户会以为“扫了没反应”。连接结果仍由状态行呈现。
-                    showTransientNotice("配对成功，正在连接网关…")
+                    showTransientNotice("已提交配对，正在连接网关…")
                 } else {
                     val message = if (result.exceptionOrNull() is GatewayPairingPayloadException) {
-                        result.exceptionOrNull()?.message ?: "配对信息无效"
+                        "配对信息无效"
                     } else {
                         "无法提交配对信息，请稍后重试。"
                     }
@@ -1886,7 +2539,7 @@ class AndroidSharedStateHolder(
             val failure = runCatching { appGraph.gatewayRuntime.setEndpointCandidates(next) }.exceptionOrNull()
             withContext(Dispatchers.Main.immediate + NonCancellable) {
                 val message = if (failure is CancellationException) "保存未确认，请重新打开核对"
-                    else failure?.let { it.message?.takeIf(String::isNotBlank) ?: "保存网关入口失败" }
+                    else failure?.let { if (it is IllegalArgumentException) "网关地址无效" else "网关入口保存失败，请重试" }
                 if (onResult == null && message != null) platformError = message
                 onResult?.invoke(message)
             }
@@ -1923,43 +2576,65 @@ class AndroidSharedStateHolder(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                if (imagePreparations[key] == preparation) platformError = "image-preprocess-failed"
+                if (imagePreparations[key] == preparation) showPlatformError("image-preprocess-failed")
             } finally {
-                if (imagePreparations[key] == preparation) imagePreparations = imagePreparations - key
-                if (imagePreparationJobs[key] === coroutineContext[Job]) imagePreparationJobs.remove(key)
+                finishImagePreparation(key, preparation)
+                if (imagePreparationJobs[preparation] === coroutineContext[Job]) imagePreparationJobs.remove(preparation)
             }
         }
-        if (imagePreparations[key] == preparation) imagePreparationJobs[key] = job
+        if (imagePreparations[key] == preparation) imagePreparationJobs[preparation] = job
     }
 
     internal fun beginImagePreparation(key: String): Long? {
         if (key in preparedUris || key in imagePreparations) return null
         val token = ++imagePreparationSequence
         imagePreparations = imagePreparations + (key to token)
+        advanceInputGeneration()
         return token
     }
 
+    private fun imageFitsDraft(images: List<AndroidPreparedImage>, image: AndroidPreparedImage): Boolean =
+        images.size + 1 <= AndroidImagePreprocessor.MAXIMUM_IMAGE_COUNT &&
+            images.sumOf(AndroidPreparedImage::byteCount) + image.byteCount <= AndroidImagePreprocessor.MAXIMUM_TOTAL_BYTES &&
+            images.sumOf { it.outgoing.base64Data.length } + image.outgoing.base64Data.length <= AndroidImagePreprocessor.MAXIMUM_TOTAL_BASE64_CHARACTERS
+
     internal fun completeImagePreparation(key: String, token: Long, image: AndroidPreparedImage): Boolean {
-        // 取消后或重新选择后，旧任务即使迟到也不能恢复附件。
-        if (imagePreparations[key] != token) return false
-        imagePreparations = imagePreparations - key
-        if (key in preparedUris) return false
-        if (
-            preparedImages.size + 1 > AndroidImagePreprocessor.MAXIMUM_IMAGE_COUNT ||
-            preparedImages.sumOf(AndroidPreparedImage::byteCount) + image.byteCount > AndroidImagePreprocessor.MAXIMUM_TOTAL_BYTES ||
-            preparedImages.sumOf { it.outgoing.base64Data.length } + image.outgoing.base64Data.length > AndroidImagePreprocessor.MAXIMUM_TOTAL_BASE64_CHARACTERS
-        ) {
-            platformError = "image-selection-limit-exceeded"
+        if (imagePreparations[key] == token) {
+            imagePreparations = imagePreparations - key
+            if (key in preparedUris) return false
+            if (!imageFitsDraft(preparedImages, image)) {
+                showPlatformError("image-selection-limit-exceeded")
+                return false
+            }
+            preparedImages = preparedImages + image
+            preparedUris = preparedUris + key
+            return true
+        }
+        // A选图后切B，完成结果只进入A保存的稿；同URI在B重选仍由独立token区分。
+        val saved = sessionDrafts.entries.firstOrNull { it.value.preparations[key] == token } ?: return false
+        val draft = saved.value
+        val remaining = draft.preparations - key
+        if (key in draft.uris || !imageFitsDraft(draft.images, image)) {
+            sessionDrafts[saved.key] = draft.copy(preparations = remaining)
             return false
         }
-        preparedImages = preparedImages + image
-        preparedUris = preparedUris + key
+        sessionDrafts[saved.key] = draft.copy(images = draft.images + image, uris = draft.uris + key,
+            preparations = remaining, generation = ++nextInputGeneration)
         return true
     }
 
+    private fun finishImagePreparation(key: String, token: Long) {
+        if (imagePreparations[key] == token) imagePreparations = imagePreparations - key
+        else sessionDrafts.entries.firstOrNull { it.value.preparations[key] == token }?.let {
+            sessionDrafts[it.key] = it.value.copy(preparations = it.value.preparations - key)
+        }
+    }
+
     internal fun cancelImagePreparation(key: String) {
+        val token = imagePreparations[key] ?: return
         imagePreparations = imagePreparations - key
-        imagePreparationJobs.remove(key)?.cancel()
+        imagePreparationJobs.remove(token)?.cancel()
+        advanceInputGeneration()
     }
 
     fun togglePreparedPhoto(uri: Uri) {
@@ -2055,6 +2730,14 @@ class AndroidSharedStateHolder(
 
     fun sendMessage() {
         val appGraph = graph ?: return
+        if (selectedSessionRecalling()) {
+            showTransientNotice("正在撤回，请稍候")
+            return
+        }
+        if (selectedSessionStopping()) {
+            showTransientNotice("正在停止，请稍候")
+            return
+        }
         if (imagePreparations.isNotEmpty()) {
             showTransientNotice("图片正在处理中，请稍候再发送")
             return
@@ -2080,11 +2763,12 @@ class AndroidSharedStateHolder(
         )
         // pi 语义：isStreaming 时 prompt 必须显式 streamingBehavior。移动端对齐：
         // 忙时点发送 → 草稿吸附到输入框上方，由用户选择 注入本轮/排队下轮。
+        if (pendingComposerSends.isNotEmpty()) { showTransientNotice("上一条消息正在确认，草稿已保留"); return }
         if (selectedSessionBusy()) {
             capturePendingDispatch(submission)
             return
         }
-        if (sendInFlight || dispatchInFlight != null) return
+        if (sendInFlight || dispatchInFlight != null || pendingComposerSends.isNotEmpty()) return
         sendInFlight = true
         // 仅空闲普通发送建立本地预览；忙时吸附派发（dispatchPending）保持原
         // 吸附条语义，不把排队消息伪装成已执行。
@@ -2150,8 +2834,11 @@ class AndroidSharedStateHolder(
         clearInputOnSuccess: Boolean
     ) {
         sendInFlight = false
-        if (clearInputOnSuccess) applyMessageSendResult(submission, sent, outgoing.sendToken)
+        // 本地写入socket不等于网关受理；只有匹配sent回执才能清本次草稿。
+        if (!clearInputOnSuccess || !sent) pendingComposerSends.remove(outgoing.sendToken)
+        if (rejectedBeforeSettleToken == outgoing.sendToken) rejectedBeforeSettleToken = null
         if (!sent) {
+            pendingExistingSessionTexts.remove(outgoing.sendToken)
             // 本地失败：草稿本就没清，不需要回填记录
             if (pendingNewSessionText?.token == outgoing.sendToken) pendingNewSessionText = null
             outgoingPreviewTracker.settleLocalFailure(outgoing.sendToken)?.let { failed ->
@@ -2217,6 +2904,7 @@ class AndroidSharedStateHolder(
             restoreImages = submission.images,
             restoreUris = submission.uris
         )
+        outgoingDraftRevisions[sendToken] = submission
         refreshOutgoingPreviews()
         return PreparedOutgoingSend(sendToken, submission, sentImages)
     }
@@ -2225,6 +2913,7 @@ class AndroidSharedStateHolder(
         // 终态预览的载荷上限回收（每条都持整组 base64）；可见上下文最近两条不被误删。
         outgoingPreviewTracker.pruneRestorable(snapshot.selectedSessionId, newSessionEpoch)
         outgoingPreviews = outgoingPreviewTracker.previews
+        outgoingDraftRevisions.keys.retainAll(outgoingPreviews.mapTo(mutableSetOf()) { it.sendToken })
     }
 
     /**
@@ -2239,6 +2928,12 @@ class AndroidSharedStateHolder(
         val token = outgoingPreviewTracker.newSendToken()
         val outgoing = prepareOutgoingSend(submission, createPreview, token)
         outgoingPreviewTracker.trackAwaiting(token, submission.sessionId)
+        if (createPreview) pendingComposerSends[token] = submission
+        // 既有会话纯文本没有占位气泡；只在发送等待期保留原稿，明确拒绝后
+        // 复用失败恢复条。正常 sent 立即丢弃，不靠文字猜测正式回显身份。
+        if (submission.images.isEmpty() && !submission.sessionId.isNullOrBlank()) {
+            pendingExistingSessionTexts[token] = PendingExistingSessionText(submission, newSessionEpoch)
+        }
         return outgoing
     }
 
@@ -2246,18 +2941,20 @@ class AndroidSharedStateHolder(
      * sent 帧（网关 preflight 受理，PROTOCOL §4.2）：按在途请求队列的队头
      * token 确认预览并尽量绑定真实 sessionId（新会话在此得知归属）；预览
      * 已被 echo 先行移除时仍消费队头（防旧 sent 串绑后续请求），且此刻
-     * 不移除预览——受理不代表模型回显，正式回显才收。
+     * 明确SDK受理时移除本次预览；旧网关无disposition才保留回显等待。
      */
-    internal fun recordOutgoingSent(frameSessionId: String?) {
+    internal fun recordOutgoingSent(frameSessionId: String?, sdkAccepted: Boolean = false) {
         val head = outgoingPreviewTracker.headAwaitingToken()
-        val confirmed = outgoingPreviewTracker.consumeSent(frameSessionId, elapsedRealtimeMs())
-        // 队头被受理（出队）后，它的新会话草稿回填记录作废
-        if (head != null && head != outgoingPreviewTracker.headAwaitingToken() && pendingNewSessionText?.token == head) {
-            pendingNewSessionText = null
+        val changedPreview = outgoingPreviewTracker.consumeSent(frameSessionId, elapsedRealtimeMs(), sdkAccepted)
+        // 队头被受理后只清它对应的那一版，用户后写的文字或其它会话不受影响。
+        if (head != null && head != outgoingPreviewTracker.headAwaitingToken()) {
+            pendingComposerSends.remove(head)?.let { applyMessageSendResult(it, sent = true, outgoingSendToken = head) }
+            pendingExistingSessionTexts.remove(head)
+            if (pendingNewSessionText?.token == head) pendingNewSessionText = null
         }
-        if (confirmed != null) {
+        if (changedPreview != null) {
             refreshOutgoingPreviews()
-            scheduleOutgoingUnconfirmedWatch()
+            if (changedPreview.state == OutgoingImagePreviewState.CONFIRMED) scheduleOutgoingUnconfirmedWatch()
         }
     }
 
@@ -2281,72 +2978,45 @@ class AndroidSharedStateHolder(
     }
 
     private fun restoreBranchDraft(frame: GatewayFrame, hasQueuedText: Boolean) {
-        val sessionId = frame.sessionId?.takeIf { it == snapshot.selectedSessionId } ?: return
-        if (frame.alreadyAt == true) return
-        pendingBranchDraft = null
-        val isUneditedRestore = branchRestoredDraft == (sessionId to inputGeneration)
-        if (hasQueuedText || preparedImages.isNotEmpty() || preparedUris.isNotEmpty() || preparingPhotoUris.isNotEmpty() ||
-            (messageDraft.isNotBlank() && !isUneditedRestore)) return
-        val restored = frame.editorText
-        if (restored != null) {
-            messageDraft = restored
-            branchRestoredDraft = sessionId to inputGeneration
-        } else {
-            // AI 节点没有 editorText：等待同一叶子的历史，不拿旧分支快照猜。
-            val leafId = frame.leafId?.takeIf { it.isNotBlank() && it == frame.entryId } ?: return
-            if (isUneditedRestore) messageDraft = ""
-            branchRestoredDraft = null
-            pendingBranchDraft = PendingBranchDraft(sessionId, leafId, inputGeneration)
-        }
+        val sessionId = frame.sessionId?.takeIf { it == composerSessionId && it == snapshot.selectedSessionId } ?: return
+        val navigation = branchNavigation
+        if (navigation != null && (navigation.sessionId != sessionId || navigation.entryId != frame.entryId)) return
+        branchNavigation = null
+        val isUneditedRestore = isUneditedBranchDraft()
+        // 无请求的原始注入帧仅供旧测试/旧投影路径；生产必须属于本次明确导航。
+        if (graph != null && navigation == null) return
+        if (navigation != null && (!navigation.replaceDraft || navigation.generation != inputGeneration ||
+                navigation.navigationEpoch != composerNavigationEpoch)) return
+        if (navigation == null && frame.alreadyAt == true && (!isUneditedRestore ||
+                frame.entryId.isNullOrBlank() || frame.entryId != frame.leafId)) return
+        if (hasQueuedText || (navigation == null && !canRestoreOutgoingDraft && !isUneditedRestore)) return
+        // 非user节点不返回editorText；历史与tree仅刷新视图，不再推断最近user回填。
+        val editorText = frame.editorText ?: return
+        commitBranchDraft(sessionId, editorText)
     }
 
-    private fun restoreBranchDraftFromHistory(frame: GatewayFrame) {
-        val pending = pendingBranchDraft ?: return
-        if (pending.sessionId != snapshot.selectedSessionId || pending.generation != inputGeneration ||
-            preparedImages.isNotEmpty() || preparedUris.isNotEmpty() || preparingPhotoUris.isNotEmpty()) {
-            pendingBranchDraft = null
-            return
-        }
-        val ids = frame.entryIds ?: return
-        val messages = frame.messages ?: return
-        if (frame.sessionId != pending.sessionId || ids.lastOrNull() != pending.leafId ||
-            ids.size != messages.size) return
-        pendingBranchDraft = pending.copy(history = frame)
-        tryRestoreBranchDraft()
+    internal fun finishBranchDraftRequest(requestType: String?, sessionId: String?) {
+        if (sessionId == null) return
+        if (requestType == "switch-branch" && branchNavigation?.sessionId == sessionId) branchNavigation = null
     }
 
-    private fun tryRestoreBranchDraft() {
-        val pending = pendingBranchDraft ?: return
-        if (pending.sessionId != snapshot.selectedSessionId || pending.generation != inputGeneration ||
-            preparedImages.isNotEmpty() || preparedUris.isNotEmpty() || preparingPhotoUris.isNotEmpty()) {
-            pendingBranchDraft = null
-            return
-        }
-        val history = pending.history ?: return
-        // 搜索/筛选可省去用户祖先；没有完整可见链时不把更早的用户误认成最近用户。
-        if (treeViewOptions?.search?.isNotBlank() == true ||
-            treeViewOptions?.filter?.let { it != "default" } == true) return
-        val nodes = sessionTree?.takeIf { it.first == pending.sessionId }?.third
-            ?.associateBy { it.id } ?: return
-        var node = nodes[pending.leafId] ?: return
-        val visited = mutableSetOf<String>()
-        while (node.type != "message" || node.role != "user") {
-            if (!visited.add(node.id)) return
-            node = nodes[node.parentId] ?: return
-        }
-        // branch_summary 可合成为 role=user；只取目标树祖先中确认的真实 user。
-        val index = history.entryIds.orEmpty().indexOf(node.id).takeIf { it >= 0 } ?: return
-        val message = history.messages.orEmpty()[index]
-        if (message["role"]?.stringValue != "user") return
-        pendingBranchDraft = null
-        messageDraft = PiEventNormalizer.textOf(message["content"])
-        branchRestoredDraft = pending.sessionId to inputGeneration
+    private fun commitBranchDraft(sessionId: String, text: String) {
+        if (composerSessionId != sessionId) return
+        imagePreparations.values.forEach { imagePreparationJobs.remove(it)?.cancel() }
+        imagePreparations = emptyMap()
+        preparedImages = emptyList()
+        preparedUris = emptyList()
+        messageDraft = text
+        advanceInputGeneration()
+        autoRestoredDraft = null
+        branchRestoredDraft = sessionId to inputGeneration
+        closePhotosTray()
     }
 
     /**
      * history 帧的正式 USER 图片回显：归一事件恒空，从 frame.messages 原始
-     * content 数组读整组 attachmentId（网关随发送帧注入并落盘，历史全链路
-     * 可命中）。与 event 回显同语义：整组 id + 会话精确匹配才收走预览（不限
+     * content 数组读整组 attachmentId（上游保留该可选字段时命中；SDK1.0.4
+     * 图片归一可能移除，已知SDK受理不再依赖它）。与event同语义：精确匹配才清预览（不限
      * 状态），不按文本；entryIds 不是图片 ID。外部端发的图无 attachmentId，
      * 归一时回退合成占位 id（hist-*），永远不与实发 id 相等，不会误认领。
      */
@@ -2369,8 +3039,15 @@ class AndroidSharedStateHolder(
     /** 命中迟到回显时，只在输入区正是回填的那一代（token+代次精确匹配）时
      *  清空——用户已重新编辑（代次已变）则不动，禁止靠内容比对判断。 */
     private fun clearAutoRestoredDraftIfMatching(preview: OutgoingImagePreview) {
+        outgoingDraftRevisions.remove(preview.sendToken)?.let {
+            applyMessageSendResult(it, sent = true, outgoingSendToken = preview.sendToken)
+        }
+        sessionDrafts.entries.firstOrNull {
+            it.value.restoredSend == (preview.sendToken to it.value.generation)
+        }?.let { sessionDrafts.remove(it.key) }
         val (token, generation) = autoRestoredDraft ?: return
-        if (token != preview.sendToken || generation != inputGeneration) return
+        if (token != preview.sendToken || generation != inputGeneration ||
+            !preview.isVisibleFor(composerSessionId, newSessionEpoch)) return
         autoRestoredDraft = null
         messageDraft = ""
         preparedImages = emptyList()
@@ -2385,8 +3062,22 @@ class AndroidSharedStateHolder(
     internal fun handleOutgoingSendUnconfirmed() {
         // 未确认≠失败（请求可能已达网关）：不自动回填纯文本草稿，避免重复发送
         val head = outgoingPreviewTracker.headAwaitingToken()
+        val pendingText = head?.let { pendingExistingSessionTexts.remove(it) }
+        if (head != null) pendingComposerSends.remove(head)
         if (head != null && pendingNewSessionText?.token == head) pendingNewSessionText = null
-        if (outgoingPreviewTracker.consumeFailure(asUnconfirmed = true) != null) {
+        val preview = outgoingPreviewTracker.consumeFailure(asUnconfirmed = true)
+        if (head != null && pendingText != null) {
+            outgoingPreviewTracker.begin(
+                token = head,
+                sessionId = pendingText.submission.sessionId,
+                newSessionEpoch = pendingText.newSessionEpoch,
+                draftText = pendingText.submission.draft,
+                images = emptyList(),
+                restoreImages = emptyList(),
+                state = OutgoingImagePreviewState.UNCONFIRMED,
+            )
+        }
+        if (preview != null || pendingText != null) {
             refreshOutgoingPreviews()
         }
     }
@@ -2397,16 +3088,43 @@ class AndroidSharedStateHolder(
      * 只回填新会话首条纯文本（[pendingNewSessionText]，DEC-F09-CWD「创建失败
      * 保留草稿」）；已有会话带图消息被拒**不**自动回填草稿——该扩展未经批准，
      * 自动回填仅保留在本地失败路径（settleLocalFailure）。生产入口是
-     * RequestRejected(message) 的协议声明码（Runtime 不发布 error 原帧）。
+     * Runtime 已关联的服务端 RequestRejected(message)，不按错误码白名单丢失新拒绝码。
      */
     internal fun handleOutgoingServerReject() {
         val head = outgoingPreviewTracker.headAwaitingToken() ?: return
+        pendingComposerSends.remove(head)
         // 拒绝先于本地回写到达：回写不得再清空草稿（此刻草稿仍在输入框里）
         if (sendInFlight) rejectedBeforeSettleToken = head
         outgoingPreviewTracker.consumeFailure(asUnconfirmed = false)
+        pendingExistingSessionTexts.remove(head)?.let { pending ->
+            val submission = pending.submission
+            // 拒绝先于本地回写且原稿仍在输入框时，不另建重复的恢复条。
+            val stillInEditor = sendInFlight && inputGeneration == submission.generation &&
+                (pendingSelectedSessionId ?: snapshot.selectedSessionId) == submission.sessionId &&
+                messageDraft == submission.draft && preparedImages.isEmpty()
+            if (!stillInEditor) outgoingPreviewTracker.begin(
+                token = head,
+                sessionId = submission.sessionId,
+                newSessionEpoch = pending.newSessionEpoch,
+                draftText = submission.draft,
+                images = emptyList(),
+                restoreImages = emptyList(),
+                state = OutgoingImagePreviewState.FAILED,
+            )
+        }
         refreshOutgoingPreviews()
         restorePendingNewSessionText(head)
     }
+
+    /** 来源由 Runtime 在关联成功后标记，避免本地 busy 拒绝误消费另一请求队头。 */
+    internal fun handleOutgoingMessageRejection(event: GatewayRuntimeEvent.RequestRejected) {
+        if (event.requestType == "message" && event.serverResponse) handleOutgoingServerReject()
+    }
+
+    private data class PendingExistingSessionText(val submission: MessageSubmission, val newSessionEpoch: Long)
+    private val pendingExistingSessionTexts = mutableMapOf<String, PendingExistingSessionText>()
+    private val pendingComposerSends = mutableStateMapOf<String, MessageSubmission>()
+    private val outgoingDraftRevisions = mutableMapOf<String, MessageSubmission>()
 
     /**
      * 新会话首条纯文本没有预览可承载草稿：单独记一份，服务端明确拒绝时回填
@@ -2443,7 +3161,7 @@ class AndroidSharedStateHolder(
         if (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) return
         messageDraft = pending.draft
         if (pendingModelSelection == null) pendingModelSelection = pending.model
-        inputGeneration += 1
+        advanceInputGeneration()
     }
 
     private data class PendingNewSessionText(
@@ -2456,14 +3174,14 @@ class AndroidSharedStateHolder(
     private var pendingNewSessionText: PendingNewSessionText? = null
     private var rejectedBeforeSettleToken: String? = null
 
-    /** CONFIRMED 超过阈值仍无回显 → UNCONFIRMED 有界收敛（不判失败/不重发）。 */
+    /** 旧网关无SDK disposition时，CONFIRMED仍无回显 → UNCONFIRMED（不判失败/不重发）。 */
     internal fun markStaleOutgoingPreviews(nowMs: Long) {
         if (outgoingPreviewTracker.markStaleUnconfirmed(nowMs, OUTGOING_UNCONFIRMED_AFTER_MS)) {
             refreshOutgoingPreviews()
         }
     }
 
-    /** CONFIRMED 后的一次性观察：迟迟无回显则转为未确认（手动恢复草稿入口）。 */
+    /** 仅旧网关的CONFIRMED回显等待计时；明确SDK受理不创建此观察。 */
     private fun scheduleOutgoingUnconfirmedWatch() {
         val holderScope = scope ?: return
         holderScope.launch {
@@ -2479,15 +3197,19 @@ class AndroidSharedStateHolder(
         val preview = outgoingPreviewTracker.peekRestorable(token) ?: return
         // 归属校验：预览对当前页面可见（会话一致，或未绑定时同一新建页代）。
         if (!preview.isVisibleFor(snapshot.selectedSessionId, newSessionEpoch)) return
-        if (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) return
+        if (!canRestoreOutgoingDraft) return
         val restored = outgoingPreviewTracker.restoreDraft(token) ?: return
         refreshOutgoingPreviews()
         messageDraft = restored.draftText
         preparedImages = restored.restoreImages
         preparedUris = restored.restoreUris
-        inputGeneration += 1
+        advanceInputGeneration()
         autoRestoredDraft = token to inputGeneration
     }
+
+    internal val canRestoreOutgoingDraft: Boolean
+        get() = messageDraft.isBlank() && preparedImages.isEmpty() &&
+            preparedUris.isEmpty() && imagePreparations.isEmpty()
 
     /** 载荷回填（仅本地失败路径 [settleLocalFailure] 使用；服务端拒绝按 F10 收窄
      *  不自动回填，只保留 FAILED 预览的手动恢复）：只在预览仍对当前页面可见且
@@ -2495,11 +3217,11 @@ class AndroidSharedStateHolder(
      *  新会话；记录 token+代次供迟到回显精确清除该代（禁止靠内容比对清新草稿）。 */
     private fun restoreOutgoingDraftPayload(preview: OutgoingImagePreview) {
         if (!preview.isVisibleFor(snapshot.selectedSessionId, newSessionEpoch)) return
-        if (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) return
+        if (!canRestoreOutgoingDraft) return
         messageDraft = preview.draftText
         preparedImages = preview.restoreImages
         preparedUris = preview.restoreUris
-        inputGeneration += 1
+        advanceInputGeneration()
         autoRestoredDraft = preview.sendToken to inputGeneration
     }
 
@@ -2542,7 +3264,12 @@ class AndroidSharedStateHolder(
             return
         }
         if (!sent) return
-        val currentSessionId = pendingSelectedSessionId ?: snapshot.selectedSessionId
+        val currentSessionId = composerSessionId
+        val saved = sessionDrafts[submission.sessionId]
+        if (saved != null && saved.generation == submission.generation && saved.text == submission.draft &&
+            saved.images == submission.images && saved.uris == submission.uris) {
+            sessionDrafts.remove(submission.sessionId)
+        }
         // sent 帧先到时 SharedMobileStore 会把新会话自动选中（selectedSessionId 从
         // null 变真实 id）：用本次实发预览的绑定归属区分"同次发送的自动绑定"与
         // 用户换会话——绑定一致照常清草稿，换会话/另起预览则保留新编辑。
@@ -2621,7 +3348,7 @@ class AndroidSharedStateHolder(
         messageDraft = pending.draft
         preparedImages = pending.images
         preparedUris = pending.uris
-        inputGeneration += 1
+        advanceInputGeneration()
         if (hasNewDraft) showTransientNotice("已取回待发送内容，新草稿保留在待发送栏")
     }
 
@@ -2634,6 +3361,8 @@ class AndroidSharedStateHolder(
     fun dispatchPending(mode: String) {
         if (sendInFlight || dispatchInFlight != null) return
         val pending = pendingDispatch ?: return
+        if (pendingQueueRecall != null && pendingQueueRecall?.first == pending.sessionId) return
+        if (stoppingSessionId != null && stoppingSessionId == pending.sessionId) return
         dispatchInFlight = pending
         graph?.diagnostics?.intent(
             GatewayDiagnosticAction.SEND_MESSAGE,
@@ -2652,26 +3381,112 @@ class AndroidSharedStateHolder(
         if (sent && pendingDispatch === submission) pendingDispatch = null
     }
 
-    /**
-     * 中断当前运行（pi 的 Esc → session.abort()）：pi 侧会同时中止
-     * 运行/压缩/重试，并把排队消息取回编辑器（restoreQueuedMessagesToEditor）。
-     * 对齐：先取回吸附草稿，再发 abort 帧；中断后的收尾由事件流驱动
-     * （turn/end 直接拉回 isStreaming，state 快照继续精化）。
-     */
+    private var stoppingSessionId: String? by mutableStateOf(null)
+    private var pendingQueueRecall: Pair<String, String>? by mutableStateOf(null)
+    private val stoppedQueueDrafts = mutableMapOf<String, String>()
+
+    private fun selectedSessionRecalling(): Boolean = pendingQueueRecall?.first != null &&
+        pendingQueueRecall?.first == (pendingSelectedSessionId ?: snapshot.selectedSessionId)
+
+    val canRecallQueuedMessages: Boolean
+        get() = gatewayState.connection == GatewayConnectionState.CONNECTED &&
+            "dequeue" in gatewayState.capabilities && pendingQueueRecall == null && stoppingSessionId == null &&
+            !sendInFlight && dispatchInFlight == null &&
+            snapshot.selectedSessionId?.let { snapshot.sessionStates[it]?.queuedMessages?.isEmpty == false } == true
+
+    internal fun beginQueueRecall(sessionId: String, requestId: String): Boolean {
+        if (pendingQueueRecall != null || stoppingSessionId != null || sendInFlight || dispatchInFlight != null) return false
+        pendingQueueRecall = sessionId to requestId
+        return true
+    }
+
+    internal fun finishQueueRecall(sessionId: String?, requestId: String?) {
+        val pending = pendingQueueRecall ?: return
+        if (pending.first == sessionId && (requestId == null || pending.second == requestId)) pendingQueueRecall = null
+    }
+
+    fun recallQueuedMessages() {
+        val appGraph = graph ?: return
+        if (!canRecallQueuedMessages) return
+        val sessionId = snapshot.selectedSessionId ?: return
+        val requestId = UUID.randomUUID().toString()
+        if (!beginQueueRecall(sessionId, requestId)) return
+        appGraph.gatewayScope.launch {
+            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.dequeue(sessionId, requestId))
+            if (!accepted) withContext(Dispatchers.Main.immediate) {
+                finishQueueRecall(sessionId, requestId)
+                showTransientNotice("撤回请求未发出，请重试")
+            }
+        }
+    }
+
+    private fun handleRecalledQueue(frame: GatewayFrame) {
+        val sessionId = frame.sessionId ?: return
+        if (pendingQueueRecall != (sessionId to frame.queueRequestId)) return
+        finishQueueRecall(sessionId, frame.queueRequestId)
+        val returned = frame.queued ?: return
+        if (returned.isEmpty()) showTransientNotice("没有可撤回的消息")
+        restoreReturnedQueueText(sessionId, returned)
+    }
+
+    private fun selectedSessionStopping(): Boolean = stoppingSessionId != null &&
+        stoppingSessionId == (pendingSelectedSessionId ?: snapshot.selectedSessionId)
+
+    /** 停止等待期不再向同一会话提交，避免旧停止回执覆盖新的运行。 */
+    internal fun beginStoppingSession(sessionId: String): Boolean {
+        if (stoppingSessionId != null || pendingQueueRecall?.first == sessionId) return false
+        stoppingSessionId = sessionId
+        return true
+    }
+
+    internal fun finishStoppingSession(sessionId: String?) {
+        if (stoppingSessionId == sessionId) stoppingSessionId = null
+    }
+
+    private fun restoreStoppedQueueDraft(sessionId: String) {
+        if ((pendingSelectedSessionId ?: snapshot.selectedSessionId) != sessionId) return
+        val text = stoppedQueueDrafts.remove(sessionId) ?: return
+        // Pi TUI Esc 将取回的文本放在当前编辑内容前；已有附件及处理中图片保持原样。
+        messageDraft = listOf(text, messageDraft).filter(String::isNotBlank).joinToString("\n\n")
+        advanceInputGeneration()
+    }
+
+    private fun handleStoppedQueue(frame: GatewayFrame) {
+        val sessionId = frame.sessionId ?: return
+        if (stoppingSessionId != sessionId) return
+        finishStoppingSession(sessionId)
+        val returned = frame.queued ?: return // 旧网关不证明已撤队列，不从快照猜恢复。
+        restoreReturnedQueueText(sessionId, returned)
+    }
+
+    private fun restoreReturnedQueueText(sessionId: String, returned: List<String>) {
+        val text = returned.filter(String::isNotBlank).joinToString("\n\n")
+        if (text.isBlank()) return
+        stoppedQueueDrafts[sessionId] = listOfNotNull(stoppedQueueDrafts[sessionId], text).joinToString("\n\n")
+        restoreStoppedQueueDraft(sessionId)
+    }
+
+    /** Pi CLI Esc 的 clearQueue + abort；已派发文本仅凭网关确认取回，不靠旧快照。 */
     fun abortCurrent() {
         val appGraph = graph ?: return
         // 同位按钮防误触：发送后极短窗口内到达的"停止"多半是连点的第二下
         // （见 stopCooldownMs），忽略它。语义上等价于 pi 里草稿为空时按 Enter
         // 无事发生（此时草稿本就为空，本来也没有可发送的内容）。
         if (stopInCooldown()) return
-        takeBackPendingDispatch(notifyWhenPreparing = false)
+        if (selectedSessionRecalling()) {
+            showTransientNotice("正在撤回，请稍候")
+            return
+        }
         // 与 Composer 的 canAbort 同口径（snapshot.selectedSessionId）：停止针对
         // 当前显示的会话，不用 pending 切换目标，避免切换在途时 abort 发错会话。
         val sessionId = snapshot.selectedSessionId ?: return
+        if (!beginStoppingSession(sessionId)) return
+        takeBackPendingDispatch(notifyWhenPreparing = false)
         appGraph.gatewayScope.launch {
             val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.abort(sessionId))
             if (!accepted) withContext(Dispatchers.Main.immediate) {
-                platformError = "中断请求未发出，请检查连接"
+                finishStoppingSession(sessionId)
+                platformError = "停止请求未发出，请重试"
             }
         }
     }
@@ -2696,7 +3511,7 @@ class AndroidSharedStateHolder(
             preparedUris = previous.uris
         }
         closePhotosTray()
-        inputGeneration += 1
+        advanceInputGeneration()
     }
 
     internal fun failAttachmentForTest(attachmentId: String) {
@@ -2736,11 +3551,12 @@ class AndroidSharedStateHolder(
 
     fun clearPlatformError() {
         platformError = null
-        platformErrorAction = PlatformErrorAction.RECONNECT
+        platformErrorAction = PlatformErrorAction.DISMISS_ONLY
     }
 
     fun showPlatformError(message: String) {
-        platformError = message
+        platformError = GatewayErrorText.local(message)
+        if (GatewayErrorText.isConnectionFailure(message)) platformErrorAction = PlatformErrorAction.RECONNECT
     }
 
     fun updateVisibleAttachments(attachmentIds: Set<String>) {
@@ -2810,6 +3626,7 @@ class AndroidSharedStateHolder(
     }
 
     fun close() {
+        clearTreeActions()
         streamingSnapshotPublishJob?.cancel()
         projectionActor.close()
         runtimeCollection?.cancel()
@@ -2818,7 +3635,8 @@ class AndroidSharedStateHolder(
 
     val canSend: Boolean
         get() = gatewayState.connection == GatewayConnectionState.CONNECTED &&
-            (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) && !sendInFlight && dispatchInFlight == null
+            !selectedSessionStopping() && !selectedSessionRecalling() &&
+            (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) && !sendInFlight && dispatchInFlight == null && pendingComposerSends.isEmpty()
 
     fun sendComposerDraft(requireDirectory: Boolean = false) {
         if (consumeSlashCommand(messageDraft) != SlashCommandOutcome.NOT_A_COMMAND) return
@@ -2828,9 +3646,11 @@ class AndroidSharedStateHolder(
             return
         }
         when {
+            selectedSessionRecalling() -> showTransientNotice("正在撤回，请稍候")
+            selectedSessionStopping() -> showTransientNotice("正在停止，请稍候")
             gatewayState.connection != GatewayConnectionState.CONNECTED -> showTransientNotice("尚未连接网关，草稿已保留，请连接后重试")
             imagePreparations.isNotEmpty() -> showTransientNotice("图片正在处理中，请稍候再发送")
-            sendInFlight || dispatchInFlight != null -> showTransientNotice("上一条消息正在提交，草稿已保留")
+            sendInFlight || dispatchInFlight != null || pendingComposerSends.isNotEmpty() -> showTransientNotice("上一条消息正在提交，草稿已保留")
             else -> sendMessage()
         }
     }
@@ -2876,6 +3696,10 @@ class AndroidSharedStateHolder(
             pendingStreamingSnapshot = null
             streamingSnapshotPublishJob?.cancel()
             streamingSnapshotPublishJob = null
+            if (next.selectedSessionId != snapshot.selectedSessionId && pendingSelectedSessionId == null &&
+                composerSessionId == snapshot.selectedSessionId) {
+                if (composerSessionId == null && next.selectedSessionId != null) composerSessionId = next.selectedSessionId
+            }
             snapshot = next
             return
         }
@@ -2901,6 +3725,54 @@ class AndroidSharedStateHolder(
         correlatedSessionId: String?,
         normalizedEvents: List<SessionEvent>
     ) {
+        if (frame.kind == "error" && frame.sessionId == composerSessionId &&
+            frame.requestType in setOf("switch-branch", "history", "tree")) {
+            finishBranchDraftRequest(frame.requestType, frame.sessionId)
+        }
+        if (frame.kind == "aborted") handleStoppedQueue(frame)
+        if (frame.kind == "dequeued") handleRecalledQueue(frame)
+        // compact-finished只更新权威状态，不认领当前等待：上一轮通知可能晚于下一轮点击。
+        // 新网关受理快照isCompacting=true已交接本地等待；断连请求终态负责取消未ACK等待。
+        if (frame.kind == "compact-started") {
+            // 受理≠完成：启动提示超时不解锁；由实际状态/事件接管，
+            // 避免受理到启动之间被重复触发；同时给受理反馈（启动失败静默路径兜底）。
+            // 迟到 ACK（会话已换）只按 frame.sessionId 归属处理，不碰当前会话。
+            val ackSessionId = frame.sessionId
+            if (ackSessionId != null && ackSessionId in compactPendingSessions) {
+                // 提示只在用户仍看该会话时弹（R5）；状态处理仍按归属。
+                if (snapshot.selectedSessionId == ackSessionId) {
+                    showTransientNotice("已请求压缩上下文")
+                }
+                observeCompactingStarted(ackSessionId)
+                compactPendingSessions[ackSessionId]?.let { pending ->
+                    val watchScope = appGraph?.gatewayScope ?: compactWatchScopeForTest
+                    watchScope?.let { watchCompactStartup(it, ackSessionId, pending) }
+                }
+            }
+        }
+        if (frame.kind == "event") {
+            // 压缩生命周期（compaction_start/end）：开始释放重复触发闸，收尾后补拉
+            // 一次 state 刷新 contextUsage（压缩后 SDK 统计可能为 null → 圆环显示 —）。
+            // 去重键带 seq：同一会话第二轮压缩不受首轮残留键影响（M3）；不轮询。
+            val compactPhase = normalizedEvents.firstOrNull { record ->
+                record.event.type == "compact/start" ||
+                    record.event.type == "compact/end" ||
+                    record.event.type == "notice/compact"
+            }
+            if (compactPhase != null) {
+                if (compactPhase.event.type == "compact/start") {
+                    observeCompactingStarted(compactPhase.sessionId)
+                } else if (compactSeenEvents.add(
+                        "${compactPhase.event.type}:${compactPhase.sessionId}:${compactPhase.seq}"
+                    )) {
+                    finishCompactPending(compactPhase.sessionId)
+                    requestStateAfterCompaction(appGraph, compactPhase.sessionId)
+                }
+            }
+        }
+        // 任意携带 isCompacting 的快照部可能携带压缩开始的权威信号（compact-started
+        // 本身就是 state 快照形状）；这里统一释放闸门。
+        frame.sessionId?.let { observeCompactingStarted(it) }
         if (frame.kind == "error" && frame.requestType == "ping" && pingStarted != null) {
             finishPing("测速失败")
         }
@@ -2941,7 +3813,6 @@ class AndroidSharedStateHolder(
             // content 数组读整组 attachmentId，否则 history 恢复后预览残留，
             // 与正式消息双气泡。
             handleHistoryEcho(correlatedSessionId, frame)
-            restoreBranchDraftFromHistory(frame)
         }
         // 正式回显（user message_end）：整组实发 attachmentId 命中即移除本地预览。
         // afterPublish 在 Main 执行，与同一次快照发布同帧，避免“先正式消息后
@@ -2979,6 +3850,10 @@ class AndroidSharedStateHolder(
     }
 
     private fun handleWorkspaceFrame(frame: GatewayFrame) {
+        if (frame.kind == "models") {
+            modelCatalogIsLoading = false
+            modelCatalogError = null
+        }
         if (frame.kind == "input-resources" || frame.kind == "input-completions") {
             inputAssist.receive(frame)
             return
@@ -2992,6 +3867,7 @@ class AndroidSharedStateHolder(
             refreshInputResources()
         }
         when (frame.kind) {
+            "paired" -> clearPairedGatewayUiState()
             // commands 帧缓存（PROTOCOL §4.21）：按 sessionId 缓存全量三源；
             // 联想层只出确定可用的模板/skill，扩展命令不进联想（RPC 下无法
             // 静态判定 handler 是否依赖 TUI，避免“点联想→静默无反应”被当
@@ -3012,15 +3888,24 @@ class AndroidSharedStateHolder(
                 if (treeOwnerId != null && treeOwnerId == snapshot.selectedSessionId) {
                     sessionTree = Triple(treeOwnerId, frame.leafId, frame.nodes.orEmpty())
                     treeSelectedId = frame.selectedId ?: frame.leafId
-                    tryRestoreBranchDraft()
                 }
             }
             // 排队稿保留双空格合并；未被编辑的自动回填可随节点更新，手工稿不覆盖。
             "branch-switched" -> {
                 val queuedText = frame.queued.orEmpty().joinToString("  ")
                 if (queuedText.isNotBlank()) {
-                    val current = messageDraft.trim()
-                    messageDraft = if (current.isBlank()) queuedText else "$queuedText  $current"
+                    val owner = frame.sessionId
+                    if (owner == composerSessionId) {
+                        val current = messageDraft.trim()
+                        messageDraft = if (current.isBlank()) queuedText else "$queuedText  $current"
+                    } else if (owner != null) {
+                        val saved = sessionDrafts[owner]
+                        sessionDrafts[owner] = ComposerDraft(
+                            listOf(queuedText, saved?.text.orEmpty()).filter(String::isNotBlank).joinToString("  "),
+                            saved?.images.orEmpty(), saved?.uris.orEmpty(), saved?.preparations.orEmpty(),
+                            ++nextInputGeneration, null,
+                        )
+                    }
                 }
                 restoreBranchDraft(frame, queuedText.isNotBlank())
                 if (frame.alreadyAt == true) {
@@ -3036,6 +3921,36 @@ class AndroidSharedStateHolder(
                     }
                 }
                 if (frame.sessionId == snapshot.selectedSessionId) {
+                    loadSessionTree(treeViewOptions.takeIf { treeViewSessionId == snapshot.selectedSessionId })
+                }
+            }
+            // 整条 entry 的可复制全文（Pi Ctrl+X，§4.26）：只有文本才当成功；
+            // 超限帧只带 oversized+bytes，如实报“过大未复制”，不静默截断充全文。
+            "entry-copy" -> {
+                // frame.text 是跳模块的公开属性，不能智能转：先取本地副本再判空。
+                val copiedText = frame.text
+                val oversizedBytes = frame.bytes
+                val outcome = when {
+                    copiedText != null -> TreeCopyOutcome.Copied(copiedText)
+                    frame.oversized == true -> TreeCopyOutcome.Failed(
+                        if (oversizedBytes == null) "内容过大，未复制"
+                        else "内容过大（约 ${(oversizedBytes + 1023) / 1024} KB），未复制"
+                    )
+                    else -> TreeCopyOutcome.Failed("网关没有返回可复制文本")
+                }
+                finishTreeCopy(frame.sessionId, frame.entryId, outcome)
+            }
+            // 标签写回执（Pi Shift+L，§4.27）：成功后重拉树——追加 LabelEntry
+            // 会推进叶子，当前行/选择必须用网关重算的投影，不在客户端自己推。
+            "label-put" -> {
+                val settled = finishTreeLabelSaved(frame.sessionId, frame.entryId, frame.label)
+                // frame.sessionId 是跨模块公开属性，不能智能转：取本地副本。
+                val ownerSessionId = frame.sessionId
+                if (settled && ownerSessionId != null && ownerSessionId == snapshot.selectedSessionId) {
+                    // 新叶子是自己写出的 LabelEntry，不会投影成消息：标记后 isBehindLatest
+                    // 不把“标签写完”误报成“落后于最新”（点了还会跳到 LabelEntry 上）。
+                    val labelEntryId = frame.labelEntryId
+                    if (labelEntryId != null) projection.markNonRenderingLeaf(ownerSessionId, labelEntryId)
                     loadSessionTree(treeViewOptions.takeIf { treeViewSessionId == snapshot.selectedSessionId })
                 }
             }
@@ -3055,10 +3970,12 @@ class AndroidSharedStateHolder(
                 parentPath?.let(::browseDirectories)
             }
             "sent" -> {
-                // sent 帧（preflight 受理，PROTOCOL §4.2）：按在途请求队列确认预览
-                // 并尽量绑定真实 sessionId；不移除——正式回显才收。生产路径与
-                // wire 注入同走这里（与手工测试入口共用）。
-                recordOutgoingSent(frame.sessionId)
+                // 明确SDK已开始/排队/处理即完成本次发送等待。SDK1.0.4会重建图片块，
+                // 不能再用附件ID回显作为发送确认；无disposition的旧网关保持原路径。
+                recordOutgoingSent(frame.sessionId, sdkAccepted = when (frame.disposition) {
+                    "started", "queued", "handled" -> true
+                    else -> false
+                })
             }
             "error" -> {
                 clearWorkspaceRequestLoading(frame.requestType)
@@ -3069,14 +3986,24 @@ class AndroidSharedStateHolder(
                     handleOutgoingServerReject()
                 }
                 if (frame.requestType in WORKSPACE_REQUEST_TYPES) {
-                    platformError = frame.message ?: "目录请求失败"
+                    platformError = GatewayErrorText.request(frame.requestType, frame.code)
                     // 目录失败的确认键是“重试”当前目录，不是断线重连。
-                    platformErrorAction = PlatformErrorAction.RETRY_DIRECTORY
+                    platformErrorAction = if (frame.requestType == "directories") PlatformErrorAction.RETRY_DIRECTORY
+                        else PlatformErrorAction.DISMISS_ONLY
                     // 面板内同样展示+重试：空列表不再被误认空目录。
-                    directoryError = frame.message ?: "目录请求失败"
+                    directoryError = GatewayErrorText.request(frame.requestType, frame.code)
                 }
             }
         }
+    }
+
+    internal fun handleWorkspaceRequestCancelled(event: GatewayRuntimeEvent.RequestCancelled) {
+        clearWorkspaceRequestLoading(event.requestType)
+        if (event.requestType == "directory-create") {
+            directoryError = "创建未确认，请重新打开核对"
+        } else if (event.requestType == "directories" && event.reason in setOf(
+            "network-lost", "connection-closed", "recovery-timeout", "websocket-failure",
+        )) directoryError = "连接已断开，请重试"
     }
 
     private fun clearWorkspaceRequestLoading(requestType: String? = null) {
@@ -3189,7 +4116,7 @@ class AndroidSharedStateHolder(
                 if (requestType != null) {
                     clearProviderRequestLoading(requestType, "Provider 连接测试失败，请重试")
                     if (requestType in PROVIDER_REQUEST_TYPES) {
-                        val detail = frame.message ?: "Provider 操作失败"
+                        val detail = GatewayErrorText.request(requestType, frame.code)
                         // 走 showProviderResult：直接赋值会绕过清除任务管理——旧 timer
                         // 会把这条提前抹掉，而这条自己又永不清除（与 RequestCancelled 同理）。
                         showProviderResult(detail)
@@ -3425,6 +4352,9 @@ class AndroidSharedStateHolder(
         // Activity，置位无效；别把它当通用开关复用。
         internal var skipStoredConnectForTest: Boolean = false
         internal const val SWITCH_REJECT_NOTICE = "会话正忙，暂不能切换分支，稍后再试"
+        /** 标签长度上限：与网关 `LABEL_MAX_CHARS`（PROTOCOL §4.27）同口径的 wire 护栏。
+         *  Pi 自身只 trim 不限长；树页输入框另按原型限 24 字符（视觉约束，不是协议上限）。 */
+        internal const val TREE_LABEL_MAX_CHARS = 200
         private const val RECENT_PHOTOS_LIMIT = 10
         private const val RECENT_PHOTO_THUMBNAIL_EDGE = 128
         private const val HISTORY_PAGE_MESSAGE_LIMIT = 20
@@ -3434,14 +4364,6 @@ class AndroidSharedStateHolder(
             "directory-create"
         )
 
-        /** 网关统一错误帧的协议声明码（PROTOCOL.md §统一错误帧）；与 Runtime 本地码不重叠。 */
-        private val SERVER_REJECTION_CODES = setOf(
-            "bad-request",
-            "unknown-command",
-            "session-not-found",
-            "prompt-rejected",
-            "internal"
-        )
         private val PROVIDER_REQUEST_TYPES = setOf(
             "providers",
             "provider-put",
@@ -3457,8 +4379,8 @@ class AndroidSharedStateHolder(
          *  AndroidAppGraph，无法端到端驱动）。 */
         internal fun providerUnconfirmedResultText(requestType: String?, outcome: String): String =
             when (requestType) {
-                "provider-put" -> "Provider 保存$outcome，配置未确认，请重试"
-                "provider-delete" -> "Provider 删除$outcome，配置未确认，请重试"
+                "provider-put" -> "保存未确认，请重新打开核对"
+                "provider-delete" -> "删除未确认，请重新打开核对"
                 else -> "Provider 请求$outcome，请重试"
             }
         private const val MAXIMUM_THUMBNAIL_BYTES = 16L * 1_024 * 1_024

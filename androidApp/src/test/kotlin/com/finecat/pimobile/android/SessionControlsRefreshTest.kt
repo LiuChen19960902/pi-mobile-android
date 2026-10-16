@@ -19,6 +19,11 @@ class SessionControlsRefreshTest {
     private val subscribed = """{"kind":"subscribed","sessionId":"s1"}"""
     private val usageState = """{"kind":"state","sessionId":"s1","contextUsage":{"percent":74.0,"tokens":148000,"contextWindow":200000}}"""
 
+    @Test fun legacyAbortRequestsStateButNewSnapshotDoesNotNeedAnotherPoll() {
+        assertEquals("s1", accept("""{"kind":"aborted","sessionId":"s1"}"""))
+        assertNull(accept("""{"kind":"aborted","sessionId":"s1","queued":[],"queuedMessages":{"steering":[],"followUp":[]}}"""))
+    }
+
     @Test fun coldHistoryBeforeSubscribeRefreshesWithoutChangingModel() {
         assertNull(accept(coldHistory))
         assertEquals("s1", accept(subscribed))

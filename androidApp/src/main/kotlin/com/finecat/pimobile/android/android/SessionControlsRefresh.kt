@@ -16,6 +16,7 @@ internal class SessionControlsRefresh {
             subscribedSessionId = sessionId
             return sessionId
         }
+        if (frame.kind == "aborted" && frame.queuedMessages == null) return sessionId
         return sessionId.takeIf {
             frame.kind == "history" && frame.contextUsage == null && subscribedSessionId == sessionId
         }

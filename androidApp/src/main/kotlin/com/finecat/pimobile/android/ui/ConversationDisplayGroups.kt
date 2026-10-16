@@ -276,17 +276,13 @@ private fun pairToolResult(
     val index = callId?.let { id ->
         tools.indexOfFirst { it.result == null && it.call?.toolCallId == id }
     }?.takeIf { it >= 0 }
-        ?: tools.indexOfFirst { it.result == null }.takeIf { it >= 0 }
+        // 已知ID但缺少对应start时保留孤儿结果，不能把嵌套结果误挂给父调用。
+        ?: tools.indexOfFirst { it.result == null && (callId == null || it.call?.toolCallId == null) }.takeIf { it >= 0 }
         ?: return null
     val updated = tools.toMutableList()
     updated[index] = updated[index].copy(result = result)
     return updated
 }
-
-// Agent 卡片（pi-subagents）的未完成下标 → entry 下标，用于 FIFO 配对 result。
-// pi-subagents 的 Agent 调用与普通工具同进折叠区（结果入流）；运行中的
-// 动效由 runningAgentTools() 单独提取，常驻输入框上方（kimi swarm 的
-// aboveEditor widget 语义：运行中不随对话滚走，完成后消失）。
 
 /**
  * 助手回合分组（F02，原型 msgBlock 结构 app.js:187-192）：时间分隔在回合外顶部，
@@ -394,43 +390,6 @@ internal fun makeConversationDisplayEntries(
     }
     flushProcess()
     return result
-}
-
-/**
- * 当前仍在运行的 Agent 调用（toolCallId 有 call、无 result）：常驻输入框
- * 上方条的数据源。只关心 Agent（title == "Agent"）；普通工具的 result
- * 按 callId 精确摘除，不受影响。
- *
- * `Agent` 工具**不是 pi 原生**（pi 内置工具只有 bash/read/write/edit/ls/grep/
- * find/powershell），它来自 pi-subagents 一类扩展：未安装此类扩展时本函数恒返回空
- * 列表、条不显示（静默失效，不产生假条）。这类扩展又是**异步派发**——toolCall 后
- * 立即返回句柄（本机实测 toolCall→toolResult 中位数 18ms），因此"有 call 无 result"
- * 只在同步等待型调用上短暂成立，条的可见性取决于扩展实现，不是稳定契约。
- */
-internal fun runningAgentTools(
-    items: List<ConversationItem>,
-    nowEpochSeconds: Double = System.currentTimeMillis() / 1000.0
-): List<ConversationProcessTool> {
-    val awaiting = LinkedHashMap<String, ConversationItem>()
-    items.forEach { item ->
-        when (item.kind) {
-            ConversationItemKind.TOOL, ConversationItemKind.JSON_TOOL -> {
-                val cid = item.toolCallId
-                if (item.title == "Agent" && cid != null) awaiting[cid] = item
-            }
-            ConversationItemKind.TOOL_RESULT -> {
-                val cid = item.toolCallId
-                if (cid != null) awaiting.remove(cid)
-            }
-            else -> Unit
-        }
-    }
-    // 兜底：pi 进程被 kill -9 等崩溃会留下无 result 的 Agent toolCall，重开
-    // App 后按"有 call 无 result"判定会永久钉住假"运行中"条（秒数无限
-    // 增长）。超过 30 分钟（swarm 任务远短于此）的残留调用不再显示。
-    return awaiting.values
-        .filter { nowEpochSeconds - it.epochSeconds < 1800.0 }
-        .map { ConversationProcessTool(id = it.id, call = it, result = null) }
 }
 
 private fun pairProcessTools(

@@ -146,7 +146,9 @@ class ProtocolAndReducerTest {
         assertEquals("""{"type":"subscribe","sessionId":"s1"}""", GatewayRequests.subscribe("s1").payload)
         assertEquals("""{"type":"unsubscribe","sessionId":"s1"}""", GatewayRequests.unsubscribe("s1").payload)
         assertEquals("""{"type":"state","sessionId":"s1"}""", GatewayRequests.state("s1").payload)
-        assertEquals("""{"type":"abort","sessionId":"s1"}""", GatewayRequests.abort("s1").payload)
+        assertEquals("""{"type":"abort","sessionId":"s1","restoreQueued":true}""", GatewayRequests.abort("s1").payload)
+        assertEquals("""{"type":"dequeue","sessionId":"s1","queueRequestId":"q-1"}""", GatewayRequests.dequeue("s1", "q-1").payload)
+        assertEquals("q-1", GatewayRequests.dequeue("s1", "q-1").correlationId)
         // §4.22 attachment：三元寻址，单 lane REJECT_IF_BUSY（同一时刻至多一个在途取图）。
         assertEquals(
             """{"type":"attachment","sessionId":"s1","entryId":"entry-9","imageIndex":2}""",

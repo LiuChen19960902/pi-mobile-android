@@ -17,7 +17,7 @@ class FineCatGatewayPairingOutcomeTest {
             lastError = null,
         )!!
         assertEquals(true, outcome.isError)
-        assertEquals("配对信息无效：配对内容不是有效的 Base64URL 字符串", outcome.text)
+        assertEquals("配对信息无效", outcome.text)
     }
 
     @Test
@@ -61,7 +61,7 @@ class FineCatGatewayPairingOutcomeTest {
             lastError = "pairing-code-invalid",
         )!!
         assertEquals(true, expired.isError)
-        assertEquals("配对码已过期或已被使用，请在电脑上重新生成一条。", expired.text)
+        assertEquals("配对码已失效，请重新生成", expired.text)
 
         val unreachable = pairingOutcomeText(
             connection = GatewayConnectionState.FAILED,
@@ -69,6 +69,6 @@ class FineCatGatewayPairingOutcomeTest {
             validationError = null,
             lastError = "endpoint-unreachable",
         )!!
-        assertEquals("列表里的地址都没连上；检查备用地址顺序（在家局域网优先，外出 Tailscale）。", unreachable.text)
+        assertEquals("无法连接网关，请检查网络", unreachable.text)
     }
 }

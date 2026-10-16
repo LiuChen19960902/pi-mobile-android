@@ -23,6 +23,15 @@ import org.junit.Test
  */
 class FineCatProviderFormTest {
     @Test
+    fun offlineDraftTextDoesNotExposeCredentialsOrAddresses() {
+        val secret = "synthetic-offline-key_Ab9"
+        val privateAddress = "https://private.example.invalid/v1"
+        val draft = ProviderEditorDraft(null, "new", "draft", privateAddress, secret, emptyList(), emptyList())
+        assertFalse(draft.toString().contains(secret))
+        assertFalse(draft.toString().contains(privateAddress))
+    }
+
+    @Test
     fun saveDirtyStateIncludesMetadataWithoutRequiringAnotherConnectionTest() {
         val existing = provider(models = listOf(GatewayProviderModel("m", contextWindow = 200000, maxTokens = 8192)))
         val rows = FineCatProviderForm.initialRows(existing)
@@ -233,25 +242,47 @@ class FineCatProviderFormTest {
         assertEquals("google-generative-ai", parsed.rows.single().api)
     }
 
-    // ---- 新增/拉回来的模型：没配上下文窗口不能进实际 models ----
+    // ---- 新模型使用可编辑默认容量，已有模型留空保留宿主值 ----
 
-    /**
-     * 手动新增或从上游拉回来、existing 里没有同 id 的行：只挂「待配置」不够，
-     * 必须行内报错拦住保存（否则一个 contextWindow 空白的模型会被落盘给 pi）。
-     */
     @Test
-    fun newOrPulledModelWithoutContextWindowBlocksSave() {
+    fun newOrPulledModelWithoutCapacityUsesSdkDefaults() {
         val existing = provider(models = listOf(GatewayProviderModel(id = "m1", contextWindow = 131072L)))
         val rows = listOf(
-            ProviderModelDraft(id = "m1", api = PROVIDER_DEFAULT_API, contextWindow = "128K"),
-            ProviderModelDraft(id = "pulled-raw", api = PROVIDER_DEFAULT_API, contextWindow = ""),
+            ProviderModelDraft(id = "m1", api = PROVIDER_DEFAULT_API),
+            ProviderModelDraft(id = "pulled-raw", api = PROVIDER_DEFAULT_API),
         )
         val parsed = FineCatProviderForm.parseModels(rows, existing)
-        assertTrue("拉回来的行必须报错：${parsed.error}", parsed.error?.contains("pulled-raw") == true)
-        assertTrue("报错时不能交出可提交行", parsed.rows.isEmpty())
-        // 行内标记和拦截用同一个判据，不会出现标了红却还能存
-        assertTrue(FineCatProviderForm.unconfigured(existing, rows[1]))
-        assertTrue(!FineCatProviderForm.unconfigured(existing, rows[0]))
+        assertNull(parsed.error)
+        assertNull(parsed.rows[0].contextWindow)
+        assertNull(parsed.rows[0].maxTokens)
+        assertEquals(128000L, parsed.rows[1].contextWindow)
+        assertEquals(16384L, parsed.rows[1].maxTokens)
+    }
+
+    @Test
+    fun pulledIdOnlyModelsCanBeSavedAfterConnectionTestWithoutEditingEveryRow() {
+        val pulled = FineCatProviderForm.appendPulled(emptyList(), listOf("one", "two", "three"))
+        val parsed = FineCatProviderForm.parseModels(pulled.rows, null)
+        assertNull(parsed.error)
+        assertEquals(listOf("one", "two", "three"), parsed.rows.map { it.id })
+        assertTrue(parsed.rows.all { it.contextWindow == 128000L && it.maxTokens == 16384L })
+        requireValidProviderUpsert("new-provider", "https://relay.example/v1", "synthetic-key", parsed.rows)
+        val fingerprint = FineCatProviderForm.fingerprint("https://relay.example/v1", "synthetic-key", pulled.rows)
+        assertFalse(FineCatProviderForm.canSave(null, fingerprint, "old", false))
+        assertTrue(FineCatProviderForm.canSave(fingerprint, fingerprint, "old", false))
+    }
+
+    @Test
+    fun newModelCapacityDefaultsCanBeOverriddenIndependently() {
+        val contextOnly = FineCatProviderForm.parseModels(
+            listOf(ProviderModelDraft(id = "context", contextWindow = "500K")), null).rows.single()
+        assertEquals(500000L, contextOnly.contextWindow)
+        assertEquals(16384L, contextOnly.maxTokens)
+        val outputOnly = FineCatProviderForm.parseModels(
+            listOf(ProviderModelDraft(id = "output", maxTokens = "8K")), null).rows.single()
+        assertEquals(128000L, outputOnly.contextWindow)
+        assertEquals(8000L, outputOnly.maxTokens)
+        assertNotEquals(contextOnly.contextWindow, outputOnly.contextWindow)
     }
 
     /** 已有模型缺上下文窗口是 pi 走目录默认：允许原样保留，不拿新行的规矩去卡旧数据。 */
@@ -263,7 +294,7 @@ class FineCatProviderFormTest {
         val parsed = FineCatProviderForm.parseModels(rows, existing)
         assertNull(parsed.error)
         assertNull(parsed.rows.single().contextWindow)
-        assertTrue(!FineCatProviderForm.unconfigured(existing, rows.single()))
+        assertNull(parsed.rows.single().maxTokens)
     }
 
     // ---- 非法输入：可见 + 不产出可提交行 ----
@@ -332,7 +363,7 @@ class FineCatProviderFormTest {
         assertEquals(1, result.added)
         assertEquals(0, result.skipped)
         assertEquals(PROVIDER_DEFAULT_API, result.rows.single().api)
-        // 拉回来的模型没配上下文 → 表单行标记为「待配置」的判据
+        // 留空时保存使用SDK默认容量，用户仍可自行填写覆盖。
         assertTrue(result.rows.single().contextWindow.isBlank())
     }
 

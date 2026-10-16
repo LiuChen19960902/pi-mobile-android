@@ -4,7 +4,13 @@ import android.app.Application
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
+import android.os.Build
+import android.os.Process
+import com.finecat.pimobile.android.platform.CrashRecordingHandler
+import com.finecat.pimobile.android.platform.LocalCrashReport
 import com.finecat.pimobile.android.platform.GatewayLifecycleEvent
+import java.io.File
+import kotlin.system.exitProcess
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -12,9 +18,19 @@ import kotlinx.coroutines.launch
 class PiAndroidApplication : Application(), DefaultLifecycleObserver {
     lateinit var graph: AndroidAppGraph
         private set
+    internal lateinit var crashReport: LocalCrashReport
+        private set
 
     override fun onCreate() {
         super<Application>.onCreate()
+        crashReport = LocalCrashReport(
+            File(noBackupFilesDir, "last-crash.txt"),
+            BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, Build.VERSION.SDK_INT,
+        )
+        Thread.setDefaultUncaughtExceptionHandler(CrashRecordingHandler(
+            crashReport, Thread.getDefaultUncaughtExceptionHandler(),
+            terminate = { Process.killProcess(Process.myPid()); exitProcess(10) },
+        ))
         graph = AndroidAppGraph(this)
         graph.diagnostics.lifecycle(GatewayLifecycleEvent.APPLICATION_CREATED)
         ProcessLifecycleOwner.get().lifecycle.addObserver(this)
@@ -34,10 +50,9 @@ class PiAndroidApplication : Application(), DefaultLifecycleObserver {
                             .onFailure {
                                 graph.diagnostics.lifecycle(GatewayLifecycleEvent.KEEP_ALIVE_START_FAILED)
                             }
-                    } else {
-                        graph.diagnostics.lifecycle(GatewayLifecycleEvent.KEEP_ALIVE_STOP, keepAlive = false)
-                        GatewayConnectionService.stop(this@PiAndroidApplication)
                     }
+                    // 空闲时由服务在完成前台注册后自行停止。此处 stopService
+                    // 会与尚未收到 onStartCommand 的前台启动请求竞争并触发系统崩溃。
                 }
         }
     }

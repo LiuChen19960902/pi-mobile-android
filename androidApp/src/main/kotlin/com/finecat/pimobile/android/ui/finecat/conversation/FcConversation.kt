@@ -228,9 +228,12 @@ fun FcUserBubble(
     val type = LocalFineCatType.current
     val bubbleShape = RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp)
     BoxWithConstraints(modifier = modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        val bubbleMaxWidth = maxWidth * 0.85f
+        // 从外层约束取上限；图片容器随内容收缩，不能用 fillMaxWidth 撑开气泡。
+        val imageMaxWidth = (bubbleMaxWidth - 28.dp).coerceAtLeast(1.dp)
         Column(
             modifier = Modifier
-                .widthIn(max = maxWidth * 0.85f)
+                .widthIn(max = bubbleMaxWidth)
                 .testTag("finecat.userBubble.${message.id}")
                 .clip(bubbleShape)
                 .background(Color(0xFF111111))
@@ -251,16 +254,17 @@ fun FcUserBubble(
                 }
             }
             if (attachments.isNotEmpty()) {
-                BoxWithConstraints(Modifier.fillMaxWidth()) {
-                val availableWidth = maxWidth
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()).testTag("finecat.userImages.${message.id}"),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
                     attachments.forEachIndexed { index, attachment ->
                         val state = imageStates[attachment.attachmentId]
                         val thumb = thumbnails[attachment.attachmentId]
                         val size = if (attachment.width > 0 && attachment.height > 0) {
-                            fineCatImageSize(attachment.width, attachment.height, availableWidth, 96.dp)
+                            fineCatImageSize(attachment.width, attachment.height, imageMaxWidth, 96.dp)
                         } else {
-                            fineCatImageSize(thumb?.width ?: 0, thumb?.height ?: 0, availableWidth, 96.dp)
+                            fineCatImageSize(thumb?.width ?: 0, thumb?.height ?: 0, imageMaxWidth, 96.dp)
                         }
                         val retryable = state == com.finecat.pimobile.android.AttachmentLoadState.FAILED ||
                             state == com.finecat.pimobile.android.AttachmentLoadState.DEFERRED
@@ -307,7 +311,6 @@ fun FcUserBubble(
                             }
                         }
                     }
-                }
                 }
             }
             if (message.text.isNotEmpty()) {

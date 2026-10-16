@@ -361,7 +361,7 @@ class FineCatMatrix102DeviceTest {
                 compose.onNodeWithTag("finecat.modelSheet").assertExists().assertIsDisplayed()
                 compose.onNodeWithTag("finecat.model.zhipu.glm-5").assertExists()
                 compose.onNodeWithTag("finecat.thinking.medium").assertIsSelected()
-                compose.onNodeWithText("暂无可用模型：目录为空或未连接网关").assertDoesNotExist()
+                compose.onNodeWithText("暂无可用模型").assertDoesNotExist()
             }
             "S4-MODEL-SHEET" -> {
                 loadHistoryAndTrajectory("s1")
@@ -372,7 +372,7 @@ class FineCatMatrix102DeviceTest {
                 compose.onNodeWithTag("finecat.modelSheet").assertExists().assertIsDisplayed()
                 compose.onNodeWithTag("finecat.model.zhipu.glm-5").assertExists()
                 compose.onNodeWithTag("finecat.thinking.medium").assertIsSelected()
-                compose.onNodeWithText("暂无可用模型：目录为空或未连接网关").assertDoesNotExist()
+                compose.onNodeWithText("暂无可用模型").assertDoesNotExist()
             }
             "S11-PROVIDER-EDIT" -> {
                 openSettings()

@@ -7,6 +7,114 @@ fun treeRowPrefix(node: GatewayTreeNode): String =
     node.prefix + if (node.onActivePath) "• " else ""
 
 /**
+ * 原型按每次用户输入给工具/回复画组内线。Pi 的无分叉单链没有 prefix，
+ * 这里只给可见用户节点后、parentId 连续的平铺段补视觉线，深链不逐层右移。
+ * 保留网关的祖先竖线/缩进，不覆盖节点本身的分叉或折叠标记；缺用户/断链不猜归属。
+ */
+fun treeDisplayPrefixes(nodes: List<GatewayTreeNode>): List<String> {
+    val lastUserIndex = nodes.indexOfLast { it.type == "message" && it.role == "user" }
+    var inVisibleTurn = false
+    var previousId: String? = null
+    return nodes.mapIndexed { index, node ->
+        val isUser = node.type == "message" && node.role == "user"
+        val follows = inVisibleTurn && node.parentId == previousId
+        val ownsConnector = node.prefix.any { it in "├└─⊟⊞" }
+        val decorate = !isUser && follows && !ownsConnector
+        inVisibleTurn = isUser || follows
+        previousId = node.id
+        if (!decorate) return@mapIndexed treeRowPrefix(node)
+        val next = nodes.getOrNull(index + 1)
+        val continues = next != null && next.prefix == node.prefix && next.parentId == node.id &&
+            next.prefix.none { it in "├└─⊟⊞" } &&
+            !(next.type == "message" && next.role == "user")
+        node.prefix.ifEmpty { if (index < lastUserIndex) "│  " else "   " } +
+            (if (continues) "├─ " else "└─ ") +
+            (if (node.onActivePath) "• " else "")
+    }
+}
+
+/**
+ * 树行正文的三段拆分（原型 `body()` 的“长路径弱化目录、保留尾部”）。
+ * `before + dimDirectory + tail` 恒等于原文，不改一个字符、不自己截断。
+ */
+data class TreeRowPathParts(val before: String, val dimDirectory: String, val tail: String) {
+    val joined: String get() = before + dimDirectory + tail
+    val hasDimDirectory: Boolean get() = dimDirectory.isNotEmpty()
+}
+
+/**
+ * 只对**最后一个含 `/` 的空白分隔片段**做目录弱化：该片段最后一个 `/` 之前（含）
+ * 变淡，尾部（文件名/行号/命令尾巴）保留正常色，片段前后的文本不受影响。
+ *
+ * 不按原型直接取“全文最后一个 `/`”：那会把 `[grep: /pat/ in ~/x]` 的模式与
+ * `cd ~/x && ls` 的 `cd ` 一并弱化，只剩下一个字母的尾部。本函数不造数据：
+ * 没有含 `/` 的片段时原样返回（dimDirectory 为空）。
+ */
+fun treeRowPathParts(body: String): TreeRowPathParts {
+    var tokenStart = -1
+    var candidateStart = -1
+    var candidateSlash = -1
+    var index = 0
+    while (index <= body.length) {
+        val atEnd = index == body.length
+        val isSpace = !atEnd && body[index].isWhitespace()
+        if (!isSpace && !atEnd) {
+            if (tokenStart < 0) tokenStart = index
+            if (body[index] == '/') {
+                candidateStart = tokenStart
+                candidateSlash = index
+            }
+        } else {
+            tokenStart = -1
+        }
+        index++
+    }
+    if (candidateSlash < 0) return TreeRowPathParts(body, "", "")
+    return TreeRowPathParts(
+        before = body.substring(0, candidateStart),
+        dimDirectory = body.substring(candidateStart, candidateSlash + 1),
+        tail = body.substring(candidateSlash + 1),
+    )
+}
+
+/**
+ * 消息行的角色标记拆分：网关 `displayText` 已含 `user: ` / `assistant: ` 前缀（Pi
+ * getEntryDisplayText 口径），客户端只把它染成角色色，**不再追加自己的标签**，
+ * 否则会出现 `我 user: xxx` 这类双重前缀。不匹配时返回 null（整行当正文）。
+ */
+fun treeRowRoleLabel(displayText: String, role: String?): String? {
+    if (role != "user" && role != "assistant") return null
+    val prefix = "$role: "
+    return if (displayText.startsWith(prefix)) prefix else null
+}
+
+/**
+ * 搜索命中的客户端强调判定（原型 `.hit`）：与网关同口径的空白分词 AND、不区分
+ * 大小写，但只在**行上看得到的文本**（标签 + displayText/preview）里找。
+ *
+ * 这是强调，不是过滤：网关还会按角色、类型关键字与 200 字正文窗口匹配，因此
+ * 本函数返回 false 的行仍可能合法地出现在结果里（例如只命中 `user` 角色词），
+ * 此时不加高亮，不反过来隐藏或伪造命中。
+ */
+fun treeRowMatchesSearch(node: GatewayTreeNode, query: String): Boolean {
+    val tokens = query.trim().lowercase().split(Regex("\\s+")).filter(String::isNotEmpty)
+    if (tokens.isEmpty()) return false
+    val haystack = buildString {
+        node.label?.let { append(it).append(' ') }
+        append(node.displayText ?: node.preview)
+    }.lowercase()
+    return tokens.all { it in haystack }
+}
+
+/** 树行正文：有 tree-view-v1 的 displayText 就用它（已含角色/标签前缀），
+ *  旧网关回落 preview 并自己补角色前缀（与改动前同口径）。 */
+fun treeRowText(node: GatewayTreeNode): String = node.displayText ?: when (node.role) {
+    "user" -> "user: ${node.preview}"
+    "assistant" -> "assistant: ${node.preview}"
+    else -> node.preview
+}
+
+/**
  * 原型 `md()` 的行内 span 范围：只认反引号 code 与双星粗体，不解析嵌套与未闭合
  * （正则不命中即保持字面）。原型先替换 code 再替换 bold，因此 bold 可包住 code
  * （如 `**`x`**`）——两个 range 允许重叠，渲染时样式叠加。

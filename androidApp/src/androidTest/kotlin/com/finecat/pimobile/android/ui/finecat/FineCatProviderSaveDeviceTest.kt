@@ -1,13 +1,23 @@
 package com.finecat.pimobile.android.ui.finecat
 
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Bitmap
+import android.text.InputType
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsFocused
@@ -23,6 +33,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
@@ -97,6 +108,7 @@ class FineCatProviderSaveDeviceTest {
 
     private var graph: AndroidAppGraph? = null
     private var holder: AndroidSharedStateHolder? = null
+    private lateinit var inputView: View
 
     /** 主题开关：在同一组合里换 LocalFineCatColors，不重开 content、不清卡片内部状态。 */
     private var dark by mutableStateOf(false)
@@ -132,6 +144,8 @@ class FineCatProviderSaveDeviceTest {
             waitUntil { stateHolder.gatewayState.connection.name == "CONNECTED" }
         }
         compose.setContent {
+            val view = LocalView.current
+            SideEffect { inputView = view }
             FineCatTheme(darkTheme = dark) {
                 FineCatProviderSheet(stateHolder = stateHolder, onDismiss = {})
             }
@@ -438,5 +452,42 @@ class FineCatProviderSaveDeviceTest {
         // 密码行保持掩码语义：只验语义节点，不填任何值、不落明文截图/日志
         compose.onNodeWithTag("finecat.formApiKey")
             .assert(SemanticsMatcher.keyIsDefined(SemanticsProperties.Password))
+    }
+
+    @Test
+    fun apiKey_usesNormalImeAndClipboardPaste_whileRemainingMasked() {
+        val transport = connectAndShowProviderSheet()
+        compose.onNodeWithTag("finecat.providerNew").performClick()
+        waitUntilTag("finecat.providerEdit")
+        scrollTagIntoView("finecat.formApiKey")
+        val field = compose.onNodeWithTag("finecat.formApiKey")
+        field.performTouchInput { click() }
+        field.assertIsFocused()
+        compose.runOnIdle {
+            val editor = EditorInfo()
+            assertTrue("必须有真实编辑连接", inputView.onCreateInputConnection(editor) != null)
+            assertEquals(InputType.TYPE_CLASS_TEXT, editor.inputType and InputType.TYPE_MASK_CLASS)
+            assertEquals(InputType.TYPE_TEXT_VARIATION_NORMAL, editor.inputType and InputType.TYPE_MASK_VARIATION)
+            val modifyingFlags = InputType.TYPE_TEXT_FLAG_AUTO_CORRECT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+                InputType.TYPE_TEXT_FLAG_CAP_WORDS or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            assertEquals("密钥输入不自动纠正或大写", 0, editor.inputType and modifyingFlags)
+        }
+        val clipboard = inputView.context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val previousClip = clipboard.primaryClip
+        val syntheticKey = "synthetic-paste-key_Ab9+/="
+        try {
+            compose.runOnIdle { clipboard.setPrimaryClip(ClipData.newPlainText("fixture", syntheticKey)) }
+            field.performSemanticsAction(SemanticsActions.PasteText) { it() }
+            field.assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString(syntheticKey)))
+            field.assert(SemanticsMatcher.keyIsDefined(SemanticsProperties.Password))
+            assertTrue("普通文字节点不得显示密钥", compose.onAllNodes(SemanticsMatcher("明文Text") {
+                it.config.getOrNull(SemanticsProperties.Text)?.any { text -> text.text.contains(syntheticKey) } == true
+            }).fetchSemanticsNodes().isEmpty())
+            assertTrue("粘贴不能触发写配置", transport.payloadsOfType("provider-put").isEmpty())
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                clipboard.setPrimaryClip(previousClip ?: ClipData.newPlainText("fixture", ""))
+            }
+        }
     }
 }

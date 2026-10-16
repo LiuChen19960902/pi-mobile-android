@@ -48,6 +48,138 @@ import kotlin.test.assertTrue
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GatewayRuntimeIntegrationTest {
+    private val dispositionHello = """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["sessions","message","dequeue","prompt-disposition-v1"]}"""
+
+    @Test
+    fun startedAckBeforeStartEventKeepsActualRunAliveInBackground() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("start", emptyList(), "s1"))
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"started","isStreaming":true,"isCompacting":false}""")
+        runCurrent()
+        runtime.applicationDidEnterBackground()
+        assertEquals(GatewayConnectionState.CONNECTED, runtime.state.value.connection)
+        assertTrue(runtime.state.value.shouldKeepAliveInBackground)
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":1,"time":1,"event":{"type":"agent_start"}}""")
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":2,"time":2,"event":{"type":"agent_settled"}}""")
+        runCurrent()
+        assertEquals(GatewayConnectionState.SUSPENDED, runtime.state.value.connection)
+    }
+
+    @Test
+    fun malformedDispositionAckDoesNotConsumeInputOrImmediatelyDisconnect() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("pending", emptyList(), "s1"))
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"handled"}""")
+        runCurrent()
+        assertEquals(GatewayConnectionState.CONNECTED, runtime.state.value.connection)
+        assertFalse(events.filterIsInstance<GatewayRuntimeEvent.Frame>().any { it.frame.kind == "sent" })
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.RequestRejected>().any { it.reason == "invalid-message-ack" })
+        assertFalse(runtime.sendMessage("blocked", emptyList(), "s1"))
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"handled","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+        assertTrue(runtime.sendMessage("next", emptyList(), "s1"))
+    }
+
+    @Test
+    fun authoritativeIdleSnapshotReleasesObservedRunButPreservesPendingOtherInput() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("start", emptyList(), "s1"))
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"started","isStreaming":true,"isCompacting":false}""")
+        runCurrent()
+        assertTrue(runtime.sendMessage("pending", emptyList(), "s2"))
+        assertTrue(runtime.requestState("s1"))
+        transport.receive("""{"kind":"state","sessionId":"s1","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertEquals(setOf("s2"), runtime.state.value.activeTurnSessionIds)
+        transport.receive("""{"kind":"sent","sessionId":"s2","disposition":"handled","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+    }
+
+    @Test
+    fun handledInputWithoutRunReleasesOnlyItsOwnWait() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("handled", emptyList(), null, "/tmp/project"))
+        transport.receive("""{"kind":"sent","sessionId":"new","disposition":"handled","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+        assertFalse(runtime.state.value.hasUnassociatedTurn)
+        assertTrue(runtime.sendMessage("next", emptyList(), "new"))
+    }
+
+    @Test
+    fun handledCanStartRealRunAndSettledCannotConsumeNextUnacknowledgedInput() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("handled with run", emptyList(), "s1"))
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":1,"time":1,"event":{"type":"agent_start"}}""")
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"handled","isStreaming":true,"isCompacting":false}""")
+        runCurrent()
+        assertEquals(setOf("s1"), runtime.state.value.activeTurnSessionIds)
+        assertTrue(runtime.sendMessage("next input", emptyList(), "s1"))
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":2,"time":2,"event":{"type":"agent_settled"}}""")
+        runCurrent()
+        assertEquals(setOf("s1"), runtime.state.value.activeTurnSessionIds) // 仍等待next input回执。
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"handled","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+    }
+
+    @Test
+    fun queuedInputsUseOneActualRunAndHandledDoesNotStopAnotherSession() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("start", emptyList(), "s1"))
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"started","isStreaming":true,"isCompacting":false}""")
+        runCurrent()
+        assertTrue(runtime.sendMessage("queued", emptyList(), "s1"))
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"queued","isStreaming":true,"isCompacting":false}""")
+        runCurrent()
+        assertTrue(runtime.sendMessage("consume", emptyList(), "s2"))
+        transport.receive("""{"kind":"sent","sessionId":"s2","disposition":"handled","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertEquals(setOf("s1"), runtime.state.value.activeTurnSessionIds)
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":5,"time":5,"event":{"type":"agent_settled"}}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+    }
+
+    @Test
+    fun completedRunBeforeSentAndLegacyGatewayKeepTheirOwnAccounting() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime, dispositionHello)
+        assertTrue(runtime.sendMessage("fast", emptyList(), "s1"))
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":1,"time":1,"event":{"type":"agent_start"}}""")
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":2,"time":2,"event":{"type":"agent_settled"}}""")
+        transport.receive("""{"kind":"sent","sessionId":"s1","disposition":"started","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+        val legacyTransport = FakeTransport()
+        val legacy = newRuntime(legacyTransport)
+        connectHello(legacyTransport, legacy)
+        assertTrue(legacy.sendMessage("legacy", emptyList(), "old"))
+        legacyTransport.receive("""{"kind":"sent","sessionId":"old"}""")
+        runCurrent()
+        assertTrue(legacy.state.value.shouldKeepAliveInBackground)
+        legacyTransport.receive("""{"kind":"event","sessionId":"old","seq":1,"time":1,"event":{"type":"agent_settled"}}""")
+        runCurrent()
+        assertFalse(legacy.state.value.shouldKeepAliveInBackground)
+    }
+
     @Test
     fun inputQueriesImmediatelyReplaceActiveAndIgnoreOldSuccessAndError() = runTest {
         val transport = FakeTransport()
@@ -442,6 +574,14 @@ class GatewayRuntimeIntegrationTest {
         assertFalse(runtime.state.value.shouldKeepAliveInBackground)
 
         runtime.sendMessage("hi", emptyList(), "session-a", null)
+        // 非法ACK缺少真实会话，不能提前结束当前lane；新/空白ID同样拒绝。
+        listOf("""{"kind":"sent"}""", """{"kind":"sent","sessionId":""}""",
+            """{"kind":"sent","sessionId":"   "}""").forEach { invalid ->
+            transport.receive(invalid)
+            runCurrent()
+        }
+        assertEquals(0, events.filterIsInstance<GatewayRuntimeEvent.Frame>().count { it.frame.kind == "sent" })
+        assertEquals(setOf("session-a"), runtime.state.value.activeTurnSessionIds)
         // sent 帧仍做严格会话关联：目标不匹配的回显不得提交，也不得发布帧。
         transport.receive("""{"kind":"sent","sessionId":"wrong-session"}""")
         runCurrent()
@@ -457,10 +597,13 @@ class GatewayRuntimeIntegrationTest {
         runCurrent()
         assertEquals(setOf("session-a"), runtime.state.value.activeTurnSessionIds)
         transport.receive(
-            """{"kind":"error","code":"session-not-found","requestType":"message","sessionId":"session-a"}"""
+            """{"kind":"error","code":"future-message-rejection","requestType":"message","sessionId":"session-a"}"""
         )
         runCurrent()
         assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.RequestRejected>().any {
+            it.requestType == "message" && it.reason == "future-message-rejection" && it.serverResponse
+        })
 
         runtime.sendMessage("new", emptyList(), sessionId = null, cwd = "/tmp/pi-demo")
         assertTrue(runtime.state.value.hasUnassociatedTurn)
@@ -545,6 +688,135 @@ class GatewayRuntimeIntegrationTest {
         assertFalse(events.filterIsInstance<GatewayRuntimeEvent.RequestCancelled>().any {
             it.reason == "connection-recycled"
         })
+    }
+
+    @Test
+    fun alternateUnauthorizedCannotEraseTokenFromSuccessfulPairing() = runTest {
+        val transport = FakeTransport()
+        val credentials = FakeCredentials()
+        val runtime = newRuntime(transport, credentials = credentials)
+        runCurrent()
+        runtime.setEndpointCandidates(listOf(TAIL_ENDPOINT, LAN_ENDPOINT))
+        runtime.pair(encodeBase64Url(
+            """{"version":1,"publicUrl":"$TAIL_ENDPOINT","pairingCode":"${GatewayProtocolFixtures.PAIRING_CODE}","expiresAt":1786937455000}"""
+        ))
+        transport.opened()
+        transport.receive(GatewayProtocolFixtures.PAIRED)
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        runCurrent()
+        assertEquals("long-lived-secret", credentials.token)
+
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            reason = "websocket-failure", recoverable = true,
+        ))
+        runCurrent()
+        assertEquals(LAN_ENDPOINT, transport.connectionSpecs.last().endpoint)
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            httpStatus = 401, recoverable = false,
+        ))
+        runCurrent()
+
+        assertEquals("long-lived-secret", credentials.token)
+        assertEquals(3, transport.connectionSpecs.size)
+        assertEquals(TAIL_ENDPOINT, transport.connectionSpecs.last().endpoint)
+        assertEquals("long-lived-secret", transport.connectionSpecs.last().bearerToken)
+        assertNull(transport.connectionSpecs.last().pairingCode)
+        transport.opened()
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        runCurrent()
+        assertEquals(GatewayConnectionState.CONNECTED, runtime.state.value.connection)
+    }
+
+    @Test
+    fun alternateUnauthorizedWaitsForBackoffWithoutReportingInvalidPrimaryCredentials() = runTest {
+        val transport = FakeTransport()
+        val credentials = FakeCredentials().apply { token = "synthetic-token" }
+        val clock = object : GatewayClock {
+            override fun nowEpochMilliseconds() = 1_786_937_355_000L
+            override suspend fun delay(milliseconds: Long) = kotlinx.coroutines.delay(milliseconds)
+        }
+        val runtime = newRuntime(transport, credentials = credentials, clock = clock)
+        runCurrent()
+        runtime.setEndpointCandidates(listOf(TAIL_ENDPOINT, LAN_ENDPOINT))
+        runtime.connect(TAIL_ENDPOINT)
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            reason = "websocket-failure", recoverable = true,
+        ))
+        runCurrent()
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            httpStatus = 401, recoverable = false,
+        ))
+        runCurrent()
+        assertEquals("synthetic-token", credentials.token)
+        assertEquals("transport-failed", runtime.state.value.lastError)
+        assertEquals(2, transport.connectionSpecs.size)
+        advanceTimeBy(1_999)
+        runCurrent()
+        assertEquals(2, transport.connectionSpecs.size)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(3, transport.connectionSpecs.size)
+        assertEquals(TAIL_ENDPOINT, transport.connectionSpecs.last().endpoint)
+        assertEquals("synthetic-token", transport.connectionSpecs.last().bearerToken)
+    }
+
+    @Test
+    fun primaryUnauthorizedAfterAlternateRetryStillClearsTokenAndStops() = runTest {
+        val transport = FakeTransport()
+        val credentials = FakeCredentials().apply { token = "synthetic-token" }
+        val runtime = newRuntime(transport, credentials = credentials)
+        runCurrent()
+        runtime.setEndpointCandidates(listOf(TAIL_ENDPOINT, LAN_ENDPOINT))
+        runtime.connect(TAIL_ENDPOINT)
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            reason = "websocket-failure", recoverable = true,
+        ))
+        runCurrent()
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            httpStatus = 401, recoverable = false,
+        ))
+        runCurrent()
+        assertEquals(TAIL_ENDPOINT, transport.connectionSpecs.last().endpoint)
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            httpStatus = 401, recoverable = false,
+        ))
+        runCurrent()
+        assertNull(credentials.token)
+        assertEquals(GatewayConnectionState.FAILED, runtime.state.value.connection)
+        assertEquals("authentication-required", runtime.state.value.lastError)
+        runtime.applicationDidBecomeActive()
+        runCurrent()
+        assertEquals(3, transport.connectionSpecs.size)
+    }
+
+    @Test
+    fun explicitRevocationOnAlternateStillStopsAutomaticReconnect() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        runCurrent()
+        runtime.setEndpointCandidates(listOf(TAIL_ENDPOINT, LAN_ENDPOINT))
+        runtime.connect(TAIL_ENDPOINT)
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            reason = "websocket-failure", recoverable = true,
+        ))
+        runCurrent()
+        transport.fail(GatewayTransportState.Failed(
+            generation = transport.connectionSpecs.last().generation,
+            closeCode = 4003, recoverable = false,
+        ))
+        runCurrent()
+        assertEquals(GatewayConnectionState.FAILED, runtime.state.value.connection)
+        runtime.applicationDidBecomeActive()
+        runCurrent()
+        assertEquals(2, transport.connectionSpecs.size)
     }
 
     @Test
@@ -672,7 +944,7 @@ class GatewayRuntimeIntegrationTest {
         val home = "wss://home.example/ws/mobile"
         val tail = "wss://tail.example/ws/mobile"
         runtime.setEndpointCandidates(listOf(home, tail))
-        // 重扫同一网关二维码：publicUrl 已在列，只追加不重复。
+        // 重扫已有入口：显式配对目标置首，不重复，也不删除其他入口。
         runtime.pair(
             encodeBase64Url(
                 """{"version":1,"publicUrl":"$tail",""" +
@@ -680,7 +952,156 @@ class GatewayRuntimeIntegrationTest {
             )
         )
         runCurrent()
-        assertEquals(listOf(home, tail), preferences.load().endpointCandidates)
+        assertEquals(listOf(tail, home), preferences.load().endpointCandidates)
+    }
+
+    @Test
+    fun timedOutAbortRecyclesConnection_andLateOrUnsolicitedAckCannotEndNewTurn() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport, requestTimeoutMilliseconds = 1_000)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        runCurrent()
+        runtime.connect("wss://gateway.example/ws/mobile")
+        transport.opened()
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        assertTrue(runtime.sendMessage("old", emptyList(), "session-a"))
+        transport.receive("""{"kind":"sent","sessionId":"session-a"}""")
+        runCurrent()
+        assertTrue(runtime.abort("session-a"))
+        val oldGeneration = transport.connectionSpecs.last().generation
+        val closeBefore = transport.closeCount
+        advanceTimeBy(1_001)
+        runCurrent()
+        assertTrue(events.any { it is GatewayRuntimeEvent.RequestTimedOut && it.requestType == "abort" })
+        assertTrue(transport.closeCount > closeBefore)
+        assertTrue(transport.connectionSpecs.last().generation != oldGeneration)
+        val late = """{"kind":"aborted","sessionId":"session-a","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["old draft"]}"""
+        transport.receiveAt(oldGeneration, late)
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.Frame>().none { it.frame.kind == "aborted" })
+        transport.opened()
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        assertTrue(runtime.sendMessage("new", emptyList(), "session-a"))
+        transport.receive("""{"kind":"sent","sessionId":"session-a"}""")
+        runCurrent()
+        // Even an unsolicited ACK labelled with the current generation has no active abort lane.
+        transport.receive(late)
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.Frame>().none { it.frame.kind == "aborted" })
+        assertEquals(setOf("session-a"), runtime.state.value.activeTurnSessionIds)
+        runtime.applicationDidEnterBackground()
+        assertEquals(GatewayConnectionState.CONNECTED, runtime.state.value.connection)
+        assertTrue(runtime.state.value.shouldKeepAliveInBackground)
+        assertTrue(runtime.abort("session-a"))
+        transport.receive(late)
+        runCurrent()
+        assertEquals(1, events.filterIsInstance<GatewayRuntimeEvent.Frame>().count { it.frame.kind == "aborted" })
+        assertEquals(GatewayConnectionState.SUSPENDED, runtime.state.value.connection)
+    }
+
+    @Test
+    fun dequeueKeepsRunningTurnUntilSettled_andRejectsOldOperationIds() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        runCurrent()
+        runtime.connect("wss://gateway.example/ws/mobile")
+        transport.opened()
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        for (session in listOf("session-a", "session-a", "session-a", "session-b")) {
+            assertTrue(runtime.sendMessage("queued", emptyList(), session, mode = "followUp"))
+            assertFalse(runtime.sendRequest(GatewayRequests.dequeue(session, "before-sent")))
+            transport.receive("""{"kind":"sent","sessionId":"$session"}""")
+            runCurrent()
+        }
+        val ack = """{"kind":"dequeued","sessionId":"session-a","queueRequestId":"q-1","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["s","f"]}"""
+        assertTrue(runtime.sendRequest(GatewayRequests.dequeue("session-a", "q-1")))
+        assertFalse(runtime.sendMessage("new", emptyList(), "session-a"))
+        transport.receive(ack.replace(",\"queued\":[\"s\",\"f\"]", "")) // 同ID但缺取回载荷，不得结束lane或发布。
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.Frame>().none { it.frame.kind == "dequeued" })
+        transport.receive(ack.replace("q-1", "wrong"))
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.Frame>().none { it.frame.kind == "dequeued" })
+        transport.receive(ack)
+        runCurrent()
+        assertEquals(setOf("session-a", "session-b"), runtime.state.value.activeTurnSessionIds)
+        assertTrue(runtime.sendRequest(GatewayRequests.dequeue("session-a", "q-2")))
+        transport.receive(ack) // 旧操作ID即使撞上新lane也不能取回/结束新请求。
+        runCurrent()
+        assertEquals(1, events.filterIsInstance<GatewayRuntimeEvent.Frame>().count { it.frame.kind == "dequeued" })
+        transport.receive(ack.replace("q-1", "q-2").replace("[\"s\",\"f\"]", "[]"))
+        runCurrent()
+        transport.receive("""{"kind":"event","sessionId":"session-a","seq":1,"time":1,"event":{"type":"agent_settled"}}""")
+        runCurrent()
+        assertEquals(setOf("session-b"), runtime.state.value.activeTurnSessionIds)
+        transport.receive(ack)
+        runCurrent()
+        assertEquals(setOf("session-b"), runtime.state.value.activeTurnSessionIds)
+    }
+
+    @Test
+    fun dequeueRejectAndTimeoutReleaseOnlyMatchingOperation_andNeverPublishLateDrafts() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport, requestTimeoutMilliseconds = 1_000)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        runCurrent()
+        runtime.connect("wss://gateway.example/ws/mobile")
+        transport.opened()
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        assertTrue(runtime.sendRequest(GatewayRequests.dequeue("session-a", "q-1")))
+        transport.receive("""{"kind":"error","requestType":"dequeue","sessionId":"session-a","queueRequestId":"q-1","code":"internal"}""")
+        runCurrent()
+        assertTrue(events.any { it is GatewayRuntimeEvent.RequestRejected && it.requestType == "dequeue" && it.correlationId == "q-1" })
+        assertTrue(runtime.sendRequest(GatewayRequests.dequeue("session-a", "q-2")))
+        val generation = transport.connectionSpecs.last().generation
+        advanceTimeBy(1_001)
+        runCurrent()
+        assertTrue(events.any { it is GatewayRuntimeEvent.RequestTimedOut && it.requestType == "dequeue" && it.correlationId == "q-2" })
+        transport.receiveAt(generation, """{"kind":"dequeued","sessionId":"session-a","queueRequestId":"q-2","queued":["lost ack draft"]}""")
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.Frame>().none { it.frame.kind == "dequeued" })
+    }
+
+    @Test
+    fun acknowledgedQueueRestoringAbortReleasesAllTargetTurnsButKeepsOtherSession() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        backgroundScope.launch { runtime.events.collect { } }
+        runCurrent()
+        runtime.connect("wss://gateway.example/ws/mobile")
+        transport.opened()
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        for (session in listOf("session-a", "session-a", "session-b")) {
+            assertTrue(runtime.sendMessage("queued", emptyList(), session, null, mode = "followUp"))
+            transport.receive("""{"kind":"sent","sessionId":"$session"}""")
+            runCurrent()
+        }
+        assertTrue(runtime.abort("session-a"))
+        assertTrue(transport.sentPayloads.last().contains("\"restoreQueued\":true"))
+        transport.receive("""{"kind":"aborted","sessionId":"wrong","isStreaming":false,"isCompacting":false,"queued":[]}""")
+        runCurrent()
+        assertEquals(setOf("session-a", "session-b"), runtime.state.value.activeTurnSessionIds)
+        transport.receive("""{"kind":"aborted","sessionId":"session-a","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["queued"]}""")
+        runCurrent()
+        assertEquals(setOf("session-b"), runtime.state.value.activeTurnSessionIds)
+        assertTrue(runtime.abort("session-b"))
+        transport.receive("""{"kind":"aborted","sessionId":"session-b","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":[]}""")
+        runCurrent()
+        assertFalse(runtime.state.value.shouldKeepAliveInBackground)
     }
 
     @Test
@@ -1315,7 +1736,7 @@ class GatewayRuntimeIntegrationTest {
     }
 
     @Test
-    fun pairingKeepsConfiguredEndpointAndOnlyAppendsPublicUrlAsCandidate() = runTest {
+    fun pairingPrioritizesPayloadEndpointAndPreservesOtherCandidates() = runTest {
         val transport = FakeTransport()
         val preferences = FakePreferences()
         val runtime = newRuntime(transport, preferences = preferences)
@@ -1331,9 +1752,87 @@ class GatewayRuntimeIntegrationTest {
         )
         runCurrent()
         val spec = transport.connectionSpecs.last()
-        assertEquals(LAN_ENDPOINT, spec.endpoint)
+        assertEquals(TAIL_ENDPOINT, spec.endpoint)
         assertEquals(GatewayProtocolFixtures.PAIRING_CODE, spec.pairingCode)
-        assertEquals(listOf(LAN_ENDPOINT, TAIL_ENDPOINT), preferences.load().endpointCandidates)
+        assertEquals(TAIL_ENDPOINT, preferences.load().endpoint)
+        assertEquals(listOf(TAIL_ENDPOINT, LAN_ENDPOINT), preferences.load().endpointCandidates)
+    }
+
+    @Test
+    fun pairingUnreachableNewAddressDoesNotProbeOldGatewayWithItsCode() = runTest {
+        val transport = FakeTransport()
+        val preferences = FakePreferences()
+        val runtime = newRuntime(transport, preferences = preferences)
+        connectHello(transport, runtime)
+        runtime.setEndpointCandidates(listOf(LAN_ENDPOINT, TAIL_ENDPOINT))
+        val before = transport.connectionSpecs.size
+        runtime.pair(encodeBase64Url(
+            """{"version":1,"publicUrl":"$TAIL_ENDPOINT","pairingCode":"${GatewayProtocolFixtures.PAIRING_CODE}","expiresAt":1786937455000}"""
+        ))
+        runCurrent()
+        advanceTimeBy(10_001)
+        runCurrent()
+        assertTrue(transport.connectionSpecs.drop(before).isNotEmpty())
+        assertTrue(transport.connectionSpecs.drop(before).all { it.endpoint == TAIL_ENDPOINT })
+        assertEquals(listOf(TAIL_ENDPOINT, LAN_ENDPOINT), preferences.load().endpointCandidates)
+    }
+
+    @Test
+    fun pairingClearsOldSubscriptionAndCapabilitiesEvenWhileOffline() = runTest {
+        val transport = FakeTransport()
+        val network = FakeNetworkMonitor()
+        val runtime = newRuntime(transport, network = network)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        connectHello(transport, runtime, helloWithAttachment())
+        runtime.subscribe("old-session")
+        runCurrent()
+        network.mutableState.value = GatewayNetworkState.UNAVAILABLE
+        runCurrent()
+        val priorRevision = runtime.state.value.gatewayRevision
+        runtime.pair(encodeBase64Url(
+            """{"version":1,"publicUrl":"$TAIL_ENDPOINT","pairingCode":"${GatewayProtocolFixtures.PAIRING_CODE}","expiresAt":1786937455000}"""
+        ))
+        assertEquals(priorRevision + 1, runtime.state.value.gatewayRevision)
+        assertTrue(runtime.state.value.capabilities.isEmpty())
+        assertEquals(GatewayConnectionState.WAITING_FOR_NETWORK, runtime.state.value.connection)
+        val sentBeforeNewGateway = transport.sentPayloads.size
+        network.mutableState.value = GatewayNetworkState.AVAILABLE
+        runCurrent()
+        transport.opened()
+        transport.receive("""{"kind":"paired","token":"new-gateway-token"}""")
+        transport.receive(helloWithAttachment())
+        runCurrent()
+        assertEquals(GatewayConnectionState.CONNECTED, runtime.state.value.connection)
+        assertFalse(transport.sentPayloads.drop(sentBeforeNewGateway).any { "old-session" in it })
+        val newFrames = events.filterIsInstance<GatewayRuntimeEvent.Frame>().filter { it.frame.kind == "paired" }
+        assertEquals(runtime.state.value.gatewayRevision, newFrames.single().gatewayRevision)
+    }
+
+    @Test
+    fun queuedOldGatewayFramesRemainDistinguishableAfterRePairing() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime)
+        transport.receive("""{"kind":"sessions","items":[{"id":"old","name":"old","running":false}]}""")
+        runCurrent() // Intentionally leave runtime.events uncollected.
+        runtime.pair(encodeBase64Url(
+            """{"version":1,"publicUrl":"$TAIL_ENDPOINT","pairingCode":"${GatewayProtocolFixtures.PAIRING_CODE}","expiresAt":1786937455000}"""
+        ))
+        runCurrent()
+        transport.opened()
+        transport.receive("""{"kind":"paired","token":"new-gateway-token"}""")
+        transport.receive(HELLO_WITHOUT_EXTRA)
+        transport.receive("""{"kind":"sessions","items":[{"id":"new","name":"new","running":false}]}""")
+        runCurrent()
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        runCurrent()
+        val sessions = events.filterIsInstance<GatewayRuntimeEvent.Frame>().filter { it.frame.kind == "sessions" }
+        assertEquals(2, sessions.size)
+        assertTrue(sessions.first().gatewayRevision < runtime.state.value.gatewayRevision)
+        assertEquals(runtime.state.value.gatewayRevision, sessions.last().gatewayRevision)
+        assertTrue(sessions.last().rawJson.contains("new"))
     }
 
     @Test
@@ -1648,14 +2147,15 @@ class GatewayRuntimeIntegrationTest {
         requestTimeoutMilliseconds: Long = 30_000,
         recoveryWindowMilliseconds: Long = 60_000,
         endpointProbeTimeoutMilliseconds: Long = 2_500,
-        finalHandshakeTimeoutMilliseconds: Long = 10_000
+        finalHandshakeTimeoutMilliseconds: Long = 10_000,
+        clock: GatewayClock = FakeClock(1_786_937_355_000)
     ): GatewayRuntime = GatewayRuntime(
         transport,
         preferences,
         credentials,
         attachmentCache,
         network,
-        FakeClock(1_786_937_355_000),
+        clock,
         backgroundScope,
         requestTimeoutMilliseconds,
         recoveryWindowMilliseconds,
@@ -1694,6 +2194,100 @@ class GatewayRuntimeIntegrationTest {
         transport.opened()
         transport.receive(hello)
         runCurrent()
+    }
+
+    @Test
+    fun treeActionRepliesAndErrorsCannotConsumeAnotherEntryOrAnAbsentLane() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        connectHello(transport, runtime,
+            """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["entry-copy","label-put","tree-actions-v1"]}""")
+        transport.receive("""{"kind":"entry-copy","sessionId":"s1","entryId":"e1","text":"未请求"}""")
+        runCurrent()
+        assertFalse(events.filterIsInstance<GatewayRuntimeEvent.Frame>().any { it.frame.kind == "entry-copy" })
+        for ((kind, request) in listOf(
+            "entry-copy" to GatewayRequests.entryCopy("s1", "e1"),
+            "label-put" to GatewayRequests.labelPut("s1", "e1", "交付")
+        )) {
+            assertTrue(runtime.sendRequest(request))
+            transport.receive("""{"kind":"$kind","sessionId":"s1","entryId":"wrong","text":"错误正文","label":"错误标签"}""")
+            transport.receive("""{"kind":"error","requestType":"$kind","sessionId":"s1","entryId":"wrong","code":"entry-not-found"}""")
+            runCurrent()
+            assertFalse(runtime.sendRequest(request))
+            transport.receive("""{"kind":"$kind","entryId":"e1","text":"缺会话"}""")
+            runCurrent()
+            assertFalse(runtime.sendRequest(request))
+            transport.receive("""{"kind":"$kind","sessionId":"s1","entryId":"e1","text":"全文","label":"交付"}""")
+            runCurrent()
+            assertEquals(1, events.filterIsInstance<GatewayRuntimeEvent.Frame>().count { it.frame.kind == kind })
+            assertTrue(runtime.sendRequest(request))
+            transport.receive("""{"kind":"error","requestType":"$kind","sessionId":"s1","entryId":"e1","code":"entry-not-found"}""")
+            runCurrent()
+            assertTrue(runtime.sendRequest(request))
+            runtime.disconnect()
+            connectHello(transport, runtime,
+                """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["entry-copy","label-put","tree-actions-v1"]}""")
+        }
+    }
+
+    @Test
+    fun compactFinishedIsValidatedAndDoesNotConsumeStateRequest() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(transport, runtime,
+            """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["compact","state","prompt-disposition-v1"]}""")
+        assertTrue(runtime.sendRequest(GatewayRequests.compact("s1")))
+        transport.receive("""{"kind":"compact-started","sessionId":"s1","isStreaming":false,"isCompacting":true}""")
+        runCurrent()
+        assertTrue("s1" in runtime.state.value.activeTurnSessionIds)
+        assertTrue(runtime.requestState("s-other"))
+        transport.receive("""{"kind":"compact-finished","sessionId":"s1","isStreaming":false}""")
+        runCurrent()
+        assertTrue("s1" in runtime.state.value.activeTurnSessionIds)
+        transport.receive("""{"kind":"compact-finished","sessionId":"","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertTrue("s1" in runtime.state.value.activeTurnSessionIds)
+        transport.receive("""{"kind":"compact-finished","sessionId":"s1","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertFalse("s1" in runtime.state.value.activeTurnSessionIds)
+        assertEquals(1, transport.sentTypes.count { it == "state" })
+        // 另一个会话state仍在途；通知不把它当成回执释放。
+        assertTrue(runtime.requestState("s-third"))
+        assertEquals(1, transport.sentTypes.count { it == "state" })
+        transport.receive("""{"kind":"state","sessionId":"s-other","isStreaming":false,"isCompacting":false}""")
+        runCurrent()
+        assertEquals(2, transport.sentTypes.count { it == "state" })
+    }
+
+    /** CTX02：手动压缩的 wire 往返。compact 是触发帧（compact-started 受理），
+     *  完成/失败靠 compaction_start/end 事件；REJECT_IF_BUSY 保证同会话不并发压缩。 */
+    @Test
+    fun manualCompactTriggersAndLifecycleEventsDriveActivity() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        connectHello(
+            transport, runtime,
+            """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["compact","state","message","prompt-disposition-v1"]}"""
+        )
+        assertTrue(runtime.sendRequest(GatewayRequests.compact("s1")))
+        runCurrent()
+        assertEquals(1, transport.sentTypes.count { it == "compact" })
+        // 受理回执（state 快照形状）。compact-started 仅带 isCompacting 的
+        // 新网关形状同样要入活动集合；本字段缺省时不冒充活动，避免旧网关
+        // 误常驻 Working。
+        transport.receive("""{"kind":"compact-started","sessionId":"s1","isStreaming":false,"isCompacting":true,"disposition":"handled"}""")
+        runCurrent()
+        // 权威快照先入活动集合；重复/迟到事件不再重复计数。
+        assertTrue("s1" in runtime.state.value.activeTurnSessionIds)
+        // 压缩开始/结束事件翻转活动会话（GatewayRuntime 的 observedCompactingSessions）。
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":1,"time":1,"event":{"type":"compaction_start","reason":"manual"}}""")
+        runCurrent()
+        assertTrue("s1" in runtime.state.value.activeTurnSessionIds)
+        transport.receive("""{"kind":"event","sessionId":"s1","seq":2,"time":2,"event":{"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false}}""")
+        runCurrent()
+        assertFalse("s1" in runtime.state.value.activeTurnSessionIds)
     }
 
     @Test

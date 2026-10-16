@@ -1,5 +1,7 @@
 package com.finecat.pimobile.android.ui
 
+import com.finecat.pimobile.shared.gateway.GatewayErrorText
+
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -315,12 +317,7 @@ private fun pairingResultPresentation(
         )
         GatewayConnectionState.FAILED -> PairingResultPresentation(
             "连接失败",
-            when (state.lastError) {
-                // 一次性配对码用过了：不等于长期凭据失效，别让人重新走一整遍配对流程。
-                "pairing-code-invalid" -> "配对码已过期或已被使用，请在电脑上重新生成一条。"
-                "endpoint-unreachable" -> "列表里的地址都没连上；检查备用地址顺序（在家局域网优先，外出 Tailscale）。"
-                else -> state.lastError ?: "请检查配对信息后重新连接。"
-            },
+            GatewayErrorText.connection(state.lastError),
             MaterialTheme.colorScheme.error,
             R.drawable.ic_permission_warning
         )

@@ -97,7 +97,7 @@ fun FineCatSessionDrawer(
     onDismiss: () -> Unit,
     onOpenSettings: () -> Unit = {},
     onOpenTheme: () -> Unit = {},
-    onNewSession: () -> Unit = {},
+    onNewSession: (String?) -> Unit = {},
     onRename: (SessionSummary) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -181,7 +181,7 @@ fun FineCatSessionDrawer(
                 Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
                     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
                         .background(colors.ink, RoundedCornerShape(999.dp))
-                        .clickable(role = Role.Button, onClick = onNewSession)
+                        .clickable(role = Role.Button, onClick = { onNewSession(selectedDirectory) })
                         .testTag("finecat.drawerNew"), horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically) {
                         Icon(FineCatIcons.Plus, null, tint = colors.onInk, modifier = Modifier.size(17.dp))

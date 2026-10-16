@@ -1,5 +1,7 @@
 package com.finecat.pimobile.android.ui.finecat
 
+import com.finecat.pimobile.shared.gateway.GatewayErrorText
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -74,6 +76,20 @@ internal fun FineCatSettingsScreen(
     val spacing = LocalFineCatSpacing.current
     val connection = stateHolder.gatewayState.connection
     val connected = connection == GatewayConnectionState.CONNECTED
+    val needsPairing = !connected && connection !in setOf(
+        GatewayConnectionState.CONNECTING, GatewayConnectionState.AUTHENTICATING,
+        GatewayConnectionState.WAITING_FOR_NETWORK,
+    ) && stateHolder.gatewayState.lastError in setOf("authentication-required", "pairing-code-invalid")
+    val connectionText = when {
+        connected -> stateHolder.pingResult ?: "点击测速"
+        needsPairing -> "需要重新配对"
+        connection == GatewayConnectionState.CONNECTING -> "正在连接…"
+        connection == GatewayConnectionState.AUTHENTICATING -> "正在验证…"
+        connection == GatewayConnectionState.WAITING_FOR_NETWORK -> "等待网络"
+        connection == GatewayConnectionState.FAILED -> GatewayErrorText.connection(stateHolder.gatewayState.lastError)
+        connection == GatewayConnectionState.SUSPENDED -> "连接已暂停"
+        else -> "未连接"
+    }
     val providersSupported = stateHolder.supportsRequest("providers")
 
     LaunchedEffect(connection) {
@@ -130,17 +146,21 @@ internal fun FineCatSettingsScreen(
                 FcSettingRow(
                     label = "网关延迟",
                     lead = FineCatIcons.Activity,
-                    value = if (connected) stateHolder.pingResult ?: "点击测速" else "未连接",
+                    value = connectionText,
                     showChevron = false,
                     onClick = stateHolder::pingGateway,
                     modifier = Modifier.testTag("finecat.gwPing"),
                 )
                 FcRowDivider()
                 FcSettingRow(
-                    label = if (connected) "断开连接" else "重新连接",
+                    label = if (connected) "断开连接" else if (needsPairing) "重新配对" else "重新连接",
                     lead = if (connected) FineCatIcons.Logout else FineCatIcons.Plus,
                     showChevron = false,
-                    onClick = { if (connected) stateHolder.disconnect() else stateHolder.connect() },
+                    onClick = {
+                        if (connected) stateHolder.disconnect()
+                        else if (needsPairing) onOpenManualPairing()
+                        else stateHolder.connect()
+                    },
                     modifier = Modifier.testTag("finecat.gwDisconnect"),
                 )
                 FcRowDivider()
@@ -161,11 +181,23 @@ internal fun FineCatSettingsScreen(
 
             // ---- 模型与 Provider（原型二级小节；一级卡列表在整页，表单仍走 sheet）----
             FcSectionLabel(text = "模型与 Provider", topPadding = 24.dp)
+            if (!connected) {
+                Row(Modifier.fillMaxWidth().testTag("finecat.modelConfigOffline"), verticalAlignment = Alignment.CenterVertically) {
+                    Text("未连接网关，请先连接后配置模型。", style = type.xs, color = colors.text2,
+                        modifier = Modifier.weight(1f).padding(start = 20.dp))
+                    FcTextButton("连接网关", onClick = {
+                        if (needsPairing) onOpenManualPairing() else stateHolder.connect()
+                    }, enabled = connection !in setOf(GatewayConnectionState.CONNECTING,
+                        GatewayConnectionState.AUTHENTICATING, GatewayConnectionState.WAITING_FOR_NETWORK),
+                        modifier = Modifier.padding(end = 12.dp).testTag("finecat.modelConfigConnect"))
+                }
+            }
             FcSettingCard {
                 FcSettingRow(
                     label = "scope-model",
                     lead = FineCatIcons.Cloud,
-                    onClick = { scopeOpen = true },
+                    enabled = connected,
+                    onClick = { if (stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED) scopeOpen = true },
                     modifier = Modifier.testTag("finecat.modelScopeEntry"),
                 )
             }
@@ -196,6 +228,7 @@ internal fun FineCatSettingsScreen(
                         subtitle = "models.json · " + providerRowSubtitle(provider),
                         // 缺 key 标红（原型 `<span class="tag bad">缺 key</span>`，不是普通文字）
                         tag = if (provider.apiKeySet) null else "缺 key",
+                        enabled = connected,
                         onClick = { onEditProvider(provider.id) },
                         modifier = Modifier.testTag("finecat.providerRow.${provider.id}"),
                     )
@@ -205,6 +238,7 @@ internal fun FineCatSettingsScreen(
                     FcSettingRow(
                         label = "添加 Provider",
                         lead = FineCatIcons.Plus,
+                        enabled = connected,
                         onClick = { onEditProvider(NEW_PROVIDER_ID) },
                         modifier = Modifier.testTag("finecat.providerNew"),
                     )

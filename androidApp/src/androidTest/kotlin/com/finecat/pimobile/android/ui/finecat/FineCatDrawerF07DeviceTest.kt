@@ -55,6 +55,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -455,6 +457,75 @@ class FineCatDrawerF07DeviceTest {
         assertTrue(hasText("待选择目录"))
         assertFalse(holder!!.transientNotice.orEmpty().contains("选择工作目录"))
         assertEquals(null, holder!!.fineCatNewSessionDirectoryPath)
+        assertEquals(0, transport.payloadsOfType("message").size)
+    }
+
+    @Test
+    fun s9_directoryPillOverridesCurrentSessionAndFirstMessageUsesItsCwd() {
+        val transport = setupSession()
+        onMain { holder!!.messageDraft = "目录继承诊断" }
+        openDrawer()
+        directory(GATEWAY_CWD)
+        // 筛选本身不改变已有会话；点新建才把完整路径交给新会话。
+        assertEquals("d-today-run", holder!!.snapshot.selectedSessionId)
+        assertEquals(ANDROID_CWD, holder!!.snapshot.sessions.first { it.id == "d-today-run" }.cwd)
+        compose.onNodeWithTag("finecat.drawerNew").performClick()
+        compose.waitUntil(5_000) { holder!!.snapshot.selectedSessionId == null }
+        assertTrue(hasTag("finecat.home"))
+        assertFalse(hasTag("finecat.drawerPanel"))
+        assertEquals(GATEWAY_CWD, holder!!.fineCatNewSessionDirectoryPath)
+        assertEquals("目录继承诊断", holder!!.messageDraft)
+        assertEquals(0, transport.payloadsOfType("message").size)
+
+        compose.onNodeWithContentDescription("发送").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("message").isNotEmpty() } }
+        val frame = transport.payloadsOfType("message").single()
+        assertEquals(GATEWAY_CWD, frame["cwd"]?.jsonPrimitive?.contentOrNull)
+        assertEquals(null, frame["sessionId"]?.jsonPrimitive?.contentOrNull)
+        assertEquals("目录继承诊断", frame["text"]?.jsonPrimitive?.contentOrNull)
+        assertEquals(ANDROID_CWD, holder!!.snapshot.sessions.first { it.id == "d-today-run" }.cwd)
+    }
+
+    @Test
+    fun s9_directoryPillOverridesHomeChoiceAndAllKeepsNewChoice() {
+        val transport = setupSession()
+        onMain {
+            holder!!.prepareNewSession(ANDROID_CWD)
+            holder!!.selectFineCatDirectory("/other/project")
+            holder!!.messageDraft = "保留草稿"
+        }
+        compose.waitUntil(5_000) { holder!!.snapshot.selectedSessionId == null }
+        // 相同末级标签必须按完整路径分别继承，第二次选择不能沿用第一次。
+        listOf("/work/alpha/shared", "/work/beta/shared").forEach { cwd ->
+            openDrawer()
+            directory(cwd)
+            compose.onNodeWithTag("finecat.drawerNew").performClick()
+            compose.waitUntil(5_000) { !hasTag("finecat.drawerPanel") }
+            assertEquals(cwd, holder!!.fineCatNewSessionDirectoryPath)
+        }
+        openDrawer()
+        compose.onNodeWithTag("finecat.drawerDirectory.all").performScrollTo().performClick()
+        compose.onNodeWithTag("finecat.drawerNew").performClick()
+        compose.waitUntil(5_000) { !hasTag("finecat.drawerPanel") }
+        assertEquals("/work/beta/shared", holder!!.fineCatNewSessionDirectoryPath)
+        assertEquals("保留草稿", holder!!.messageDraft)
+        assertEquals(0, transport.payloadsOfType("message").size)
+    }
+
+    @Test
+    fun s9_unspecifiedDirectoryGroupKeepsCurrentSessionWorkspace() {
+        val transport = setupSession()
+        val frame = sessionsFrame().replace(
+            "\"items\":[",
+            "\"items\":[{\"id\":\"no-cwd\",\"name\":\"未指定目录\",\"messageCount\":1,\"running\":false},",
+        )
+        transport.receive(frame)
+        runBlocking { waitUntil { holder!!.snapshot.sessions.any { it.id == "no-cwd" } } }
+        openDrawer()
+        directory("")
+        compose.onNodeWithTag("finecat.drawerNew").performClick()
+        compose.waitUntil(5_000) { holder!!.snapshot.selectedSessionId == null }
+        assertEquals(ANDROID_CWD, holder!!.fineCatNewSessionDirectoryPath)
         assertEquals(0, transport.payloadsOfType("message").size)
     }
 

@@ -15,7 +15,8 @@ package com.finecat.pimobile.shared.protocol
  *   message_end(role=toolResult)      → tool/result
  *   tool_execution_start              → tool/call
  *   agent_start / agent_settled       → turn/start / turn/end
- *   entry_appended(empty-stop-retry)  → notice/upstream（上游流错误/空回复的唯一痕迹）
+ *   message_end(role=custom)          → notice/custom（尊重display，仅通用文本）
+ *   tool_execution_end(nested)        → tool/result（无独立持久化结果的嵌套调用）
  *   entry_appended(compaction)        → compact/done（对齐 TUI 的 [compaction: Nk tokens] 行）
  *   compaction_start / compaction_end → compact/start / compact|notice（状态收尾与失败可见）
  *   session_info_changed              → session/title
@@ -31,6 +32,9 @@ class PiEventNormalizer(private val sessionId: String) {
 
     /** toolCallId → 最近一次 tool_execution_start 的工具名（result 关联用）。 */
     private val toolNamesByCallId = mutableMapOf<String, String>()
+    private val nestedParentsByCallId = mutableMapOf<String, String>()
+    private val completedNestedCalls = mutableSetOf<String>()
+    private val completedToolMessages = mutableSetOf<String>()
 
     fun normalize(seq: Int, time: Double, event: JsonValue, entryId: String? = null): List<SessionEvent> {
         val type = event["type"]?.stringValue ?: return emptyList()
@@ -39,6 +43,7 @@ class PiEventNormalizer(private val sessionId: String) {
             "message_update" -> onMessageUpdate(seq, time, event)
             "message_end" -> onMessageEnd(seq, time, event, entryId)
             "tool_execution_start" -> listOfNotNull(onToolExecutionStart(seq, time, event))
+            "tool_execution_end" -> onToolExecutionEnd(seq, time, event)
             "agent_start" -> listOf(view(seq, time, "turn/start"))
             "agent_settled" -> listOf(view(seq, time, "turn/end"))
             "compaction_start" -> listOf(view(seq, time, "compact/start", reason = event["reason"]?.stringValue))
@@ -61,7 +66,7 @@ class PiEventNormalizer(private val sessionId: String) {
         // 帧顶层 entryId（PROTOCOL §4.5）属于整个 event 帧（网关只在 message_end
         // 上加盖，一帧至多一条归一事件），随归一结果透传给身份去重；null = 身份未知。
         // 同一 entryId 也用于 image 引用寻址（§4.22 attachment 取图）。
-        return events.map { record -> record.copy(sessionId = sessionId, entryId = entryId) }
+        return events.map { record -> record.copy(sessionId = sessionId, entryId = entryId ?: record.entryId) }
     }
 
     private fun onMessageStart(seq: Int, time: Double, event: JsonValue, entryId: String?): List<SessionEvent> {
@@ -127,8 +132,15 @@ class PiEventNormalizer(private val sessionId: String) {
                     )
                 )
             }
+            "custom" -> customMessage(seq, time, message)
             "toolResult" -> {
                 val callId = message["toolCallId"]?.stringValue
+                if (callId in completedNestedCalls) return emptyList()
+                val parent = callId?.let { nestedParentsByCallId.remove(it) }
+                if (callId != null) {
+                    rememberCompletedCall(completedToolMessages, callId)
+                    if (parent != null) rememberCompletedCall(completedNestedCalls, callId)
+                }
                 // 结果关联后即释放（remove 返回旧值正好当名字用）：
                 // 连接生命周期内上千次工具调用不再单调增长。
                 val registeredName = callId?.let { toolNamesByCallId.remove(it) }
@@ -136,6 +148,7 @@ class PiEventNormalizer(private val sessionId: String) {
                     view(
                         seq, time, "tool/result",
                         callId = callId,
+                        parentCallId = parent,
                         name = registeredName ?: message["toolName"]?.stringValue,
                         isError = message["isError"]?.booleanValue ?: false,
                         preview = textOf(message["content"])
@@ -160,23 +173,45 @@ class PiEventNormalizer(private val sessionId: String) {
         val callId = event["toolCallId"]?.stringValue ?: return null
         val name = event["toolName"]?.stringValue
         if (name != null) toolNamesByCallId[callId] = name
+        completedNestedCalls.remove(callId)
+        completedToolMessages.remove(callId)
+        val parent = event["parentToolCallId"]?.stringValue?.takeIf(String::isNotBlank)
+        if (parent != null) nestedParentsByCallId[callId] = parent
         // orphan（start 后无 result，如中断）由上限兜底：只保最近的。
         while (toolNamesByCallId.size > MAX_TOOL_NAMES) {
-            toolNamesByCallId.remove(toolNamesByCallId.keys.firstOrNull() ?: break)
+            val oldest = toolNamesByCallId.keys.firstOrNull() ?: break
+            toolNamesByCallId.remove(oldest)
+            nestedParentsByCallId.remove(oldest)
         }
-        return view(seq, time, "tool/call", callId = callId, name = name, arguments = event["args"])
+        while (nestedParentsByCallId.size > MAX_TOOL_NAMES) nestedParentsByCallId.remove(nestedParentsByCallId.keys.first())
+        return view(seq, time, "tool/call", callId = callId, name = name, arguments = event["args"], parentCallId = parent)
     }
 
-    /**
-     * 扩展补写的空回复错误（401、额度不足等）的可见提示：由 `empty-stop-guard` 一类**扩展**在
-     * 检测到空回复重试时写入 `empty-stop-retry` custom entry（带 attempt/reason），
-     * 这里归一成 notice/upstream，让投影渲染成一条可见的系统提示；只报首次避免刷屏。
-     *
-     * 这是扩展行为、**不是 pi 原生**：pi 核心事件流没有这个概念，未安装此类扩展时本
-     * 分支是死代码，行为与 pi 原生一致（不出现任何提示）。判据是条目的 `data`——扩展
-     * 注入给模型的隐藏续跑消息是 custom_message 形态（无 data），会被下面的
-     * `?: return emptyList()` 跳过，因此不会被误渲染成错误提示。
-     */
+    private fun onToolExecutionEnd(seq: Int, time: Double, event: JsonValue): List<SessionEvent> {
+        val callId = event["toolCallId"]?.stringValue ?: return emptyList()
+        val parent = event["parentToolCallId"]?.stringValue?.takeIf(String::isNotBlank)
+            ?: nestedParentsByCallId[callId] ?: return emptyList()
+        // 顶层结果留给权威toolResult消息；仅嵌套调用依赖end收尾。
+        if (callId in completedNestedCalls || callId in completedToolMessages) return emptyList()
+        rememberCompletedCall(completedNestedCalls, callId)
+        nestedParentsByCallId.remove(callId)
+        val name = toolNamesByCallId.remove(callId) ?: event["toolName"]?.stringValue
+        return listOf(view(seq, time, "tool/result", callId = callId, name = name, parentCallId = parent,
+            preview = textOf(event["result"]?.get("content")), isError = event["isError"]?.booleanValue ?: false))
+    }
+
+    // 有界缓存只处理近期重复；真实SDK的嵌套end没有独立toolResult。
+    private fun rememberCompletedCall(completed: MutableSet<String>, callId: String) {
+        completed.add(callId)
+        while (completed.size > MAX_TOOL_NAMES) completed.remove(completed.first())
+    }
+
+    private fun customMessage(seq: Int, time: Double, message: JsonValue): List<SessionEvent> {
+        if (message["display"]?.booleanValue != true) return emptyList()
+        val text = textOf(message["content"]).takeIf(String::isNotBlank) ?: return emptyList()
+        return listOf(view(seq, time, "notice/custom", text = text))
+    }
+
     /**
      * 压缩结束：completed 只做状态收尾（压缩完成的可见痕迹是 compaction entry
      * 本身，见 onEntryAppended）；failed/declined 则归一成 notice/compact，
@@ -194,14 +229,22 @@ class PiEventNormalizer(private val sessionId: String) {
         val failed = status == "failed" || status == "declined" || !errorText.isNullOrEmpty() || aborted
         if (!failed) return listOf(view(seq, time, "compact/end"))
 
+        val nativeError = errorText?.removePrefix("Compaction failed: ")
         val message = when {
             status == "declined" -> "上下文压缩未执行"
             aborted && errorText.isNullOrEmpty() -> "上下文压缩已中止"
+            nativeError == "Nothing to compact (session too small)" -> "暂无可压缩内容"
+            nativeError == "Already compacted" -> "暂无需再次压缩"
             errorText.isNullOrEmpty() -> "上下文压缩失败"
-            else -> "上下文压缩失败：$errorText"
+            else -> "上下文压缩失败，请重试"
         }
         return listOf(
-            view(seq, time, "notice/compact", text = message.take(MAX_NOTICE_CHARACTERS), isError = true)
+            view(seq, time, "notice/compact", text = message.take(MAX_NOTICE_CHARACTERS), isError = true,
+                reason = when {
+                    aborted -> "aborted"
+                    status == "declined" -> "declined"
+                    else -> "failed"
+                })
         )
     }
 
@@ -215,17 +258,10 @@ class PiEventNormalizer(private val sessionId: String) {
                 view(seq, time, "compact/done", text = tokens?.let { "压缩前 ${it}k tokens" })
             )
         }
-        if (entry["customType"]?.stringValue != EMPTY_STOP_RETRY) return emptyList()
-        val data = entry["data"] ?: return emptyList()
-        if ((data["attempt"]?.doubleValue ?: 1.0) > 1.0) return emptyList()
-        val reason = data["reason"]?.stringValue?.trim().orEmpty()
-        return listOf(
-            view(
-                seq, time, "notice/upstream",
-                text = reason.take(MAX_NOTICE_CHARACTERS).ifEmpty { "上游没有返回可见正文" },
-                isError = true
-            )
-        )
+        if (entry["type"]?.stringValue == "custom_message") {
+            return customMessage(seq, time, entry).map { it.copy(entryId = entry["id"]?.stringValue) }
+        }
+        return emptyList()
     }
 
     private fun onSessionInfoChanged(seq: Int, time: Double, event: JsonValue): List<SessionEvent> {
@@ -258,7 +294,8 @@ class PiEventNormalizer(private val sessionId: String) {
         preview: String? = null,
         reason: String? = null,
         steering: List<String>? = null,
-        followUp: List<String>? = null
+        followUp: List<String>? = null,
+        parentCallId: String? = null
     ): SessionEvent = SessionEvent(
         sessionId = sessionId,
         seq = seq,
@@ -268,16 +305,13 @@ class PiEventNormalizer(private val sessionId: String) {
             tool = tool, usage = usage, reasoning = reasoning, toolCalls = toolCalls, images = images,
             callId = callId, name = name, arguments = arguments, provider = provider, model = model,
             isError = isError,
-            errorMessage = errorMessage, preview = preview, reason = reason, steering = steering, followUp = followUp
+            errorMessage = errorMessage, preview = preview, reason = reason, steering = steering, followUp = followUp, parentCallId = parentCallId
         )
     )
 
     companion object {
         /** tool 名表上限：正常路径结果即删，此处只兜 start 后无 result 的 orphan。 */
         private const val MAX_TOOL_NAMES = 512
-
-        /** pi 空回复重试记账的 customType（上游错误只存在这里）。 */
-        private const val EMPTY_STOP_RETRY = "empty-stop-retry"
 
         /** 有 entryId 时的统一占位前缀：即 history 侧旧公式前缀，缓存键跨 live/history 复用。 */
         private const val STABLE_FALLBACK_PREFIX = "hist"

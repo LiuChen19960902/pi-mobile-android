@@ -22,7 +22,8 @@ data class ConversationProjectionLabels(
     val toolResultFailed: String = "Tool failed",
     val upstreamNotice: String = "模型未回复",
     val compactionDone: String = "上下文已压缩",
-    val compactionNotice: String = "上下文压缩"
+    val compactionNotice: String = "上下文压缩",
+    val customNotice: String = "通知"
 )
 
 @Serializable
@@ -35,7 +36,8 @@ data class ConversationItem(
     val isError: Boolean = false,
     val epochSeconds: Double,
     /** pi 的 toolCallId：tool/call 与 tool/result 精确配对用；旧数据/流式前为 null。 */
-    val toolCallId: String? = null
+    val toolCallId: String? = null,
+    val parentToolCallId: String? = null
 )
 
 /** 高频 token 流只发送有序操作，不重复发送已经累计的完整消息文本。 */
@@ -206,7 +208,7 @@ class ConversationProjector(
                     ConversationItem(
                         id = eventId(record), kind = kind, title = name,
                         text = event.arguments?.jsonDisplayText().orEmpty(), epochSeconds = date,
-                        toolCallId = event.callId
+                        toolCallId = event.callId, parentToolCallId = event.parentCallId
                     ),
                     operations
                 )
@@ -218,7 +220,11 @@ class ConversationProjector(
                 text = event.preview.orEmpty(),
                 isError = event.isError == true,
                 epochSeconds = date,
-                toolCallId = event.callId
+                toolCallId = event.callId, parentToolCallId = event.parentCallId
+            ), operations)
+            event.type == "notice/custom" && !event.text.isNullOrBlank() -> insert(ConversationItem(
+                id = eventId(record), kind = ConversationItemKind.SYSTEM,
+                title = labels.customNotice, text = event.text, epochSeconds = date
             ), operations)
             event.type == "notice/upstream" -> insertUpstreamError(record, event.text, operations, date)
             event.type == "compact/done" -> insert(ConversationItem(

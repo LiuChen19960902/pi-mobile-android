@@ -34,23 +34,6 @@ class PiEventNormalizerTest {
         assertEquals("hi", end.single().event.text)
     }
 
-    @Test
-    fun emptyStopRetryEntryBecomesSingleVisibleUpstreamNotice() {
-        val normalizer = PiEventNormalizer("s1")
-        val first = normalizer.normalize(
-            7, 3.0,
-            piEvent("""{"type":"entry_appended","entry":{"type":"custom","customType":"empty-stop-retry","data":{"attempt":1,"reason":"流错误: 401: CreditsError"}}}""")
-        )
-        assertEquals(listOf("notice/upstream"), first.map { it.event.type })
-        assertEquals("流错误: 401: CreditsError", first.single().event.text)
-        assertEquals(true, first.single().event.isError)
-        // pi 同一轮会重试多次，只报首次，避免同一个上游错误刷屏。
-        val second = normalizer.normalize(
-            8, 4.0,
-            piEvent("""{"type":"entry_appended","entry":{"type":"custom","customType":"empty-stop-retry","data":{"attempt":2,"reason":"流错误: 401: CreditsError"}}}""")
-        )
-        assertTrue(second.isEmpty())
-    }
 
     @Test
     fun textThinkingAndToolcallDeltasCarryAssistantStreamTurns() {
@@ -201,8 +184,51 @@ class PiEventNormalizerTest {
             piEvent("""{"type":"compaction_end","reason":"overflow","aborted":false,"willRetry":false,"errorMessage":"summary failed"}""")
         )
         assertEquals(listOf("notice/compact"), failed.map { it.event.type })
-        assertEquals("上下文压缩失败：summary failed", failed.single().event.text)
+        assertEquals("上下文压缩失败，请重试", failed.single().event.text)
         assertEquals(true, failed.single().event.isError)
+    }
+
+    @Test
+    fun nativeEmptyCompactionHasASpecificSafeMessage() {
+        for (error in listOf("Nothing to compact (session too small)", "Compaction failed: Nothing to compact (session too small)")) {
+            val result = PiEventNormalizer("s1").normalize(
+                1, 1.0,
+                piEvent("""{"type":"compaction_end","errorMessage":"$error"}""")
+            ).single()
+            assertEquals("notice/compact", result.event.type)
+            assertEquals("暂无可压缩内容", result.event.text)
+            assertEquals(true, result.event.isError)
+        }
+    }
+
+    @Test
+    fun legacyCompactionRefusalsUseTheSameSafeMessages() {
+        val cases = listOf(
+            """"error":{"message":"Nothing to compact (session too small)"}""" to "暂无可压缩内容",
+            """"error":"Already compacted"""" to "暂无需再次压缩",
+            """"errorMessage":"Compaction failed: Already compacted"""" to "暂无需再次压缩",
+            """"errorMessage":"secret endpoint Nothing to compact (session too small)"""" to "上下文压缩失败，请重试",
+        )
+        for ((field, expected) in cases) {
+            val result = PiEventNormalizer("s1").normalize(
+                1, 1.0, piEvent("""{"type":"compaction_end",$field}""")
+            ).single()
+            assertEquals(expected, result.event.text)
+        }
+    }
+
+    @Test
+    fun compactFailureAndCancellationHaveDistinctLocalOutcomes() {
+        for ((fields, reason) in listOf(
+            """"aborted":true""" to "aborted",
+            """"status":"declined"""" to "declined",
+            """"errorMessage":"synthetic failure"""" to "failed"
+        )) {
+            val record = PiEventNormalizer("s1").normalize(1, 1.0,
+                piEvent("""{"type":"compaction_end",$fields}""")).single()
+            assertEquals("notice/compact", record.event.type)
+            assertEquals(reason, record.event.reason)
+        }
     }
 
     @Test
@@ -357,7 +383,7 @@ class PiEventNormalizerTest {
             piEvent("""{"type":"compaction_end","status":"failed","error":{"message":"overloaded"}}""" )
         )
         assertEquals(listOf("notice/compact"), failed.map { it.event.type })
-        assertEquals("上下文压缩失败：overloaded", failed.single().event.text)
+        assertEquals("上下文压缩失败，请重试", failed.single().event.text)
         assertEquals(true, failed.single().event.isError)
         val declined = normalizer.normalize(
             2, 2.0,
@@ -369,7 +395,7 @@ class PiEventNormalizerTest {
             3, 3.0,
             piEvent("""{"type":"compaction_end","status":"failed","error":"timeout"}""")
         )
-        assertEquals("上下文压缩失败：timeout", rawString.single().event.text)
+        assertEquals("上下文压缩失败，请重试", rawString.single().event.text)
     }
 
     @Test

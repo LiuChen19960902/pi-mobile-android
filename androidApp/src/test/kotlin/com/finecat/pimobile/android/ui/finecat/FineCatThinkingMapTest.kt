@@ -1,6 +1,7 @@
 package com.finecat.pimobile.android.ui.finecat
 
 import com.finecat.pimobile.android.ui.ProviderModelDraft
+import com.finecat.pimobile.shared.gateway.PI_THINKING_LEVELS
 import com.finecat.pimobile.shared.protocol.GatewayModelCatalog
 import com.finecat.pimobile.shared.protocol.GatewayModelGroup
 import com.finecat.pimobile.shared.protocol.GatewayModelItem
@@ -15,10 +16,8 @@ import org.junit.Test
 /**
  * F11 思考强度映射纯逻辑（`DEC-F11-SCOPE`）。
  *
- * 重点钉三件事：
- * 1. 档位真源是 `models` 目录帧的 `thinkingLevels`，查不到就查不到（不拿全集顶替）；
- * 2. 列 = 目录声明 ∪ 已有 map 键（显式 null 的档位被 pi 过滤出目录清单，不并进来会被静默删掉）；
- * 3. wire 三态：缺键=不下发、`-`=JSON null、普通串=取值；清空=删除 override 被拒绝。
+ * 目录能力仍来自真实帧；编辑键全集不是能力认证。缺目录时仍可编辑，
+ * 未修改的映射继续省略；显式null与自定义值保留，不能自动覆盖宿主映射。
  */
 class FineCatThinkingMapTest {
 
@@ -47,8 +46,8 @@ class FineCatThinkingMapTest {
 
     @Test
     fun declaredLevels_modelAbsentFromCatalog_isNull_notAFallbackList() {
-        // 没认证 / 不在 enabledModels 白名单 / models 帧没到：只能说「不知道」，
-        // 不能拿 PI_THINKING_LEVELS 全集或原型演示数据顶替（DEC-F09-THINKMAP）。
+        // 目录未返回该模型，例如未认证或 models 帧没到：只能说「不知道」，
+        // 编辑器虽提供标准键，目录查询仍不能冒充这个模型的真实声明。
         assertNull(FineCatThinkingMap.declaredLevels(null, "relay", "m1"))
         assertNull(FineCatThinkingMap.declaredLevels(catalog("other", "m1", listOf("off")), "relay", "m1"))
         assertNull(FineCatThinkingMap.declaredLevels(catalog("relay", "m2", listOf("off")), "relay", "m1"))
@@ -71,23 +70,25 @@ class FineCatThinkingMapTest {
     }
 
     @Test
-    fun plan_modelNotInCatalog_isItsOwnEmptyState_neverEmptyColumns() {
-        assertEquals(
-            FineCatThinkingMap.Plan.ModelNotInCatalog,
-            FineCatThinkingMap.plan(reasoning = true, declared = null, draftMap = emptyMap(), currentLevel = null),
-        )
+    fun plan_modelNotInCatalogProvidesEveryStandardKeyWithoutInventingOverrides() {
+        val plan = FineCatThinkingMap.plan(true, null, emptyMap(), null) as FineCatThinkingMap.Plan.Columns
+        assertEquals(PI_THINKING_LEVELS, plan.columns.map { it.level })
+        assertTrue(plan.columns.all { it.isUnset })
+        assertNull(FineCatThinkingMap.emptyHint(plan))
+        assertEquals("默认", FineCatThinkingMap.displayTarget(plan.columns.first().target))
     }
 
     @Test
-    fun plan_reasoningModelWithNoDeclaredLevels_isNoDeclaredLevelsEmptyState() {
-        assertEquals(
-            FineCatThinkingMap.Plan.NoDeclaredLevels,
-            FineCatThinkingMap.plan(reasoning = true, declared = emptyList(), draftMap = emptyMap(), currentLevel = null),
-        )
+    fun plan_reasoningModelWithNoDeclaredLevelsRemainsEditable() {
+        val plan = FineCatThinkingMap.plan(true, emptyList(), mapOf("high" to "vendor-high"), null)
+            as FineCatThinkingMap.Plan.Columns
+        assertEquals(PI_THINKING_LEVELS, plan.columns.map { it.level })
+        assertEquals("vendor-high", plan.columns.single { it.level == "high" }.target)
+        assertTrue(plan.columns.filter { it.level != "high" }.all { it.isUnset })
     }
 
     @Test
-    fun plan_oneColumnPerDeclaredLevel_inPiOrder() {
+    fun plan_providesAllStandardKeysInPiOrder() {
         val plan = FineCatThinkingMap.plan(
             reasoning = true,
             declared = listOf("off", "minimal", "low", "medium", "high"),
@@ -95,7 +96,7 @@ class FineCatThinkingMapTest {
             currentLevel = null,
         )
         val columns = (plan as FineCatThinkingMap.Plan.Columns).columns
-        assertEquals(listOf("off", "minimal", "low", "medium", "high"), columns.map { it.level })
+        assertEquals(PI_THINKING_LEVELS, columns.map { it.level })
         // 没配过的档位是「不下发」，不是 null。
         assertTrue(columns.all { it.isUnset })
         assertFalse(columns.any { it.isUnsupported })
@@ -155,7 +156,7 @@ class FineCatThinkingMapTest {
             currentLevel = null,
         )
         val columns = (plan as FineCatThinkingMap.Plan.Columns).columns
-        assertEquals(listOf("off", "minimal", "low", "medium", "high"), columns.map { it.level })
+        assertEquals(PI_THINKING_LEVELS, columns.map { it.level })
         val off = columns.single { it.level == "off" }
         assertTrue(off.isUnsupported)
         assertEquals("null", FineCatThinkingMap.displayTarget(off.target))
@@ -185,7 +186,7 @@ class FineCatThinkingMapTest {
         val next = FineCatThinkingMap.applyUnsupported(emptyMap(), "off")
         assertEquals(mapOf("off" to FineCatThinkingMap.UNSUPPORTED), next)
         assertTrue((FineCatThinkingMap.plan(true, listOf("off"), next, null) as FineCatThinkingMap.Plan.Columns)
-            .columns.single().isUnsupported)
+            .columns.single { it.level == "off" }.isUnsupported)
     }
 
     @Test
@@ -368,4 +369,63 @@ class FineCatThinkingMapTest {
         assertEquals(choices.distinct(), choices)
     }
 
+    @Test
+    fun uncatalogedModelCanEditMappingsAndSaveWithoutDesktopSetup() {
+        var row = ProviderModelDraft(id = "new-uncataloged", reasoning = true)
+        val original = FineCatThinkingMap.plan(true, null, row.thinkingMap, null) as FineCatThinkingMap.Plan.Columns
+        assertEquals(PI_THINKING_LEVELS, original.columns.map { it.level })
+        assertTrue(row.thinkingMap.isEmpty())
+        row = row.copy(thinkingMap = FineCatThinkingMap.applyTarget(row.thinkingMap, "high", "vendor-effort")!!)
+        row = row.copy(thinkingMap = FineCatThinkingMap.applyUnsupported(row.thinkingMap, "off"))
+        val parsed = FineCatProviderForm.parseModels(listOf(row), null)
+        assertNull(parsed.error)
+        assertEquals(128000L, parsed.rows.single().contextWindow)
+        assertEquals(16384L, parsed.rows.single().maxTokens)
+        assertEquals(mapOf("high" to "vendor-effort", "off" to null), parsed.rows.single().thinkingLevelMap)
+    }
+
+    @Test
+    fun rekeyCanMoveToVisibleDefaultColumnWithoutDroppingAnyConfiguredMapping() {
+        val original = mapOf("off" to "-", "low" to "vendor-low", "high" to "vendor-high")
+        val displayed = FineCatThinkingMap.editableLevels(null, original.keys)
+        assertTrue("xhigh" in displayed)
+        assertTrue("xhigh" in FineCatThinkingMap.keyChoices(original, "low"))
+        val changed = FineCatThinkingMap.renameLevel(original, displayed, "low", "xhigh")!!
+        assertEquals(mapOf("off" to "-", "xhigh" to "vendor-low", "high" to "vendor-high"), changed)
+        val columns = FineCatThinkingMap.renamedColumns(displayed, "low", "xhigh")
+        assertEquals(displayed.toSet(), columns.toSet())
+        assertEquals(columns.size, columns.distinct().size)
+        val plan = FineCatThinkingMap.plan(true, null, changed, null, columns) as FineCatThinkingMap.Plan.Columns
+        assertEquals("vendor-low", plan.columns.single { it.level == "xhigh" }.target)
+        assertTrue(plan.columns.single { it.level == "low" }.isUnset)
+        assertTrue(plan.columns.single { it.level == "off" }.isUnsupported)
+    }
+
+    @Test
+    fun keyPickerCannotOverwriteCustomValueOrExplicitNull() {
+        val original = mapOf("off" to "-", "low" to "vendor-low", "high" to "vendor-high")
+        val choices = FineCatThinkingMap.keyChoices(original, "low")
+        assertTrue("low" in choices)
+        assertFalse("off" in choices)
+        assertFalse("high" in choices)
+        assertNull(FineCatThinkingMap.renameLevel(original, PI_THINKING_LEVELS, "low", "off"))
+        assertNull(FineCatThinkingMap.renameLevel(original, PI_THINKING_LEVELS, "low", "high"))
+    }
+
+    @Test
+    fun extendedCatalogKeyCanBeReplacedWithAnUnconfiguredStandardKey() {
+        val original = mapOf("ultra" to "vendor-ultra", "high" to "vendor-high")
+        val displayed = FineCatThinkingMap.editableLevels(listOf("ultra"), original.keys)
+        assertTrue(FineCatThinkingMap.keyChoices(original, "ultra").isNotEmpty())
+        val changed = FineCatThinkingMap.renameLevel(original, displayed, "ultra", "max")!!
+        assertEquals(mapOf("max" to "vendor-ultra", "high" to "vendor-high"), changed)
+        assertEquals(displayed.size, FineCatThinkingMap.renamedColumns(displayed, "ultra", "max").distinct().size)
+    }
+
+    @Test
+    fun keyPickerKeepsCurrentExtendedKeyWhenEveryStandardTargetIsOccupied() {
+        val original = PI_THINKING_LEVELS.associateWith { "vendor-$it" } + ("ultra" to "vendor-ultra")
+        assertEquals(listOf("ultra"), FineCatThinkingMap.keyChoices(original, "ultra"))
+        assertEquals(original, FineCatThinkingMap.renameLevel(original, original.keys.toList(), "ultra", "ultra"))
+    }
 }

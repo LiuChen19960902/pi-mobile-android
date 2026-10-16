@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.compose.ui.graphics.ImageBitmap
 import com.finecat.pimobile.android.platform.AndroidPreparedImage
 import com.finecat.pimobile.shared.gateway.GatewayOutgoingImage
+import com.finecat.pimobile.shared.gateway.GatewayRuntimeEvent
 import com.finecat.pimobile.shared.protocol.GatewayEvent
 import com.finecat.pimobile.shared.protocol.GatewayImageAttachment
 import com.finecat.pimobile.shared.protocol.GatewayModelSelection
@@ -16,8 +17,102 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Ignore
 import org.junit.Test
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.resetMain
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class AndroidSharedStateHolderTest {
+    @Test
+    fun treeActionsCannotPublishIntoAnotherSessionOrSurviveReset() {
+        val holder = AndroidSharedStateHolder()
+        try {
+            holder.selectSession("a")
+            holder.beginTreeCopyRequest("a", "e1")
+            holder.beginTreeLabelRequest("a", "e1")
+            assertTrue(holder.treeCopyInFlight)
+            assertTrue(holder.treeLabelInFlight)
+            holder.selectSession("b")
+            assertFalse(holder.treeCopyInFlight)
+            assertFalse(holder.treeLabelInFlight)
+            holder.wirePayload = """{"kind":"entry-copy","sessionId":"a","entryId":"e1","text":"旧会话内容"}"""
+            holder.submitWirePayload()
+            holder.wirePayload = """{"kind":"label-put","sessionId":"a","entryId":"e1","label":"旧标签"}"""
+            holder.submitWirePayload()
+            assertNull(holder.treeCopyOutcome)
+            assertNull(holder.treeLabelOutcome)
+            holder.beginTreeCopyRequest("b", "e2")
+            holder.beginTreeLabelRequest("b", "e2")
+            holder.reset()
+            assertFalse(holder.treeCopyInFlight)
+            assertFalse(holder.treeLabelInFlight)
+            assertNull(holder.treeCopyOutcome)
+            assertNull(holder.treeLabelOutcome)
+        } finally { holder.close() }
+    }
+
+    @Test
+    fun treeActionRepliesRequireExactSessionAndEntryAndFailuresStayScoped() {
+        val holder = AndroidSharedStateHolder()
+        try {
+            holder.selectSession("a")
+            holder.beginTreeCopyRequest("a", "e1")
+            for (payload in listOf(
+                """{"kind":"entry-copy","sessionId":"a","entryId":"wrong","text":"错条目"}""",
+                """{"kind":"entry-copy","entryId":"e1","text":"缺会话"}""",
+                """{"kind":"entry-copy","sessionId":"a","text":"缺条目"}"""
+            )) {
+                holder.wirePayload = payload; holder.submitWirePayload()
+                assertTrue(holder.treeCopyInFlight)
+                assertNull(holder.treeCopyOutcome)
+            }
+            holder.failTreeAction("entry-copy", "b", "错误会话失败")
+            assertTrue(holder.treeCopyInFlight)
+            holder.wirePayload = """{"kind":"entry-copy","sessionId":"a","entryId":"e1","text":"完整正文"}"""
+            holder.submitWirePayload()
+            assertFalse(holder.treeCopyInFlight)
+            assertEquals("完整正文", (holder.treeCopyOutcome as AndroidSharedStateHolder.TreeCopyOutcome.Copied).text)
+            holder.selectSession("b")
+            assertNull(holder.treeCopyOutcome)
+            holder.beginTreeLabelRequest("b", "e2")
+            holder.failTreeAction("label-put", "a", "旧会话超时")
+            assertTrue(holder.treeLabelInFlight)
+            holder.failTreeAction("label-put", "b", "请求超时，请重试")
+            assertFalse(holder.treeLabelInFlight)
+            assertEquals("请求超时，请重试", (holder.treeLabelOutcome as AndroidSharedStateHolder.TreeLabelOutcome.Failed).message)
+        } finally { holder.close() }
+    }
+
+    @Test
+    fun workspaceCancellationDistinguishesConnectionFailureFromReplacementAndOtherRequests() {
+        val holder = AndroidSharedStateHolder()
+        try {
+            holder.handleWorkspaceRequestCancelled(GatewayRuntimeEvent.RequestCancelled("directories", null, "connection-replaced"))
+            assertNull(holder.directoryError)
+            holder.handleWorkspaceRequestCancelled(GatewayRuntimeEvent.RequestCancelled("providers", null, "websocket-failure"))
+            assertNull(holder.directoryError)
+            for (reason in listOf("network-lost", "connection-closed", "recovery-timeout", "websocket-failure")) {
+                holder.wirePayload = """{"kind":"directories","path":"/workspace","entries":[]}"""
+                holder.submitWirePayload()
+                assertNull(holder.directoryError)
+                holder.handleWorkspaceRequestCancelled(GatewayRuntimeEvent.RequestCancelled("directories", null, reason))
+                assertEquals("连接已断开，请重试", holder.directoryError)
+            }
+            holder.handleWorkspaceRequestCancelled(GatewayRuntimeEvent.RequestCancelled("directory-create", null, "websocket-failure"))
+            assertEquals("创建未确认，请重新打开核对", holder.directoryError)
+        } finally {
+            holder.close()
+        }
+    }
+
     @Test
     fun storedConnectTestSwitchDefaultsToFalse() {
         // 防"默认翻转"回归：skipStoredConnectForTest 只允许测试在 @Before 置位，
@@ -65,6 +160,57 @@ class AndroidSharedStateHolderTest {
         assertNotNull(tree)
         assertEquals("session-x", tree!!.first)
         assertEquals("leaf-1", tree.second)
+    }
+
+    /** 树页动作的前置守卫（TREE05）：没网关/没会话/没选中条目时明确失败，
+     *  不静默无反应、也不用 preview 冒充全文。 */
+    @Test
+    fun treeCopyGuardsFailExplicitlyWithoutGatewayOrTarget() {
+        val holder = AndroidSharedStateHolder()
+        // 未选会话：先报会话，不报“未连接”（用户实际缺的是会话）。
+        holder.copyTreeEntry("e1")
+        assertEquals(
+            "当前没有选中的会话",
+            (holder.treeCopyOutcome as AndroidSharedStateHolder.TreeCopyOutcome.Failed).message,
+        )
+        holder.consumeTreeCopyOutcome()
+        assertEquals(null, holder.treeCopyOutcome)
+
+        holder.selectSession("session-x")
+        // 未连接（本用例无 graph）：不得把失败当成“已复制”。
+        holder.copyTreeEntry("e1")
+        assertEquals(
+            "请先连接 Pi 网关",
+            (holder.treeCopyOutcome as AndroidSharedStateHolder.TreeCopyOutcome.Failed).message,
+        )
+        assertEquals(false, holder.treeCopyInFlight)
+        holder.consumeTreeCopyOutcome()
+        // 注意：本用例无 graph（capabilities 恒空），`treeActionsSupported == false`
+        // 在此恒真、不证明能力门控。门控的正反两态由设备用例真实覆盖：
+        // `FineCatTraceTreeRepairDeviceTest.legacyGatewayWithoutTreeActionsHidesCopyAndLabelInsteadOfFakingThem`
+        //（hello 不宣告 tree-actions-v1 → 按钮不存在 + 0 请求）与
+        // `copyActionRequestsEntryFullTextAndReportsTheRealResult`（宣告 → 发 entry-copy）。
+    }
+
+    @Test
+    fun treeLabelGuardsFailExplicitlyAndKeepTargetEntryId() {
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-x")
+        holder.setTreeEntryLabel("e9", null)
+        val failed = holder.treeLabelOutcome as AndroidSharedStateHolder.TreeLabelOutcome.Failed
+        assertEquals("e9", failed.entryId)
+        assertEquals("请先连接 Pi 网关", failed.message)
+        assertEquals(false, holder.treeLabelInFlight)
+        holder.consumeTreeLabelOutcome()
+        assertEquals(null, holder.treeLabelOutcome)
+
+        // 未选会话：同样明确失败，不默默丢请求。
+        val fresh = AndroidSharedStateHolder()
+        fresh.setTreeEntryLabel("e9", "交付")
+        assertEquals(
+            "当前没有选中的会话",
+            (fresh.treeLabelOutcome as AndroidSharedStateHolder.TreeLabelOutcome.Failed).message,
+        )
     }
 
     @Test
@@ -190,6 +336,9 @@ class AndroidSharedStateHolderTest {
         holder.selectSession("another-session")
         holder.applyMessageSendResultForTest(submission, sent = true)
 
+        assertEquals("", holder.messageDraft)
+        assertTrue(holder.preparedImages.isEmpty())
+        holder.selectSession("android-demo")
         assertEquals("new draft", holder.messageDraft)
         assertEquals(listOf(newImage), holder.preparedImages)
         assertEquals(0L, holder.successfulMessageSendCount)
@@ -315,6 +464,247 @@ class AndroidSharedStateHolderTest {
         assertEquals(listOf("hist-entry-9-0"), holder.queuedAttachmentIdsForTest())
     }
 
+    // ---- 手动压缩上下文（CTX02）：真实接线的闸门、归属与统计收尾 ----
+
+    @Test
+    fun compactRequestGuardBlocksRepeatsWhilePendingOrCompacting() {
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-compact")
+        // 无会话/未连接时按钮不可用（引导与按钮共用闸门）。
+        assertEquals(false, holder.canStartManualCompact())
+        // 测试缝注入连接：闸门开启（M5：启用路径不再是恒 false 死断言）。
+        holder.compactGateForceOpenForTest = true
+        assertEquals(true, holder.canStartManualCompact())
+        // 压缩中关闸。
+        holder.wirePayload = """{"kind":"state","sessionId":"session-compact","isStreaming":false,"isCompacting":true}"""
+        holder.submitWirePayload()
+        assertEquals(false, holder.canStartManualCompact())
+        // 压缩中重复触发被拦：不产生新的发送意图。
+        holder.startManualCompact()
+        assertTrue(holder.compactRequestsForTest.isEmpty())
+        assertEquals(false, holder.canStartManualCompact())
+    }
+
+    @Test
+    fun compactRequestLifecycleKeepsGateUntilStartThenRecovers() {
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-compact")
+        holder.compactGateForceOpenForTest = true
+        // 发出后闸门关（在途）；未收到受理前不可重复触发（M1：闸门不提前释放）。
+        holder.startManualCompact()
+        assertEquals(listOf("session-compact"), holder.compactRequestsForTest)
+        assertEquals(false, holder.canStartManualCompact())
+        // compact-started 受理（isCompacting=true 快照）：闸门由压缩中状态接管。
+        holder.wirePayload = """{"kind":"compact-started","sessionId":"session-compact","isStreaming":false,"isCompacting":true}"""
+        holder.submitWirePayload()
+        assertEquals(false, holder.canStartManualCompact())
+        assertTrue(holder.transientNotice!!.contains("已请求压缩"))
+        // 收尾（compaction_end 归一为 compact/end）后状态可恢复。
+        holder.wirePayload = """{"kind":"event","sessionId":"session-compact","seq":1,"time":1.0,"event":{"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false}}"""
+        holder.submitWirePayload()
+        assertEquals(false, holder.selectedSessionCompacting())
+        assertEquals(true, holder.canStartManualCompact())
+    }
+
+    @Test
+    fun compactPendingGateOnlyBlocksItsOwnSession() {
+        // R5：A 会话在途不阻塞 B 会话的压缩闸门；提示/状态仍按归属处理。
+        val holder = AndroidSharedStateHolder()
+        holder.compactGateForceOpenForTest = true
+        holder.selectSession("session-a")
+        holder.startManualCompact()
+        assertEquals(false, holder.canStartManualCompact())
+        holder.selectSession("session-b")
+        assertEquals(true, holder.canStartManualCompact())
+        // 回到 A：在途闸门仍然拦截。
+        holder.selectSession("session-a")
+        assertEquals(false, holder.canStartManualCompact())
+    }
+
+    @Test
+    fun concurrentCompactPendingTracksBothSessionsIndependently() {
+        // R5-3：按会话独立记账——B 的压缩不覆写 A 的在途闸门；A/B 的记账互不干扰。
+        val holder = AndroidSharedStateHolder()
+        holder.compactGateForceOpenForTest = true
+        holder.selectSession("session-a")
+        holder.startManualCompact()
+        holder.selectSession("session-b")
+        holder.startManualCompact()
+        assertEquals(listOf("session-a", "session-b"), holder.compactRequestsForTest)
+        // 切回 A：A 的在途闸门仍在（未被 B 覆写），B 的也独立保留。
+        holder.selectSession("session-a")
+        assertEquals(false, holder.canStartManualCompact())
+        holder.selectSession("session-b")
+        assertEquals(false, holder.canStartManualCompact())
+    }
+
+    @Test
+    fun compactWatchJobsTrackSessionsAndRearmCancelsOnlyOwn() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val holder = AndroidSharedStateHolder(compactWatchScopeForTest = backgroundScope)
+        try {
+            holder.compactGateForceOpenForTest = true
+            holder.selectSession("session-a")
+            holder.startManualCompact()
+            val firstA = holder.compactWatchJobForTest("session-a")!!
+            holder.selectSession("session-b")
+            holder.startManualCompact()
+            val jobB = holder.compactWatchJobForTest("session-b")!!
+            holder.rearmCompactWatchForTest("session-a")
+            val secondA = holder.compactWatchJobForTest("session-a")!!
+            assertTrue(firstA.isCancelled)
+            assertTrue(secondA !== firstA)
+            assertTrue(jobB.isActive)
+            runCurrent()
+            advanceTimeBy(9_000)
+            runCurrent()
+            assertFalse(holder.canStartManualCompact())
+            holder.selectSession("session-a")
+            assertFalse(holder.canStartManualCompact())
+            holder.reset()
+            holder.rearmCompactWatchForTest("session-a")
+            assertNull(holder.compactWatchJobForTest("session-a"))
+        } finally {
+            holder.reset()
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun acknowledgedCompactStillWaitingAfterEightSecondsCannotBeRepeated() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val holder = AndroidSharedStateHolder(compactWatchScopeForTest = backgroundScope)
+        try {
+            holder.compactGateForceOpenForTest = true
+            holder.selectSession("session-compact")
+            holder.messageDraft = "保留草稿"
+            holder.startManualCompact()
+            holder.wirePayload = """{"kind":"compact-started","sessionId":"session-compact","isStreaming":true,"isCompacting":false}"""
+            holder.submitWirePayload()
+            runCurrent()
+            advanceTimeBy(9_000)
+            runCurrent()
+            assertFalse(holder.canStartManualCompact())
+            assertEquals("压缩仍在启动，请稍候", holder.transientNotice)
+            holder.startManualCompact()
+            assertEquals(listOf("session-compact"), holder.compactRequestsForTest)
+            assertEquals("保留草稿", holder.messageDraft)
+            // 即使错过start，权威结束事件也释放本地等待。
+            holder.wirePayload = """{"kind":"event","sessionId":"session-compact","seq":1,"time":1.0,"event":{"type":"compaction_end","reason":"manual","aborted":true,"willRetry":false}}"""
+            holder.submitWirePayload()
+            assertTrue(holder.canStartManualCompact())
+        } finally {
+            holder.reset()
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun compactRequestTerminalDoesNotShowAnotherSessionsNotice() {
+        val holder = AndroidSharedStateHolder()
+        holder.compactGateForceOpenForTest = true
+        holder.selectSession("session-a")
+        holder.startManualCompact()
+        holder.selectSession("session-b")
+        holder.finishManualCompactRequest("compact", "session-a", "不应显示在B")
+        assertNull(holder.transientNotice)
+        holder.selectSession("session-a")
+        assertTrue(holder.canStartManualCompact())
+        holder.startManualCompact()
+        holder.finishManualCompactRequest("compact", "session-a", "当前压缩失败")
+        assertEquals("当前压缩失败", holder.transientNotice)
+        assertTrue(holder.canStartManualCompact())
+    }
+
+    @Test
+    fun compactAckWithoutCompactingKeepsGateUntilStartOrTimeout() {
+        // M1：受理快照 isCompacting=false（网关 liveState 在 fire 后立即回帧）时，
+        // 闸门保持到 compact/start 事件到达，不在 ACK 即释放。
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-compact")
+        holder.compactGateForceOpenForTest = true
+        holder.startManualCompact()
+        holder.wirePayload = """{"kind":"compact-started","sessionId":"session-compact","isStreaming":false,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals(false, holder.canStartManualCompact())
+        // 压缩真正开始才释放闸门（后续由 isCompacting 接管）。
+        holder.wirePayload = """{"kind":"event","sessionId":"session-compact","seq":1,"time":1.0,"event":{"type":"compaction_start","reason":"manual"}}"""
+        holder.submitWirePayload()
+        assertEquals(false, holder.canStartManualCompact())
+        assertTrue(holder.selectedSessionCompacting())
+    }
+
+    @Test
+    fun secondCompactionRoundStillRefreshesState() {
+        // M3/R1：去重键带 seq，同一会话第二轮压缩的 compact/end 不被首轮残留键
+        // 吞掉；用 stateRequestsAfterCompactionForTest 断言两轮各补拉一次（R2：
+        // 用例必须有判别力，不能只验状态不异常）。
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-compact")
+        holder.wirePayload = """{"kind":"event","sessionId":"session-compact","seq":1,"time":1.0,"event":{"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false}}"""
+        holder.submitWirePayload()
+        assertEquals(listOf("session-compact"), holder.stateRequestsAfterCompactionForTest)
+        holder.wirePayload = """{"kind":"event","sessionId":"session-compact","seq":2,"time":2.0,"event":{"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false}}"""
+        holder.submitWirePayload()
+        assertEquals(listOf("session-compact", "session-compact"), holder.stateRequestsAfterCompactionForTest)
+        assertEquals(false, holder.selectedSessionCompacting())
+    }
+
+    @Test
+    fun compactStateRefreshSkipsUnselectedSessions() {
+        // M4/R1：后台会话的压缩收尾不补拉（不挤当前会话排队中的 state 请求），
+        // 切回时由 subscribed 帧重拉。
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-a")
+        holder.selectSession("session-b")
+        holder.wirePayload = """{"kind":"event","sessionId":"session-a","seq":1,"time":1.0,"event":{"type":"compaction_end","reason":"manual","aborted":false,"willRetry":false}}"""
+        holder.submitWirePayload()
+        assertTrue(holder.stateRequestsAfterCompactionForTest.isEmpty())
+    }
+
+    @Test
+    fun slashCompactExplainsReasonByBranchNotGenericRingHint() {
+        // M2：未连接时不再统一指引去点圆环（那条路同样禁用）。
+        val holder = AndroidSharedStateHolder()
+        assertEquals(AndroidSharedStateHolder.SlashCommandOutcome.CONSUMED, holder.consumeSlashCommand("/compact"))
+        assertTrue(holder.transientNotice!!.contains("会话"))
+        holder.selectSession("session-compact")
+        holder.consumeSlashCommand("/compact")
+        assertTrue(holder.transientNotice!!.contains("尚未连接"))
+    }
+
+    @Test
+    fun slashCompactReachesRealActionWhenPossibleOtherwiseExplains() {
+        val holder = AndroidSharedStateHolder()
+        // 无会话：引导不假装完成，给出下一步。
+        assertEquals(AndroidSharedStateHolder.SlashCommandOutcome.CONSUMED, holder.consumeSlashCommand("/compact"))
+        assertTrue(holder.transientNotice!!.contains("会话"))
+        // 有会话但未连接/闸门关：解释原因，不静默。
+        holder.selectSession("session-compact")
+        assertEquals(AndroidSharedStateHolder.SlashCommandOutcome.CONSUMED, holder.consumeSlashCommand("/compact"))
+        assertNotNull(holder.transientNotice)
+        assertTrue(holder.messageDraft.isEmpty())
+        holder.compactGateForceOpenForTest = true
+        holder.consumeSlashCommand("/compact")
+        assertEquals(listOf("session-compact"), holder.compactRequestsForTest)
+        assertFalse(holder.canStartManualCompact())
+    }
+
+    @Test
+    fun postCompactionStatsRemainUnknownInsteadOfRecycledPercent() {
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-compact")
+        holder.wirePayload = """{"kind":"state","sessionId":"session-compact","isStreaming":false,"isCompacting":false,"contextUsage":{"percent":74.0,"tokens":148000,"contextWindow":200000}}"""
+        holder.submitWirePayload()
+        assertEquals(74.0, holder.snapshot.sessionStates["session-compact"]!!.contextUsage!!.percent!!, 0.01)
+        // 压缩后 SDK 统计合法 unknown：不沿用旧 percent 伪造改善。
+        holder.wirePayload = """{"kind":"state","sessionId":"session-compact","isStreaming":false,"isCompacting":false,"contextUsage":{"percent":null,"tokens":null,"contextWindow":200000}}"""
+        holder.submitWirePayload()
+        val usage = holder.snapshot.sessionStates["session-compact"]!!.contextUsage!!
+        assertNull(usage.percent)
+        assertNull(usage.tokens)
+    }
+
     @Test
     fun compactionStateBlocksSendingBeforeReachingTransport() {
         val holder = AndroidSharedStateHolder()
@@ -386,24 +776,24 @@ class AndroidSharedStateHolderTest {
     @Test
     fun providerUnconfirmedResultTextOnlyMarksConfigWritesUnconfirmed() {
         // P3 文案面回归：取消/超时的提示只有配置写操作（保存/删除）才说
-        // “配置未确认”（请求可能已达网关，落盘状态不明）；providers 列表刷新、
+        // “未确认”（请求可能已达网关，落盘状态不明）；providers 列表刷新、
         // 连接测试、拉模型是读操作，失败不得冒充保存/删除结论。
         // 端到端路径（init 块三处终态 + showProviderResult 的 4s 清除）依赖
         // AndroidAppGraph（构造需 Application），纯 JVM 单测不可达，见交付说明。
         for (outcome in listOf("已取消", "超时")) {
             assertTrue(
                 AndroidSharedStateHolder.providerUnconfirmedResultText("provider-put", outcome)
-                    .contains("配置未确认")
+                    .contains("未确认")
             )
             assertTrue(
                 AndroidSharedStateHolder.providerUnconfirmedResultText("provider-delete", outcome)
-                    .contains("配置未确认")
+                    .contains("未确认")
             )
         }
         for (requestType in listOf("providers", "provider-test", "provider-models")) {
             for (outcome in listOf("已取消", "超时")) {
                 val text = AndroidSharedStateHolder.providerUnconfirmedResultText(requestType, outcome)
-                assertFalse("读操作文案不应出现「配置未确认」：$text", text.contains("配置未确认"))
+                assertFalse("读操作文案不应出现「未确认」：$text", text.contains("未确认"))
                 // 终态仍可辨识：说明是 Provider 请求失败并给出取消/超时方向。
                 assertTrue("读操作文案应保留请求失败方向：$text", text.contains("Provider 请求$outcome"))
             }
@@ -832,13 +1222,14 @@ class AndroidSharedStateHolderTest {
         holder.messageDraft = "看图"
         holder.setPreparedImagesForTest(listOf(preparedTestImage()))
         driveSend(holder)
-        assertEquals("", holder.messageDraft)
+        assertEquals("看图", holder.messageDraft)
         assertEquals(1, holder.outgoingPreviews.size)
 
         // sent 帧（preflight 受理）：确认不移除，预览仍唯一显示。
         holder.wirePayload = """{"kind":"sent","sessionId":"s-1","mode":"followUp"}"""
         holder.submitWirePayload()
         assertEquals(OutgoingImagePreviewState.CONFIRMED, holder.outgoingPreviews.single().state)
+        assertEquals("", holder.messageDraft)
 
         // 正式回显（message_end user 带同组 id）：预览移除；投影里只剩正式一条。
         holder.wirePayload = """
@@ -1008,18 +1399,18 @@ class AndroidSharedStateHolderTest {
     }
 
     @Test
-    fun userSwitchingSessionAfterNewSessionSendKeepsDraft() {
+    fun userSwitchingSessionAfterNewSessionSendKeepsDraftWithItsOwner() {
         val holder = newPreviewHolder()
         holder.prepareNewSession()
         holder.messageDraft = "新会话首图"
         holder.setPreparedImagesForTest(listOf(preparedTestImage()))
         val submission = holder.captureMessageSubmissionForTest()
         val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
-        // 用户主动切到已有会话（generation/会话都变）：草稿保留。
+        // 切换后不把未确认稿带入其它会话；回到原新建页可恢复。
         holder.selectSession("other-session")
         holder.settleOutgoingSendLocally(submission, outgoing, sent = true, clearInputOnSuccess = true)
-        assertEquals("新会话首图", holder.messageDraft)
-        assertEquals(1, holder.preparedImages.size)
+        assertEquals("", holder.messageDraft)
+        assertEquals(0, holder.preparedImages.size)
         assertEquals(0L, holder.successfulMessageSendCount)
     }
 
@@ -1106,10 +1497,10 @@ class AndroidSharedStateHolderTest {
         holder.messageDraft = "看图"
         holder.setPreparedImagesForTest(listOf(preparedTestImage()))
         val (_, outgoing) = driveSend(holder)
-        // 请求超时（断连取消同路径）：未确认，不是失败；不自动重发（受理已计入）。
+        // 请求超时未确认：保留原输入，不计受理、不自动重发。
         holder.handleOutgoingSendUnconfirmed()
         assertEquals(OutgoingImagePreviewState.UNCONFIRMED, holder.outgoingPreviews.single().state)
-        assertEquals(1L, holder.successfulMessageSendCount)
+        assertEquals(0L, holder.successfulMessageSendCount)
         // 迟到的正式回显：UNCONFIRMED 预览照样收走（避免双气泡）。
         holder.handleOutgoingEcho("s-1", listOf(userEcho("s-1", outgoing.images.single().outgoing.attachmentId)))
         assertEquals(0, holder.outgoingPreviews.size)
@@ -1156,13 +1547,13 @@ class AndroidSharedStateHolderTest {
         holder.messageDraft = "看图"
         holder.setPreparedImagesForTest(listOf(preparedTestImage()))
         driveSend(holder)
-        // 服务端 error 帧（明确 preflight 拒绝）：FAILED 收敛；草稿不自动回填
+        // 服务端明确拒绝：FAILED收敛，原编辑内容始终保留；不会自动重发
         //（F10 收窄：带图自动回填仅保留在本地失败路径），FAILED 预览保留手动恢复。
         holder.wirePayload = """{"kind":"error","requestType":"message","code":"prompt-rejected","message":"无模型"}"""
         holder.submitWirePayload()
         assertEquals(OutgoingImagePreviewState.FAILED, holder.outgoingPreviews.single().state)
-        assertEquals("", holder.messageDraft)
-        assertEquals(1L, holder.successfulMessageSendCount)
+        assertEquals("看图", holder.messageDraft)
+        assertEquals(0L, holder.successfulMessageSendCount)
     }
 
     /**
@@ -1188,12 +1579,270 @@ class AndroidSharedStateHolderTest {
     }
 
     @Test
+    fun recalledQueueMatchesOperationAndPreservesNewDraftAndAttachments() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-recall")
+        holder.messageDraft = "本地尚未派发稿"
+        val localPending = holder.captureMessageSubmissionForTest()
+        holder.capturePendingDispatchForTest(localPending)
+        holder.dispatchPending("steer")
+        assertFalse(holder.beginQueueRecall("s-recall", "before-dispatch"))
+        holder.settlePendingDispatchForTest(localPending, sent = false)
+        holder.setSendInFlightForTest(true)
+        assertFalse(holder.beginQueueRecall("s-recall", "before-send"))
+        holder.setSendInFlightForTest(false)
+        holder.messageDraft = "新稿"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()), uris = listOf("content://new"))
+        assertTrue(holder.beginQueueRecall("s-recall", "q-1"))
+        assertFalse(holder.beginStoppingSession("s-recall"))
+        assertTrue(holder.beginStoppingSession("other"))
+        holder.finishStoppingSession("other")
+        val ack = """{"kind":"dequeued","sessionId":"s-recall","queueRequestId":"q-1","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["s","f","f"]}"""
+        holder.wirePayload = ack.replace("q-1", "wrong")
+        holder.submitWirePayload()
+        assertEquals("新稿", holder.messageDraft)
+        assertFalse(holder.beginQueueRecall("s-recall", "q-2"))
+        holder.wirePayload = ack
+        holder.submitWirePayload()
+        assertEquals("s\n\nf\n\nf\n\n新稿", holder.messageDraft)
+        assertEquals(listOf("content://new"), holder.preparedUris)
+        assertEquals(1, holder.preparedImages.size)
+        assertEquals(localPending, holder.pendingDispatch)
+        assertTrue(holder.beginQueueRecall("s-recall", "q-2"))
+        holder.submitWirePayload() // 同会话旧回执不消费下一次撤回。
+        assertFalse(holder.beginQueueRecall("s-recall", "q-3"))
+        holder.wirePayload = ack.replace("q-1", "q-2").replace("[\"s\",\"f\",\"f\"]", "[]")
+        holder.submitWirePayload()
+        assertEquals("s\n\nf\n\nf\n\n新稿", holder.messageDraft)
+        assertEquals(0L, holder.successfulMessageSendCount)
+        assertTrue(holder.beginStoppingSession("s-recall"))
+    }
+
+    @Test
+    fun recalledQueueStaysWithItsSession_andFailureReleasesWaitWithoutInventingDraft() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-recall")
+        assertTrue(holder.beginQueueRecall("s-recall", "q-1"))
+        holder.selectSession("other")
+        holder.messageDraft = "新稿"
+        holder.wirePayload = """{"kind":"dequeued","sessionId":"s-recall","queueRequestId":"q-1","queued":["取回稿"]}"""
+        holder.submitWirePayload()
+        assertEquals("新稿", holder.messageDraft)
+        holder.selectSession("s-recall")
+        assertEquals("取回稿", holder.messageDraft)
+        assertTrue(holder.beginQueueRecall("s-recall", "q-2"))
+        holder.finishQueueRecall("s-recall", "old")
+        assertFalse(holder.beginQueueRecall("s-recall", "q-3"))
+        holder.finishQueueRecall("s-recall", "q-2")
+        assertTrue(holder.beginQueueRecall("s-recall", "q-3"))
+        assertEquals("取回稿", holder.messageDraft)
+    }
+
+    @Test
+    fun stoppedRemoteQueueRestoresOnceAheadOfNewDraftAndKeepsNewAttachments() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-stop")
+        holder.messageDraft = "新草稿"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()), uris = listOf("content://new"))
+        assertTrue(holder.beginStoppingSession("s-stop"))
+        assertFalse(holder.beginStoppingSession("s-stop"))
+        holder.wirePayload = """{"kind":"aborted","sessionId":"s-stop","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["steer","follow-up","follow-up"]}"""
+        holder.submitWirePayload()
+        assertEquals("steer\n\nfollow-up\n\nfollow-up\n\n新草稿", holder.messageDraft)
+        assertEquals(listOf("content://new"), holder.preparedUris)
+        assertEquals(1, holder.preparedImages.size)
+        holder.submitWirePayload()
+        assertEquals("steer\n\nfollow-up\n\nfollow-up\n\n新草稿", holder.messageDraft)
+        assertEquals(0L, holder.successfulMessageSendCount)
+        assertTrue(holder.beginStoppingSession("s-stop"))
+        holder.wirePayload = """{"kind":"aborted","sessionId":"s-stop","queued":[],"isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]}}"""
+        holder.submitWirePayload()
+        assertEquals("steer\n\nfollow-up\n\nfollow-up\n\n新草稿", holder.messageDraft)
+    }
+
+    @Test
+    fun stoppedQueueRemainsWithOriginalSessionAfterSwitch_andLegacyAckDoesNotGuessQueueText() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-stop")
+        assertTrue(holder.beginStoppingSession("s-stop"))
+        holder.selectSession("other")
+        holder.messageDraft = "另一页的新稿"
+        holder.wirePayload = """{"kind":"aborted","sessionId":"s-stop","queued":["取回稿"],"isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]}}"""
+        holder.submitWirePayload()
+        assertEquals("另一页的新稿", holder.messageDraft)
+        holder.selectSession("s-stop")
+        assertEquals("取回稿", holder.messageDraft)
+        assertTrue(holder.beginStoppingSession("s-stop"))
+        holder.wirePayload = """{"kind":"aborted","sessionId":"s-stop"}"""
+        holder.submitWirePayload()
+        assertEquals("取回稿", holder.messageDraft)
+        assertTrue(holder.beginStoppingSession("s-stop"))
+        holder.finishStoppingSession("wrong")
+        assertFalse(holder.beginStoppingSession("s-stop"))
+        holder.finishStoppingSession("s-stop")
+        assertTrue(holder.beginStoppingSession("s-stop"))
+    }
+
+    @Test
+    fun existingSessionRejectedTextCanBeManuallyRecoveredWithoutOverwritingNewDraft() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-text")
+        holder.messageDraft = "需要找回的追加稿"
+        driveSend(holder)
+        assertEquals("需要找回的追加稿", holder.messageDraft)
+        holder.wirePayload = """{"kind":"error","requestType":"message","code":"future-message-rejection"}"""
+        holder.submitWirePayload()
+        val failed = holder.outgoingPreviews.single()
+        assertEquals(OutgoingImagePreviewState.FAILED, failed.state)
+        assertTrue(failed.images.isEmpty())
+        assertEquals("需要找回的追加稿", holder.messageDraft)
+        holder.messageDraft = "新稿"
+        holder.restoreOutgoingPreviewDraft(failed.sendToken)
+        assertEquals("新稿", holder.messageDraft)
+        assertEquals(1, holder.outgoingPreviews.size)
+        holder.messageDraft = ""
+        holder.selectSession("other")
+        holder.restoreOutgoingPreviewDraft(failed.sendToken)
+        assertEquals("", holder.messageDraft)
+        holder.selectSession("s-text")
+        holder.restoreOutgoingPreviewDraft(failed.sendToken)
+        assertEquals("需要找回的追加稿", holder.messageDraft)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertEquals(0L, holder.successfulMessageSendCount)
+    }
+
+    @Test
+    fun existingTextUnconfirmedRetainsManualRecoveryWithoutResendingOrOverwritingNewDraft() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-text")
+        holder.messageDraft = "网络中断前的原稿"
+        driveSend(holder)
+        holder.messageDraft = "新的草稿"
+        holder.handleOutgoingSendUnconfirmed()
+        val unconfirmed = holder.outgoingPreviews.single()
+        assertEquals(OutgoingImagePreviewState.UNCONFIRMED, unconfirmed.state)
+        assertEquals("网络中断前的原稿", unconfirmed.draftText)
+        holder.restoreOutgoingPreviewDraft(unconfirmed.sendToken)
+        assertEquals("新的草稿", holder.messageDraft)
+        holder.messageDraft = ""
+        holder.selectSession("other")
+        holder.restoreOutgoingPreviewDraft(unconfirmed.sendToken)
+        assertEquals("", holder.messageDraft)
+        holder.selectSession("s-text")
+        holder.restoreOutgoingPreviewDraft(unconfirmed.sendToken)
+        assertEquals("网络中断前的原稿", holder.messageDraft)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertEquals(0L, holder.successfulMessageSendCount)
+    }
+
+    @Test
+    fun textUnconfirmedBeforeLocalSettleRemainsRecoverableAfterEditorIsCleared() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-text")
+        holder.messageDraft = "原稿"
+        holder.setSendInFlightForTest(true)
+        val submission = holder.captureMessageSubmissionForTest()
+        val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
+        holder.handleOutgoingSendUnconfirmed()
+        assertEquals("原稿", holder.messageDraft)
+        assertFalse(holder.canRestoreOutgoingDraft)
+        holder.settleOutgoingSendLocally(submission, outgoing, sent = true, clearInputOnSuccess = true)
+        assertEquals("原稿", holder.messageDraft)
+        holder.messageDraft = ""
+        assertEquals(OutgoingImagePreviewState.UNCONFIRMED, holder.outgoingPreviews.single().state)
+        holder.restoreOutgoingPreviewDraft(outgoing.sendToken)
+        assertEquals("原稿", holder.messageDraft)
+        assertEquals(0L, holder.successfulMessageSendCount)
+    }
+
+    @Test
+    fun localFailedImageDraftDoesNotOverwriteNewPhotoPreparationOrUri() {
+        for (preparing in listOf(true, false)) {
+            val holder = newPreviewHolder()
+            holder.selectSession("s-1")
+            holder.messageDraft = "发送原稿"
+            holder.setPreparedImagesForTest(listOf(preparedTestImage()), uris = listOf("content://old"))
+            val submission = holder.captureMessageSubmissionForTest()
+            val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
+            holder.messageDraft = ""
+            holder.setPreparedImagesForTest(emptyList(), uris = if (preparing) emptyList() else listOf("content://new"))
+            val preparation = if (preparing) holder.beginImagePreparation("content://new") else null
+            holder.settleOutgoingSendLocally(submission, outgoing, sent = false, clearInputOnSuccess = true)
+            assertEquals("", holder.messageDraft)
+            assertTrue(holder.preparedImages.isEmpty())
+            assertEquals(OutgoingImagePreviewState.FAILED, holder.outgoingPreviews.single().state)
+            if (preparing) {
+                assertEquals(setOf("content://new"), holder.preparingPhotoUris)
+                assertTrue(holder.completeImagePreparation("content://new", preparation!!, preparedTestImage()))
+            }
+            assertEquals(listOf("content://new"), holder.preparedUris)
+            assertFalse(holder.canRestoreOutgoingDraft)
+        }
+    }
+
+    @Test
+    fun malformedSentDoesNotConsumeTextRejectionRecovery_andAcceptedTextHasNoRecovery() {
+        for (invalid in listOf<String?>(null, "", " ")) {
+            val holder = newPreviewHolder()
+            holder.selectSession("s-text")
+            holder.messageDraft = "原稿"
+            driveSend(holder)
+            holder.recordOutgoingSent(invalid)
+            rejectMessage(holder)
+            assertEquals("原稿", holder.outgoingPreviews.single().draftText)
+        }
+        val holder = newPreviewHolder()
+        holder.selectSession("s-text")
+        holder.messageDraft = "已受理"
+        driveSend(holder)
+        holder.recordOutgoingSent("s-text")
+        rejectMessage(holder)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertEquals("", holder.messageDraft)
+    }
+
+    @Test
+    fun existingTextRejectedBeforeLocalSettleKeepsOriginalOnceWithoutDuplicateRecovery() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-text")
+        holder.messageDraft = "原稿"
+        holder.setSendInFlightForTest(true)
+        val submission = holder.captureMessageSubmissionForTest()
+        val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
+        rejectMessage(holder)
+        holder.settleOutgoingSendLocally(submission, outgoing, sent = true, clearInputOnSuccess = true)
+        assertEquals("原稿", holder.messageDraft)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertEquals(0L, holder.successfulMessageSendCount)
+        holder.messageDraft = "后续消息"
+        driveSend(holder)
+        holder.recordOutgoingSent("s-text")
+        assertEquals("", holder.messageDraft)
+    }
+
+    @Test
+    fun dispatchedFollowUpTextRejectedAfterLocalAcceptanceRemainsRecoverable() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-follow")
+        holder.messageDraft = "下一轮追加稿"
+        val submission = holder.captureMessageSubmissionForTest()
+        val outgoing = holder.beginOutgoingSend(submission, createPreview = false)
+        holder.messageDraft = ""
+        holder.settleOutgoingSendLocally(submission, outgoing, sent = true, clearInputOnSuccess = false)
+        rejectMessage(holder)
+        assertEquals("下一轮追加稿", holder.outgoingPreviews.single().draftText)
+        holder.restoreOutgoingPreviewDraft(outgoing.sendToken)
+        assertEquals("下一轮追加稿", holder.messageDraft)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+    }
+
+    @Test
     fun newSessionFirstTextRejectedAfterLocalSettleRestoresDraft() {
-        // DEC-F09-CWD「创建失败保留草稿」：本地回写先清空输入框，网关拒绝随后到达 → 回填原文。
+        // 本地写出和网关拒绝都保留原稿。
         val holder = newPreviewHolder()
         holder.messageDraft = "在新目录开工"
         driveNewSessionTextSend(holder)
-        assertEquals("本地受理后输入框清空", "", holder.messageDraft)
+        assertEquals("等待网关受理时保留原稿", "在新目录开工", holder.messageDraft)
         rejectMessage(holder)
         assertEquals("拒绝后原文回填", "在新目录开工", holder.messageDraft)
         assertEquals(null, holder.snapshot.selectedSessionId)
@@ -1216,6 +1865,8 @@ class AndroidSharedStateHolderTest {
         assertEquals(0L, holder.successfulMessageSendCount)
         // 守卫只吞这一次：下一条正常发送照常清空
         driveNewSessionTextSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"new","mode":"followUp"}"""
+        holder.submitWirePayload()
         assertEquals("", holder.messageDraft)
         assertEquals(1L, holder.successfulMessageSendCount)
 
@@ -1258,7 +1909,7 @@ class AndroidSharedStateHolderTest {
         driveNewSessionTextSend(unconfirmedHolder)
         unconfirmedHolder.handleOutgoingSendUnconfirmed()
         rejectMessage(unconfirmedHolder)
-        assertEquals("", unconfirmedHolder.messageDraft)
+        assertEquals("未确认", unconfirmedHolder.messageDraft)
 
         // 本地失败：草稿本就没清，记录丢弃；用户清空后迟到拒绝不再写回
         val localFailHolder = newPreviewHolder()
@@ -1306,7 +1957,7 @@ class AndroidSharedStateHolderTest {
         driveSend(holder0)
         holder0.handleOutgoingSendUnconfirmed()
         assertEquals(OutgoingImagePreviewState.UNCONFIRMED, holder0.outgoingPreviews.single().state)
-        assertEquals("", holder0.messageDraft)
+        assertEquals("看图", holder0.messageDraft)
 
         // 同代（未编辑）：本地失败自动回填 → 迟到 echo 清回填稿，防误重发。
         //（服务端拒绝已按 F10 收窄为不自动回填；代次守卫经仍回填的本地失败路径验证。）
@@ -1397,6 +2048,75 @@ class AndroidSharedStateHolderTest {
         holder2.restoreOutgoingPreviewDraft(outgoing2.sendToken!!)
         assertEquals("", holder2.messageDraft)
         assertEquals(1, holder2.outgoingPreviews.size)
+    }
+
+    @Test
+    fun sdkStartedImageWithoutAttachmentIdDoesNotReportUnconfirmed() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-1")
+        holder.messageDraft = "看图"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+        val (_, outgoing) = driveSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-1","mode":"followUp","disposition":"started","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        // SDK1.0.4会重新创建image块，不保留客户端attachmentId。
+        holder.wirePayload = """{"kind":"event","sessionId":"s-1","entryId":"sdk-user","seq":1,"time":1,
+            "event":{"type":"message_end","message":{"role":"user","content":[
+            {"type":"text","text":"看图"},{"type":"image","mimeType":"image/png","data":"AQID"}]}}}""".replace("\n", "")
+        holder.submitWirePayload()
+        holder.wirePayload = """{"kind":"event","sessionId":"s-1","entryId":"sdk-answer","seq":2,"time":2,
+            "event":{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"合成图片描述"}]}}}""".replace("\n", "")
+        holder.submitWirePayload()
+        val user = holder.snapshot.conversation.single { it.kind == ConversationItemKind.USER }
+        assertEquals("hist-sdk-user-0", user.images.single().attachmentId)
+        assertTrue(holder.snapshot.conversation.any { it.text == "合成图片描述" })
+        holder.messageDraft = "后写新稿"
+        holder.markStaleOutgoingPreviews(testNowMs + 45_001)
+        assertTrue("Pi明确受理后，不因回显ID缺失生成未确认恢复条", holder.outgoingPreviews.isEmpty())
+        holder.restoreOutgoingPreviewDraft(outgoing.sendToken)
+        assertEquals("后写新稿", holder.messageDraft)
+        assertTrue(holder.preparedImages.isEmpty())
+    }
+
+    @Test
+    fun sdkAcceptedDispositionsCompleteOnlyTheirOwnImageSend() {
+        for (disposition in listOf("started", "queued", "handled")) {
+            val holder = newPreviewHolder()
+            holder.selectSession("s-1")
+            holder.messageDraft = "旧失败稿"
+            holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+            val (_, old) = driveSend(holder)
+            holder.handleOutgoingServerReject()
+            holder.messageDraft = "本次图片"
+            val (_, current) = driveSend(holder)
+            holder.messageDraft = "后写新稿"
+            holder.wirePayload = """{"kind":"sent","sessionId":"s-1","disposition":"$disposition","isStreaming":true,"isCompacting":false}"""
+            holder.submitWirePayload()
+            holder.markStaleOutgoingPreviews(testNowMs + 45_001)
+            assertEquals(listOf(old.sendToken), holder.outgoingPreviews.map { it.sendToken })
+            assertEquals(OutgoingImagePreviewState.FAILED, holder.outgoingPreviews.single().state)
+            holder.restoreOutgoingPreviewDraft(current.sendToken)
+            assertEquals("后写新稿", holder.messageDraft)
+            assertEquals(1, holder.preparedImages.size)
+        }
+    }
+
+    @Test
+    fun sdkAcceptedHistoryWithoutAttachmentIdKeepsOneFormalImage() {
+        val holder = newPreviewHolder()
+        holder.messageDraft = "新会话图片"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+        driveSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"created-session","disposition":"started","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        holder.wirePayload = """{"kind":"history","sessionId":"created-session","entryIds":["sdk-history-user"],"messages":[
+            {"role":"user","content":[{"type":"text","text":"新会话图片"},{"type":"image","mimeType":"image/png","data":"AQID"}]}]}""".replace("\n", "")
+        holder.submitWirePayload()
+        holder.markStaleOutgoingPreviews(testNowMs + 45_001)
+        val user = holder.snapshot.conversation.single { it.kind == ConversationItemKind.USER }
+        assertEquals("hist-sdk-history-user-0", user.images.single().attachmentId)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertEquals("", holder.messageDraft)
     }
 
     @Test
@@ -1530,7 +2250,7 @@ class AndroidSharedStateHolderTest {
     }
 
     @Test
-    fun newSessionFromCurrentDoesNotCreatePiSessionOrTouchDraft() {
+    fun newSessionFromCurrentStartsEmptyAndPreservesTheOriginalSessionsDraft() {
         val holder = AndroidSharedStateHolder()
         holder.wirePayload =
             """{"kind":"sessions","items":[{"id":"s-1","cwd":"/repo/one",""" +
@@ -1540,16 +2260,18 @@ class AndroidSharedStateHolderTest {
         holder.messageDraft = "还没发出去的字"
         val epochBefore = holder.newSessionEpoch
 
-        // 「+」只做本地切换：换代、清选中，草稿按既有语义保留。
+        // 「+」只做本地切换：新页空稿，原会话手稿单独保留。
         holder.prepareNewSession(cwd = "/repo/one")
         assertEquals(null, holder.snapshot.selectedSessionId)
         assertEquals(epochBefore + 1, holder.newSessionEpoch)
-        assertEquals("还没发出去的字", holder.messageDraft)
+        assertEquals("", holder.messageDraft)
 
         // 换目录同样不发消息、不动草稿（只影响下一个新会话的落点）。
         holder.selectDirectory("/repo/two")
-        assertEquals("还没发出去的字", holder.messageDraft)
+        assertEquals("", holder.messageDraft)
         assertEquals(null, holder.snapshot.selectedSessionId)
+        holder.selectSession("s-1")
+        assertEquals("还没发出去的字", holder.messageDraft)
     }
 
     @Test
@@ -1589,7 +2311,9 @@ class AndroidSharedStateHolderTest {
         val holder = AndroidSharedStateHolder()
         holder.messageDraft = "/compact"
         holder.sendComposerDraft(requireDirectory = true)
-        assertEquals("点上下文占用圆环，从详情里压缩", holder.transientNotice)
+        // C07 接线后引导文案随状态变化；不因本地命令而要求先选目录。
+        assertTrue(holder.transientNotice != null)
+        assertTrue(holder.transientNotice!!.contains("会话"))
         assertEquals(null, holder.fineCatNewSessionDirectoryPath)
         assertEquals(0L, holder.successfulMessageSendCount)
     }

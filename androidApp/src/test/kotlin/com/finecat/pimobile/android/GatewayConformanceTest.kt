@@ -68,6 +68,30 @@ import org.junit.Test
 class GatewayConformanceTest {
 
     @Test
+    fun handledInputUsesRealGatewayAckAndDoesNotWaitForInventedRun() = runBlocking {
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        val fixture = startFixtureProcess()
+        try {
+            val runtime = buildRuntime()
+            connectProjection(runtime, frames)
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue("新网关必须声明输入处置", "prompt-disposition-v1" in runtime.state.value.capabilities)
+            assertTrue(runtime.sendMessage("fixture:handled", emptyList(), fixture.info.fixtureSessionId))
+            val sent = awaitFrame(frames) { it.frame.kind == "sent" }.frame
+            assertEquals("handled", sent.disposition)
+            assertEquals(false, sent.isStreaming)
+            awaitState(runtime) { !it.shouldKeepAliveInBackground }
+            assertTrue(frames.none { it.normalizedEvents.any { record -> record.event.type == "turn/end" } })
+            assertNoErrorFrames(frames, runtime)
+        } finally {
+            fixture.process.destroy()
+            fixture.process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
     fun inputAssistPreviewAndQuotedFileUseProductionWireAgainstIsolatedGateway() = runBlocking {
         val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
         val fixture = startFixtureProcess()
@@ -597,6 +621,123 @@ class GatewayConformanceTest {
         obj["pairingCode"] = JsonPrimitive("bogus-pairing-code")
         val encoded = Json.encodeToString(JsonObject.serializer(), JsonObject(obj))
         return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(encoded.toByteArray())
+    }
+
+    @Test
+    fun dequeueUsesProductionWireWithExactOperationId_andDoesNotCreateOrSendMessages() = runBlocking {
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        val fixture = startFixtureProcess()
+        try {
+            val runtime = buildRuntime()
+            connectProjection(runtime, frames)
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue("dequeue" in runtime.state.value.capabilities)
+            val sessionId = fixture.info.fixtureSessionId
+            for (operation in listOf("recall-1", "recall-2")) {
+                assertTrue(runtime.sendRequest(GatewayRequests.dequeue(sessionId, operation)))
+                val ack = awaitFrame(frames) { it.frame.kind == "dequeued" && it.frame.queueRequestId == operation }.frame
+                assertEquals(sessionId, ack.sessionId)
+                assertEquals(emptyList<String>(), ack.queued)
+                assertEquals(false, ack.isStreaming)
+            }
+            assertTrue(frames.none { it.frame.kind == "sent" || it.frame.kind == "aborted" })
+            assertNoErrorFrames(frames, runtime)
+            runtime.disconnect()
+        } finally {
+            fixture.process.destroy()
+        }
+    }
+
+    /**
+     * 树页动作（PROTOCOL §4.26/§4.27）跑真实隔离网关 + 真实 Pi SessionManager：
+     * 复制取整条 entry 全文（不是 preview），标签写只追加 LabelEntry 并推进叶子，
+     * 且标签在 tree-view-v1 投影里可见。错误码路径（entry-copy-empty / entry-not-found）
+     * 由网关 tests/router.test.ts 覆盖：Runtime 把它们转成 RequestRejected，不进帧列表。
+     */
+    @Test
+    fun treeEntryCopyAndLabelPutUseProductionWireAgainstIsolatedGateway() = runBlocking {
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        val fixture = startFixtureProcess()
+        try {
+            val runtime = buildRuntime()
+            connectProjection(runtime, frames)
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue("本轮网关必须声明树页动作能力", "tree-actions-v1" in runtime.state.value.capabilities)
+            val sessionId = fixture.info.fixtureSessionId
+
+            // 复制是只读的：未 subscribe 也能取（网关回落文件视图）。
+            assertTrue(runtime.sendRequest(GatewayRequests.entryCopy(sessionId, "e2")))
+            val copy = awaitFrame(frames) { it.frame.kind == "entry-copy" && it.frame.entryId == "e2" }.frame
+            assertEquals("hi there", copy.text)
+            assertEquals(null, copy.oversized)
+            assertEquals("hi there".encodeToByteArray().size, copy.bytes)
+
+            // 标签写要 live 句柄：subscribed 帧证明 openSession 已完成，再写不会撞 not-found。
+            runtime.subscribe(sessionId)
+            awaitFrame(frames) { it.frame.kind == "subscribed" && it.frame.sessionId == sessionId }
+            assertTrue(runtime.sendRequest(GatewayRequests.labelPut(sessionId, "e1", "交付")))
+            val label = awaitFrame(frames) { it.frame.kind == "label-put" && it.frame.entryId == "e1" }.frame
+            assertEquals("交付", label.label)
+            assertNotNull("应答必须带新 LabelEntry id", label.labelEntryId)
+            assertEquals("Pi 语义：追加 LabelEntry 推进叶子", label.labelEntryId, label.leafId)
+
+            // 标签在投影里可见：labeled-only 只留 e1；default 的 selectedId 不把隐藏的
+            // LabelEntry 当当前行（显示与跳转目标不错位）。
+            assertTrue(
+                runtime.sendRequest(
+                    GatewayRequests.tree(
+                        sessionId,
+                        com.finecat.pimobile.shared.protocol.GatewayTreeView(filter = "labeled-only"),
+                    )
+                )
+            )
+            val labeled = awaitFrame(frames) {
+                it.frame.kind == "tree" && it.frame.view?.filter == "labeled-only"
+            }.frame
+            assertEquals(listOf("e1"), labeled.nodes.orEmpty().map { it.id })
+            assertEquals("交付", labeled.nodes.orEmpty().single().label)
+            assertTrue(
+                runtime.sendRequest(
+                    GatewayRequests.tree(
+                        sessionId,
+                        com.finecat.pimobile.shared.protocol.GatewayTreeView(filter = "default"),
+                    )
+                )
+            )
+            val defaultView = awaitFrame(frames) {
+                it.frame.kind == "tree" && it.frame.view?.filter == "default"
+            }.frame
+            assertEquals(label.labelEntryId, defaultView.leafId)
+            assertEquals("e2", defaultView.selectedId)
+            assertTrue(defaultView.nodes.orEmpty().none { it.id == label.labelEntryId })
+
+            // 清除仍追加独立LabelEntry；重拉不得继续显示旧标签，也不消费其他lane。
+            assertTrue(runtime.sendRequest(GatewayRequests.labelPut(sessionId, "e1", null)))
+            val cleared = awaitFrame(frames) {
+                it.frame.kind == "label-put" && it.frame.entryId == "e1" &&
+                    it.frame.label == null && it.frame.labelEntryId != null
+            }.frame
+            assertTrue(cleared.labelEntryId != label.labelEntryId)
+            assertTrue(runtime.sendRequest(GatewayRequests.tree(sessionId,
+                com.finecat.pimobile.shared.protocol.GatewayTreeView(filter = "labeled-only"))))
+            val empty = awaitFrame(frames) {
+                it.frame.kind == "tree" && it.frame.leafId == cleared.labelEntryId &&
+                    it.frame.view?.filter == "labeled-only"
+            }.frame
+            assertTrue(empty.nodes.orEmpty().isEmpty())
+
+            assertNoErrorFrames(frames, runtime)
+            runtime.disconnect()
+        } catch (t: Throwable) {
+            dumpDiagnostics(frames, stderr = fixture.stderr)
+            throw t
+        } finally {
+            fixture.process.destroy()
+        }
     }
 
     @Test

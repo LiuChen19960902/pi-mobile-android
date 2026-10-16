@@ -121,10 +121,10 @@ class FineCatThinkingMapF11DeviceTest {
         connect()
 
         val columns = openMapping(WIRE, "reasoner")
-        assertEquals("映射列数必须等于目录帧真实声明的档位数", DECLARED, columns)
+        assertEquals("映射编辑器提供完整标准档位，目录声明不作为前置", EDITABLE_LEVELS, columns)
         assertEquals(
             "初始取值展示：显式 null / 未设置 / 三个实值",
-            listOf("null", "—", "low", "low", "high"),
+            listOf("null", "默认", "low", "low", "high", "默认", "默认"),
             valuesOf(columns),
         )
         emitAssert("map.columns", columns.joinToString(","))
@@ -136,7 +136,7 @@ class FineCatThinkingMapF11DeviceTest {
         compose.waitForIdle()
         assertEquals(
             "编辑后取值展示：两档 null、low、medium=high、high",
-            listOf("null", "null", "low", "high", "high"),
+            listOf("null", "null", "low", "high", "high", "默认", "默认"),
             valuesOf(columns),
         )
         emitAssert("map.values.edited", valuesOf(columns).joinToString(","))
@@ -195,10 +195,10 @@ class FineCatThinkingMapF11DeviceTest {
         // 重开表单：显示的必须是回读后的服务端持久化值，不是本地草稿。
         closeAllSheets()
         val reopened = openMapping(WIRE, "reasoner")
-        assertEquals("重开后列集合不变", DECLARED, reopened)
+        assertEquals("重开后列集合不变", EDITABLE_LEVELS, reopened)
         assertEquals(
             "重开后显示的必须是服务端持久化后的值",
-            listOf("null", "null", "low", "high", "high"),
+            listOf("null", "null", "low", "high", "high", "默认", "默认"),
             valuesOf(reopened),
         )
         saveShot("f11-map-readback.png")
@@ -221,7 +221,7 @@ class FineCatThinkingMapF11DeviceTest {
         compose.waitForIdle()
         assertEquals(
             "草稿确实改了（否则本用例测不到取消）",
-            listOf("null", "null", "low", "xhigh", "high"),
+            listOf("null", "null", "low", "xhigh", "high", "默认", "默认"),
             valuesOf(columns),
         )
 
@@ -231,7 +231,7 @@ class FineCatThinkingMapF11DeviceTest {
         awaitTag("finecat.modelDetail")
         assertEquals(
             "回一级后草稿仍在（回上一级 ≠ 取消）",
-            listOf("null", "null", "low", "xhigh", "high"),
+            listOf("null", "null", "low", "xhigh", "high", "默认", "默认"),
             valuesOf(columnTags()),
         )
         backToProviderCard()
@@ -249,39 +249,31 @@ class FineCatThinkingMapF11DeviceTest {
         saveShot("f11-map-cancel.png")
     }
 
-    /**
-     * 三种空态各一句话，且都不出现任何列：
-     * - `noreason`（providers 帧 `reasoning:false`）
-     * - `nodeclared`（目录帧声明 `thinkingLevels:[]`）
-     * - `uncataloged`（providers 里有、目录帧查不到 → 读不到真实声明，不能拿全集顶替）
-     */
+    /** 用户关闭推理时保持空态；目录缺失或未声明档位时仍提供完整编辑入口。 */
     @Test
-    fun emptyStates_noReasoning_noDeclaredLevels_modelNotInCatalog() {
+    fun uncatalogedAndUndeclaredModelsRemainEditable() {
         connect()
         compose.onNodeWithTag("finecat.providerRow.$EMPTY").performClick()
         awaitTag("finecat.providerEdit")
-
-        val hints = listOf("noreason", "nodeclared", "uncataloged").map { modelId ->
+        for (modelId in listOf("noreason", "nodeclared", "uncataloged")) {
             val index = holder!!.providers.first { it.id == EMPTY }.models.indexOfFirst { it.id == modelId }
             compose.onNodeWithTag("finecat.modelRow.$index").performScrollTo().performClick()
             awaitTag("finecat.modelDetail")
             scrollToMapping()
-            val hint = textOf("finecat.thinkingEmpty")
-            assertTrue("$modelId 必须显示空态说明", hint.isNotBlank())
-            assertEquals("$modelId 不得出现任何档位列", 0, columnTags().size)
+            if (modelId == "noreason") {
+                assertEquals("这个模型不支持推理，没有强度可映射。", textOf("finecat.thinkingEmpty"))
+                assertTrue(columnTags().isEmpty())
+            } else {
+                assertEquals(EDITABLE_LEVELS, columnTags())
+                assertTrue(compose.onAllNodesWithTag("finecat.thinkingEmpty").fetchSemanticsNodes().isEmpty())
+                if (modelId == "uncataloged") assertEquals("low", valueOf("low"))
+                setValue("high", "vendor-high")
+                assertEquals("vendor-high", valueOf("high"))
+            }
             backToProviderCard()
-            "$modelId=$hint"
         }
-        assertEquals(
-            listOf(
-                "noreason=这个模型不支持推理，没有强度可映射。",
-                "nodeclared=这个模型还没声明有哪些强度档位。",
-                "uncataloged=模型目录里没有这个模型，读不到它真实声明的档位。先在电脑上认证并启用它，再回来编辑。",
-            ),
-            hints,
-        )
-        emitAssert("empty.hints", hints.joinToString(" | "))
-        saveShot("f11-map-empty.png")
+        assertTrue("编辑只更新草稿，不自动保存Provider", transport.payloadsOfType("provider-put").isEmpty())
+        emitAssert("catalogNotRequired", "true")
     }
 
     /**
@@ -292,14 +284,14 @@ class FineCatThinkingMapF11DeviceTest {
      * ——退卡时 `detailIndex=null` 已让子树离开组合、`remember` 本就会重建，去掉 `key()` 照样绿。
      * `key()` 的价值在于「子树存活期间行下标变化」这条当前 UI 不可达的路径。
      *
-     * 用 `f11-empty` 这个 provider：它同时有 5 列的 `reasoner2` 和 0 列的 `nodeclared`，
+     * 用 `f11-empty` 这个 provider：它同时有已声明档位的 `reasoner2` 和未声明档位的 `nodeclared`，
      * 所以「换模型」是同一张表单内的真实切换，不用跨 provider。
      */
     @Test
     fun switchModel_doesNotLeakPopoverOrDraft() {
         connect()
         val a = openMapping(EMPTY, "reasoner2")
-        assertEquals("A 有目录声明的 5 档", DECLARED, a)
+        assertEquals("A 有完整标准编辑档位", EDITABLE_LEVELS, a)
         setValue("medium", "high")
         compose.onNodeWithTag("finecat.thinkingVal.medium").performScrollTo().performClick()
         openCustomValuePicker()
@@ -320,12 +312,12 @@ class FineCatThinkingMapF11DeviceTest {
             "换模型后不得出现上一张卡的错误行",
             compose.onAllNodesWithTag("finecat.thinkingError").fetchSemanticsNodes().isEmpty(),
         )
-        assertEquals("B 没有列", 0, columnTags().size)
-        assertEquals("A 的草稿改到了 medium=high", listOf("—", "—", "—", "high", "—"), aValues)
-        emitAssert("switch.bColumnCount", "0")
+        assertEquals("B 缺目录声明仍可编辑标准档位", EDITABLE_LEVELS, columnTags())
+        assertEquals("A 的草稿改到了 medium=high", listOf("默认", "默认", "默认", "high", "默认", "默认", "默认"), aValues)
+        emitAssert("switch.bColumnCount", columnTags().size.toString())
         emitAssert("switch.aValues", aValues.joinToString(","))
 
-        // 回到 A 确认草稿真的还在（没有被 B 的空态洗掉）。
+        // 回到 A 确认草稿仍在，不串到 B。
         backToProviderCard()
         compose.onNodeWithTag("finecat.modelRow.0").performScrollTo().performClick()
         awaitTag("finecat.modelDetail")
@@ -350,7 +342,7 @@ class FineCatThinkingMapF11DeviceTest {
         compose.onNodeWithTag("finecat.thinkingMap").performScrollTo()
         compose.waitForIdle()
 
-        assertEquals("换协议不得抹掉思考映射", listOf("null", "—", "low", "high", "high"), valuesOf(columns))
+        assertEquals("换协议不得抹掉思考映射", listOf("null", "默认", "low", "high", "high", "默认", "默认"), valuesOf(columns))
         assertTrue(
             "协议已切到 anthropic-messages（基础表单语义不回退）",
             compose.onAllNodesWithText("anthropic-messages", substring = true, useUnmergedTree = true)
@@ -380,7 +372,7 @@ class FineCatThinkingMapF11DeviceTest {
             compose.onAllNodesWithTag("finecat.thinkingError").fetchSemanticsNodes().isNotEmpty(),
         )
         assertEquals("被拒绝的清空不得改动草稿", "low", valueOf("low"))
-        assertEquals("整列取值不变", listOf("null", "—", "low", "low", "high"), valuesOf(columns))
+        assertEquals("整列取值不变", listOf("null", "默认", "low", "low", "high", "默认", "默认"), valuesOf(columns))
         emitAssert("clearRejected.error", textOf("finecat.thinkingError"))
         emitAssert("clearRejected.values", valuesOf(columns).joinToString(","))
         saveShot("f11-map-clear-rejected.png")
@@ -479,9 +471,8 @@ class FineCatThinkingMapF11DeviceTest {
     /**
      * 三环境亮暗 + 横向可达。
      *
-     * 横向可达必须用 **7 档**的模型测：目录帧对 `reasoner` 只声明 5 档，5 档在 360dp 下
-     * 放得下，测不出滚动。`wide` 的目录清单是 pi 档位全集 7 档（`xhigh`/`max` 只有显式
-     * 映射过才会出现在真实清单里，所以这里给它们配了 override），360dp 下必然溢出。
+     * 编辑器始终提供标准7档；这里用 wide 的 xhigh/max 自定义映射检查横向可达，
+     * 不把编辑列数当作目录能力声明。360dp 下需能滚到最后一列。
      */
     private fun matrixStep(
         tag: String,
@@ -980,10 +971,10 @@ class FineCatThinkingMapF11DeviceTest {
             (if (dark) darkFineCatColors().surface else lightFineCatColors().surface).toArgb(),
         )
 
-        /** 目录帧对 reasoner 真实声明的档位；列集合必须与之严格相等。 */
-        val DECLARED = listOf("off", "minimal", "low", "medium", "high")
+        /** 标准编辑键全集；它不代表目录声明的能力。 */
+        val EDITABLE_LEVELS = listOf("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
-        /** 目录帧对 wide 真实声明的 7 档（xhigh/max 因显式映射而出现），用于测横向可达。 */
+        /** 目录帧对 wide 真实声明的 7 档，用于测横向可达。 */
         val DECLARED_WIDE = listOf("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
         /** 批准 fixture 的 expected wire：显式 null 下发为 JSON null，没动过的档位键不丢。 */

@@ -11,13 +11,14 @@ import com.finecat.pimobile.shared.protocol.GatewayImageAttachment
  * - 只存在于 UI 层：不写共享 history / 持久化会话，不参与投影。
  * - 归属用"整组实发 attachmentId + 会话"精确匹配，禁止用文本/内容猜身份；
  *   attachmentId 每次实发重新分配，同图重复发送各自独立。
- * - sent 帧只代表网关 preflight 受理（PROTOCOL §4.2），此刻不移除预览；
- *   正式回显到达才收走，此后对话里只剩正式消息一条。
+ * - sent 的 started/queued/handled 表示 Pi SDK 明确受理，结束本次本地预览；
+ *   正式消息照常投影，不要求 SDK 图片归一保留客户端的 attachmentId。
+ *   旧网关未带 disposition 时保留原回显匹配路径。
  * - 请求身份独立于预览维护（[AwaitingOutgoingSend] 队列）：echo 先到移除
  *   预览后，迟到的旧 sent 帧仍按队头 token 正确消费，不会串到后续请求。
  * - 失败（本地拒绝/超时/断连/服务端 error）收敛为 FAILED，不自动重发；
- *   sent 后长期无回显（如扩展 input handled 吞掉 echo）转为 UNCONFIRMED
- *   有界收敛，两者都允许手动恢复草稿，且不覆盖发送后新编辑的草稿。
+ *   旧网关无 disposition 且 sent 后长期无回显时转为 UNCONFIRMED；
+ *   可恢复态不覆盖发送后新编辑的草稿，已知 SDK 受理后不再降级。
  * - 网络失败不证明服务端未收到：迟到的正式回显允许移除 FAILED 预览，
  *   避免失败占位与正式消息双气泡。
  * - 终态（FAILED/UNCONFIRMED）预览有界保留：见 [pruneRestorable]——每条都持着
@@ -86,7 +87,8 @@ internal class OutgoingImagePreviewTracker {
         draftText: String,
         images: List<GatewayImageAttachment>,
         restoreImages: List<AndroidPreparedImage>,
-        restoreUris: List<String> = emptyList()
+        restoreUris: List<String> = emptyList(),
+        state: OutgoingImagePreviewState = OutgoingImagePreviewState.SENDING,
     ) {
         items += OutgoingImagePreview(
             sendToken = token,
@@ -97,7 +99,7 @@ internal class OutgoingImagePreviewTracker {
             draftText = draftText,
             restoreImages = restoreImages,
             restoreUris = restoreUris,
-            state = OutgoingImagePreviewState.SENDING
+            state = state
         )
     }
 
@@ -144,19 +146,23 @@ internal class OutgoingImagePreviewTracker {
      * 预览确认并绑到错误会话上（跨会话串绑）。
      * 目标会话未知（新会话首条）时仍按 FIFO 消费：这与 runtime 对 "sent" lane
      * 的 FIFO 完成一致，帧内没有任何字段能区分两个新会话请求。
+     * 帧 sessionId 缺失或空白时不消费队头；runtime 已拦截，此处保留同样守卫。
      *
-     * 返回被确认的预览（无变化返回 null）。
+     * SDK已明确受理时完成预览；SDK1.0.4归一图片会移除attachmentId，不能再
+     * 要求同ID回显来证明发送。旧网关未带disposition则保留原匹配等待。
+     * 返回本次发生变化的预览，供调用方刷新列表；sdkAccepted时返回已移除项。
+     * 无变化返回null，返回值不表示该项仍保留在列表中。
      */
-    fun consumeSent(frameSessionId: String?, nowMs: Long): OutgoingImagePreview? {
+    fun consumeSent(frameSessionId: String?, nowMs: Long, sdkAccepted: Boolean = false): OutgoingImagePreview? {
         val head = awaiting.firstOrNull() ?: return null
-        val frameSession = frameSessionId?.takeIf(String::isNotBlank)
-        if (frameSession != null && head.sessionId != null && head.sessionId != frameSession) {
+        val frameSession = frameSessionId?.takeIf(String::isNotBlank) ?: return null
+        if (head.sessionId != null && head.sessionId != frameSession) {
             return null
         }
         awaiting.removeFirst()
         // 绑定记录保留供发送回写查询（区分自动选中与换会话）；等待队列仅
         // 有限增长（受理即消费），取超出上限丢最旧的有界清理。
-        frameSessionId?.takeIf(String::isNotBlank)?.let { boundSessionsByToken[head.token] = it }
+        boundSessionsByToken[head.token] = frameSession
         if (boundSessionsByToken.size > BOUND_SESSION_HISTORY_LIMIT) {
             boundSessionsByToken.remove(boundSessionsByToken.keys.first())
         }
@@ -165,10 +171,12 @@ internal class OutgoingImagePreviewTracker {
         }
         if (index < 0) return null
         val preview = items[index]
+        // 结束本次本地等待；只按已匹配的token清理，不认领别的消息或图片。
+        if (sdkAccepted) return items.removeAt(index)
         val confirmed = preview.copy(
             state = OutgoingImagePreviewState.CONFIRMED,
             sentAtMs = nowMs,
-            sessionId = preview.sessionId ?: frameSessionId
+            sessionId = preview.sessionId ?: frameSession
         )
         items[index] = confirmed
         return confirmed

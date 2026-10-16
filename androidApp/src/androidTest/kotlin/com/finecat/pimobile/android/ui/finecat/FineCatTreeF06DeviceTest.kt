@@ -76,6 +76,14 @@ import org.junit.runner.RunWith
  * 语义存在冒充手势证据；分支切换断言**发出去的请求帧**里的 entryId，同文异 ID 分别点
  * 击分别核对，不按正文文本定位。几何/颜色按 DEC-TOLERANCE（≤2dp / 逐通道 ≤3）。
  * 定位用 performScrollTo 只是测试编排手段，不作为滚动手势证据（F04/F05 先例）。
+ *
+ * TREE05（2026-10-15）交互口径变更：点行只**浏览选中**并弹动作卡，不再立即切分支；
+ * 跳转走卡内「跳到此处」（仍用既有 switch-branch 路径）。本文件所有“点击→切分支”
+ * 的用例改走 [jumpRow]（点行 + 点跳转）；浏览选中底色由 surface2 改 surface3，
+ * active leaf 改为深色实心行。行首「当前」标记保留（TREE02 已验收口径）。
+ * 注意：本文件仍保留一组按旧“泳道/导轨”渲染写的像素断言（分叉实心点/空心点/底线段），
+ * 那套渲染已在前几轮删除、改为网关 prefix 等宽文本；这些断言在 TREE05 之前就已与主源码
+ * 不同步，本轮未重instrument，不能当作当前页面的验收结论。
  */
 @RunWith(AndroidJUnit4::class)
 class FineCatTreeF06DeviceTest {
@@ -262,7 +270,7 @@ class FineCatTreeF06DeviceTest {
     fun s8_tree_clickSwitch_sendsRealEntryId() {
         val transport = setupSession()
         gotoTreeAndLoad(transport, treeFrameA(LEAF_A))
-        clickRow(rowTag("t02"))
+        jumpRow(rowTag("t02"))
         awaitSwitchRequest(transport, "t02")
         // 重拉树计数快照必须在 receive(branch-switched) 之前：自动重拉由该帧触发，
         // 可能早于下方 waitUntil 取快照已发出（竞态 F06 实测）
@@ -285,7 +293,7 @@ class FineCatTreeF06DeviceTest {
         // editorText"与 pi 一致。此前恒传 null/[]，该路径零覆盖（审查 m10/R-m10）
         // 段1：已有草稿 → queued 前置合并；成功切换回对话（tick→onBack）
         holder!!.messageDraft = "草稿F06"
-        clickRow(rowTag("t05"))
+        jumpRow(rowTag("t05"))
         awaitSwitchRequest(transport, "t05")
         val beforeQueued = transport.payloadsOfType("tree").size
         transport.receive(branchSwitchedFrame(SESSION, "t05", queued = listOf("q1", "q2")))
@@ -303,17 +311,17 @@ class FineCatTreeF06DeviceTest {
         }
         transport.receive(historyFrame(SESSION, listOf(Msg("user", "h-1", "历史用户F06甲")), "h-1", "h-1"))
         assertEquals("queued 应前置合并进既有草稿（双空格=移动端取舍）", "q1  q2  草稿F06", holder!!.messageDraft)
-        // 段2：清空草稿回树 → editorText 覆盖（alreadyAt 帧也恢复、不 tick、留树页）
+        // 段2：assistant/current leaf不返回editorText，alreadyAt保持输入、不tick。
         gotoTreeAndLoad(transport, treeFrameA("t05"), "t05")
         holder!!.messageDraft = ""
-        clickRow(rowTag("t02"))
+        jumpRow(rowTag("t02"))
         awaitSwitchRequest(transport, "t02")
         val tickBeforeAlready = holder!!.branchSwitchedTick
         transport.receive(
-            branchSwitchedFrame(SESSION, "t02", alreadyAt = true, editorText = "编辑器文本F06"),
+            branchSwitchedFrame(SESSION, "t02", alreadyAt = true),
         )
         compose.waitUntil(5_000) { hasAnyText("已在此处") }
-        assertEquals("editorText 应在草稿为空时恢复", "编辑器文本F06", holder!!.messageDraft)
+        assertEquals("assistant/alreadyAt应保持输入框为空", "", holder!!.messageDraft)
         assertEquals("alreadyAt 不得计 tick", tickBeforeAlready, holder!!.branchSwitchedTick)
     }
 
@@ -322,7 +330,7 @@ class FineCatTreeF06DeviceTest {
         val transport = setupSession()
         gotoTreeAndLoad(transport, treeFrameA(LEAF_A))
         val tickBefore = holder!!.branchSwitchedTick
-        clickRow(rowTag("t20"))
+        jumpRow(rowTag("t20"))
         awaitSwitchRequest(transport, "t20")
         transport.receive(errorFrame("运行中，暂不能切换分支"))
         compose.waitForIdle()
@@ -337,7 +345,7 @@ class FineCatTreeF06DeviceTest {
         assertTrue("活动叶应保持 t08", requireDescendant(rowTag("t08"), "当前") != null)
         assertTrue("t20 不应变成当前", descendantBounds(rowTag("t20"), "当前") == null)
         // 失败后链路仍可用：再点 t02 仍发真实切换请求（重拉快照同前，先于 receive）
-        clickRow(rowTag("t02"))
+        jumpRow(rowTag("t02"))
         awaitSwitchRequest(transport, "t02")
         val beforeReload = transport.payloadsOfType("tree").size
         transport.receive(branchSwitchedFrame(SESSION, "t02"))
@@ -353,7 +361,7 @@ class FineCatTreeF06DeviceTest {
         val transport = setupSession()
         gotoTreeAndLoad(transport, treeFrameA(LEAF_A))
         val tickBefore = holder!!.branchSwitchedTick
-        clickRow(rowTag("t08"))
+        jumpRow(rowTag("t08"))
         awaitSwitchRequest(transport, "t08")
         transport.receive(branchSwitchedFrame(SESSION, "t08", alreadyAt = true))
         compose.waitUntil(5_000) { hasAnyText("已在此处") }
@@ -369,11 +377,11 @@ class FineCatTreeF06DeviceTest {
         // 同文异 ID 两节点逐个真实点击：请求帧里的 entryId 必须各归各（不按文本定位）。
         // 对子放首屏深链（t07/t08）：深行定位通道有系统性坑（fling 跨行/scrollToNode
         // 滚错轴，见 realSwipeUntilVisible 注释），身份验证本身不需要深处。
-        clickRow(rowTag("t07"))
+        jumpRow(rowTag("t07"))
         awaitSwitchRequest(transport, "t07")
         transport.receive(branchSwitchedFrame(SESSION, "t07", alreadyAt = true))
         compose.waitUntil(5_000) { hasAnyText("已在此处") }
-        clickRow(rowTag("t08"))
+        jumpRow(rowTag("t08"))
         awaitSwitchRequest(transport, "t08")
         transport.receive(branchSwitchedFrame(SESSION, "t08", alreadyAt = true))
         compose.waitForIdle()
@@ -387,7 +395,7 @@ class FineCatTreeF06DeviceTest {
         val transport = setupSession()
         gotoTreeAndLoad(transport, treeFrameA(LEAF_A))
         // 点 t20（失败回复保持选中高亮、留在树页），记录滚动基线
-        clickRow(rowTag("t20"))
+        jumpRow(rowTag("t20"))
         awaitSwitchRequest(transport, "t20")
         transport.receive(errorFrame("运行中，暂不能切换分支"))
         compose.waitForIdle()
@@ -404,7 +412,8 @@ class FineCatTreeF06DeviceTest {
         // 滚动位置保持
         assertEquals("切 tab 后横滚应保持", hKeep, hAxisValue(), 0.5f)
         assertEquals("切 tab 后纵滚应保持", vKeep, vAxisValue(), 0.5f)
-        // 选中高亮保持（t20 行背景 = surface2）。采样取行中心：高亮底从 depth*16dp
+        // 选中高亮保持（TREE05：浏览选中行背景 = surface3，深色 active leaf 行是另一回事）。
+        // 采样取行中心：高亮底从 depth*16dp
         // 缩进后才开始铺（background 挂在 start padding 之后），左上角采样会落在
         // 缩进前的 surface 底上（F06 实测 t20 采到 fffafafa）；读数前先等 bounds
         // 收敛（切回树后重组过渡态行 bounds 会短暂 (0,0)，F06 实测）
@@ -413,7 +422,7 @@ class FineCatTreeF06DeviceTest {
         val row20 = tagBounds(rowTag("t20"))
         assertPixelNear(
             rootBitmap(), (row20.left + row20.width / 2f).roundToInt(), (row20.top + row20.height / 2f).roundToInt(),
-            lightSurface2, "切 tab 后 t20 选中高亮应保持",
+            lightSurface3, "切 tab 后 t20 选中高亮应保持",
         )
         // 当前叶不受影响
         assertTrue("切 tab 后 t08「当前」应保持", requireDescendant(rowTag("t08"), "当前") != null)
@@ -449,7 +458,7 @@ class FineCatTreeF06DeviceTest {
         )
         assertTrue("乙当前叶应为 b04", requireDescendant(rowTag("b04"), "当前") != null)
         // 乙的同文异 ID 节点点击发乙自己的 id（跨会话不串）
-        clickRow(rowTag("b07"))
+        jumpRow(rowTag("b07"))
         awaitSwitchRequest(transport, "b07")
         transport.receive(branchSwitchedFrame(SESSION_B, "b07", alreadyAt = true))
         compose.waitUntil(5_000) { hasAnyText("已在此处") }
@@ -467,7 +476,7 @@ class FineCatTreeF06DeviceTest {
             } > 1
         }
         transport.receive(treeFrameB(LEAF_B))
-        // 点击波纹淡出后再采样（Material3 clickable 波纹残留会给 surface2 混色，
+        // 点击波纹淡出后再采样（Material3 clickable 波纹残留会给选中底混色，
         // F06 实测采到 e0e0de）
         Thread.sleep(700)
         compose.waitForIdle()
@@ -477,7 +486,7 @@ class FineCatTreeF06DeviceTest {
         val bVpRight = tagBounds("finecat.treeContent").right.roundToInt()
         assertPixelNear(
             rootBitmap(), bVpRight - px(24f), (b07Row.top + b07Row.height / 2f).roundToInt(),
-            lightSurface2,
+            lightSurface3,
             "乙树短行选中底应铺到视口右缘-页边距内（b07=$b07Row vp=${tagBounds("finecat.treeContent")} " +
                 "sel=${holder?.let { it.sessionTree?.second }} all=" +
                 compose.onAllNodesWithTag(rowTag("b07"), useUnmergedTree = true)
@@ -762,6 +771,14 @@ class FineCatTreeF06DeviceTest {
         // 可见行再语义点击（OnClick 动作直达；注入层在软渲染模拟器上有系统性故障）
         realSwipeUntilVisible(tag)
         compose.onNodeWithTag(tag, useUnmergedTree = true).performClick()
+        compose.waitForIdle()
+    }
+
+    /** TREE05：点行只浏览选中并弹动作卡，跳转要再点卡内「跳到此处」。
+     *  本文件下面所有“点击→切分支”的用例都走这个两步动作。 */
+    private fun jumpRow(tag: String) {
+        clickRow(tag)
+        compose.onNodeWithTag("finecat.treeActionJump", useUnmergedTree = true).performClick()
         compose.waitForIdle()
     }
 
@@ -1281,6 +1298,8 @@ class FineCatTreeF06DeviceTest {
         const val lightText3 = 0xFF7F7F88L
         const val lightInk = 0xFF1A1A1CL
         const val lightSurface2 = 0xFFF0F0EEL
+        /** TREE05 起浏览选中行的底色（surface3）；surface2 已不再用于树行选中。 */
+        const val lightSurface3 = 0xFFE7E7E4L
         const val darkBg = 0xFF17171AL
 
         // 暗色 token（darkFineCatColors）

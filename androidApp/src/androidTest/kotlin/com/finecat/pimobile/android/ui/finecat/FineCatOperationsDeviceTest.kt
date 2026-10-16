@@ -2,6 +2,7 @@ package com.finecat.pimobile.android.ui.finecat
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -12,8 +13,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.dp
+import com.finecat.pimobile.shared.protocol.GatewayImageAttachment
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.*
@@ -243,5 +247,53 @@ class FineCatOperationsDeviceTest {
             compose.onNodeWithTag("finecat.copy.u").performClick()
             assertEquals("用户消息可复制", copied)
         }
+    }
+
+    @Test fun imageBubblesWrapPortraitCaptionLandscapeAndUnknownSize() {
+        val portrait = GatewayImageAttachment("portrait", "image/png", bytes = 0, width = 200, height = 400)
+        val landscape = GatewayImageAttachment("landscape", "image/png", bytes = 0, width = 400, height = 300)
+        val unknown = GatewayImageAttachment("unknown", "image/png", bytes = 0)
+        compose.setContent {
+            FineCatTheme {
+                Column(Modifier.width(320.dp)) {
+                    FcUserBubble(FcChatMessage("portrait", true), attachments = listOf(portrait))
+                    FcUserBubble(FcChatMessage("caption", true, "图"), attachments = listOf(portrait))
+                    FcUserBubble(FcChatMessage("landscape", true), attachments = listOf(landscape))
+                    FcUserBubble(FcChatMessage("unknown", true), attachments = listOf(unknown))
+                }
+            }
+        }
+        val density = compose.density.density
+        for ((id, width) in listOf("portrait" to 76f, "caption" to 76f, "landscape" to 156f, "unknown" to 124f)) {
+            val bubble = compose.onNodeWithTag("finecat.userBubble.$id").fetchSemanticsNode().boundsInRoot
+            assertEquals("气泡只占图片/文字与内距的宽度：$id", width, bubble.width / density, 1f)
+            assertEquals("气泡仍靠右", 320f, bubble.right / density, 1f)
+        }
+    }
+
+    @Test fun wideImageStripStillScrollsAndLongCaptionKeepsBubbleWidthLimit() {
+        val images = List(8) { GatewayImageAttachment("image-$it", "image/png", bytes = 0, width = 200, height = 400, name = "合成图$it") }
+        var openedIndex = -1
+        compose.setContent {
+            FineCatTheme {
+                Column(Modifier.width(320.dp)) {
+                    FcUserBubble(
+                        FcChatMessage("multiple", true), attachments = images,
+                        thumbnails = images.associate { it.attachmentId to ImageBitmap(48, 96) },
+                        onOpenImage = { actual, index -> assertEquals(images, actual); openedIndex = index },
+                    )
+                    FcUserBubble(FcChatMessage("long", true, "较长文字仍能自动换行并遵守消息最大宽度。".repeat(4)),
+                        attachments = listOf(images.first()), onCopy = {})
+                }
+            }
+        }
+        val density = compose.density.density
+        for (id in listOf("multiple", "long")) {
+            val bubble = compose.onNodeWithTag("finecat.userBubble.$id").fetchSemanticsNode().boundsInRoot
+            assertEquals("气泡宽度不超父容器85%", 272f, bubble.width / density, 1f)
+        }
+        compose.onNodeWithTag("finecat.userImages.multiple").performTouchInput { swipeLeft() }
+        compose.onNodeWithContentDescription("放大查看 合成图7").assertIsDisplayed().performClick()
+        compose.runOnIdle { assertEquals(7, openedIndex) }
     }
 }

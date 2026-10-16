@@ -45,6 +45,8 @@ internal fun FcModelPicker(
     currentThinking: String?,
     onSelect: (String, String, String?) -> Unit,
     onDismiss: () -> Unit,
+    emptyText: String = "暂无可用模型",
+    onRetry: (() -> Unit)? = null,
 ) {
     val colors = LocalFineCatColors.current
     val type = LocalFineCatType.current
@@ -76,8 +78,11 @@ internal fun FcModelPicker(
                 Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())
                     .padding(vertical = 4.dp).testTag("finecat.modelList")) {
                     if (groups.isEmpty()) {
-                        Text("暂无可用模型：目录为空或未连接网关", style = type.sm, color = colors.text3,
+                        Text(emptyText, style = type.sm, color = colors.text3,
                             modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp))
+                        if (onRetry != null) androidx.compose.material3.TextButton(
+                            onClick = onRetry, modifier = Modifier.padding(horizontal = 16.dp),
+                        ) { Text("重试") }
                     }
                     groups.forEach { group ->
                         group.models.forEach { model ->

@@ -95,7 +95,7 @@ internal fun FineCatDirectorySheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("目录加载失败：$it", style = type.xs, color = colors.err, modifier = Modifier.weight(1f))
+                Text(it, style = type.xs, color = colors.err, modifier = Modifier.weight(1f))
                 FcTextButton(text = "重试", onClick = { browse(requestedPath) })
             }
         }

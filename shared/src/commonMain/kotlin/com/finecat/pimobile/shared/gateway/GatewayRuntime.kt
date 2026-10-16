@@ -46,6 +46,8 @@ enum class GatewayConnectionState {
 }
 
 data class GatewayRuntimeState(
+    /** 仅显式配对递增，隔离已入队但尚未被UI消费的旧网关帧。 */
+    val gatewayRevision: Long = 0,
     val connection: GatewayConnectionState = GatewayConnectionState.DISCONNECTED,
     val endpoint: String? = null,
     val networkAvailable: Boolean = true,
@@ -68,7 +70,8 @@ sealed interface GatewayRuntimeEvent {
         val frame: GatewayFrame,
         val correlatedSessionId: String?,
         /** pi event 帧经 PiEventNormalizer 归一后的内部视图事件（0..n 条）。 */
-        val normalizedEvents: List<SessionEvent> = emptyList()
+        val normalizedEvents: List<SessionEvent> = emptyList(),
+        val gatewayRevision: Long = 0,
     ) : GatewayRuntimeEvent {
         override fun toString(): String =
             "Frame(kind=${frame.kind}, correlatedSessionId=$correlatedSessionId, rawJson=<redacted>)"
@@ -90,7 +93,9 @@ sealed interface GatewayRuntimeEvent {
         val requestType: String,
         val reason: String,
         val targetSessionId: String? = null,
-        val correlationId: String? = null
+        val correlationId: String? = null,
+        /** 已通过在途关联的服务端拒绝；本地 busy 等拒绝由发送返回值按自身 token 收尾。 */
+        val serverResponse: Boolean = false,
     ) : GatewayRuntimeEvent
 }
 
@@ -129,7 +134,13 @@ class GatewayRuntime(
     /** 每会话一个 pi 事件归一器（合成的 turn 计数依赖会话内顺序）。 */
     private val eventNormalizers = mutableMapOf<String, PiEventNormalizer>()
     private val deferredRequests = ArrayDeque<GatewayRequest>()
+    // 新协议计数仅代表等待sent的输入；实际运行与压缩由事件/快照独立记录。
+    // 旧网关仍保留原来的输入→settled兼容计数。
     private val activeTurnCountsBySession = mutableMapOf<String, Int>()
+    private val observedRunningSessions = mutableSetOf<String>()
+    private val observedCompactingSessions = mutableSetOf<String>()
+    private val hasPromptDisposition: Boolean
+        get() = "prompt-disposition-v1" in mutableState.value.capabilities
     private var unassociatedTurnCount = 0
     private var desiredConnection = false
     private var reconnectBlocked = false
@@ -173,13 +184,21 @@ class GatewayRuntime(
         val payload = GatewayPairingPayloadParser.parse(encodedPayload, clock.nowEpochMilliseconds())
         val existing = preferences.load()
         val configured = roundOrderLocked(existing)
-        // 配对落点不再被 payload.publicUrl 劫持：用户/历史已配好的地址优先，
-        // publicUrl 只在全新安装（一个地址都没有）时兜底，否则追加为备用。
-        val order = if (configured.isEmpty()) listOf(payload.publicUrl) else configured + payload.publicUrl
-        // 去重：重扫同一网关二维码时 publicUrl 已在列，不重复探测。distinct 保首序。
-        val deduped = order.distinct()
-        preferences.updateFields { it.copy(endpoint = deduped.first(), endpointCandidates = deduped) }
-        beginConnectionRoundLocked(deduped, pairingCode = payload.pairingCode)
+        // 显式配对以载荷指定的网关为目标，旧入口保留原相对顺序供后续连接使用。
+        val order = (listOf(payload.publicUrl) + configured).distinct()
+        preferences.updateFields { it.copy(endpoint = payload.publicUrl, endpointCandidates = order) }
+        connectionGeneration += 1
+        runCatching { transport.close() }
+        clearConnectionWorkLocked()
+        subscribedSessionId = null
+        previousSubscribedSessionId = null
+        mutableState.value = GatewayRuntimeState(
+            gatewayRevision = mutableState.value.gatewayRevision + 1,
+            endpoint = payload.publicUrl,
+            networkAvailable = networkAvailableLocked(),
+        )
+        // 一次性配对码只交给其签发地址，不能因探测超时而投给历史入口。
+        beginConnectionRoundLocked(listOf(payload.publicUrl), pairingCode = payload.pairingCode)
     }
 
     /**
@@ -456,6 +475,10 @@ class GatewayRuntime(
             rejectLocked("message", ERROR_IMAGE_LIMITS)
             return@serialized false
         }
+        if (sessionId != null && pendingLanes["dequeued"]?.active?.request?.targetSessionId == sessionId) {
+            rejectLocked("message", ERROR_REQUEST_BUSY, sessionId)
+            return@serialized false
+        }
         markTurnLocked(sessionId)
         val sent = sendRequestLocked(
             GatewayRequests.message(text.trim(), images, sessionId, cwd, model, mode)
@@ -465,6 +488,12 @@ class GatewayRuntime(
     }
 
     private suspend fun sendRequestLocked(request: GatewayRequest): Boolean {
+        if (request.requestType == "dequeue" &&
+            pendingLanes["sent"]?.active?.request?.targetSessionId == request.targetSessionId &&
+            pendingLanes["sent"] != null) {
+            rejectLocked("dequeue", ERROR_REQUEST_BUSY, request.targetSessionId, request.correlationId)
+            return false
+        }
         if (mutableState.value.connection != GatewayConnectionState.CONNECTED) {
             rejectLocked(
                 request.requestType,
@@ -690,17 +719,25 @@ class GatewayRuntime(
         handshakeJob?.cancel()
         handshakeJob = null
         val credentialRejected = failure.httpStatus == 401 || failure.closeCode == 4003
+        // 备用入口可能已指向别的宿主；它的401不能证明首入口的凭据无效。
+        // 保留凭据，按已有退避回到首入口；首入口401与明确撤销4003仍停止重连。
+        val retryPrimary = failure.httpStatus == 401 && pairingCode == null && endpointCursor > 0
+        if (retryPrimary) endpointCursor = 0
         // 一次性配对码无效/已被用过 ≠ 长期凭据失效：作废 pairingCode，改回 token 继续，
         // 不能因此把 App 永久钉死在 authentication-required。
         val pairingRejected = credentialRejected && pairingCode != null
         if (pairingRejected) {
             pairingCode = null
             if (runCatching { credentials.loadToken() }.getOrNull() == null) reconnectBlocked = true
-        } else {
+        } else if (!retryPrimary) {
             if (failure.httpStatus == 401) runCatching { credentials.deleteToken() }
             if (credentialRejected || !failure.recoverable) reconnectBlocked = true
         }
-        val error = if (pairingRejected) ERROR_PAIRING_REJECTED else failure.stableErrorCode()
+        val error = when {
+            retryPrimary -> ERROR_TRANSPORT_FAILED
+            pairingRejected -> ERROR_PAIRING_REJECTED
+            else -> failure.stableErrorCode()
+        }
         cancelPendingLocked(error)
         // 切备用地址在这里提前 return；回合保留与恢复窗口武装都在 advance 内部完成。
         if (!credentialRejected && advanceOrRestartRoundLocked()) return
@@ -734,6 +771,8 @@ class GatewayRuntime(
             }
             entryHistoryGatewayKey = token to null
             pairingCode = null
+            endpointOrder = roundOrderLocked(preferences.load())
+            endpointCursor = 0
         }
         if (frame.kind == "hello") {
             handshakeJob?.cancel()
@@ -749,6 +788,11 @@ class GatewayRuntime(
                 reconnectAttempt = 0,
                 lastError = null
             )
+            if (!hasPromptDisposition) {
+                observedRunningSessions.clear()
+                observedCompactingSessions.clear()
+                publishTurnStateLocked()
+            }
             replayAfterHelloLocked()
         }
         // attachment 应答/错误帧由 runtime 自行消费（严格三元校验 + 终态释放），
@@ -769,7 +813,8 @@ class GatewayRuntime(
                 frame.requestType ?: "gateway",
                 frame.code ?: ERROR_GATEWAY_REQUEST,
                 correlation.sessionId,
-                responseCorrelation(frame)
+                responseCorrelation(frame),
+                serverResponse = true,
             )
             suspendBackgroundConnectionIfIdleLocked()
             return
@@ -780,11 +825,49 @@ class GatewayRuntime(
                 activeTurnCountsBySession.getOrElse(frame.sessionId) { 0 } + 1
             publishTurnStateLocked()
         }
-        // pi 没有显式 turn 事件：agent_settled 表示一轮运行彻底落定
-        // （含重试），后台保活与未读状态以它为准。
-        val endedLastBackgroundTurn =
-            frame.kind == "event" && frame.event?.get("type")?.stringValue == "agent_settled"
-        if (endedLastBackgroundTurn) releaseTurnLocked(frame.sessionId)
+        if (frame.kind == "sent" && hasPromptDisposition && frame.isStreaming != null && frame.isCompacting != null) {
+            // ACK只释放这次输入的乐观等待，不以handled推断整个会话已结束。
+            releaseTurnLocked(frame.sessionId)
+            updateObservedActivity(frame.sessionId, frame.isStreaming, frame.isCompacting)
+        }
+        val activitySnapshot = hasPromptDisposition && frame.isStreaming != null && frame.isCompacting != null &&
+            frame.kind in setOf("history", "state", "model-set", "branch-switched", "session-restarted", "compact-started", "compact-finished", "session-named")
+        if (activitySnapshot) {
+            // 重连期间run可能已经落定；权威补拉不能只修UI而留下后台保活假运行。
+            updateObservedActivity(frame.sessionId, frame.isStreaming == true, frame.isCompacting == true)
+        }
+        val nativeType = if (frame.kind == "event") frame.event?.get("type")?.stringValue else null
+        val endedLastBackgroundTurn = nativeType == "agent_settled"
+        if (hasPromptDisposition) frame.sessionId?.let { sessionId ->
+            when (nativeType) {
+                "agent_start" -> observedRunningSessions.add(sessionId)
+                "agent_settled" -> { observedRunningSessions.remove(sessionId); observedCompactingSessions.remove(sessionId) }
+                "compaction_start" -> observedCompactingSessions.add(sessionId)
+                "compaction_end" -> observedCompactingSessions.remove(sessionId)
+            }
+            publishTurnStateLocked()
+        }
+        // 旧网关没有输入处置快照，沿用既有计数；新协议settled不能消费尚未ACK的输入。
+        if (endedLastBackgroundTurn && !hasPromptDisposition) releaseTurnLocked(frame.sessionId)
+        // aborted 已与当前请求关联且证明会话 idle；取消的排队消息不会逐条发 settled。
+        if (frame.kind == "aborted" && frame.queued != null && frame.isStreaming == false && frame.isCompacting == false) {
+            correlation.sessionId?.let {
+                activeTurnCountsBySession.remove(it)
+                observedRunningSessions.remove(it)
+                observedCompactingSessions.remove(it)
+            }
+            publishTurnStateLocked()
+        }
+        // dequeue回执在网关清队列的同步段发出；保留当前run，取消的排队项不再settled。
+        if (frame.kind == "dequeued" && frame.queued != null && frame.queuedMessages != null &&
+            frame.isStreaming != null && frame.isCompacting != null) {
+            correlation.sessionId?.let { sessionId ->
+                if (hasPromptDisposition) updateObservedActivity(sessionId, frame.isStreaming, frame.isCompacting)
+                else if (frame.isStreaming || frame.isCompacting) activeTurnCountsBySession[sessionId] = 1
+                else activeTurnCountsBySession.remove(sessionId)
+            }
+            publishTurnStateLocked()
+        }
         val safeFrame = when (frame.kind) {
             "paired" -> frame.copy(token = null)
             else -> frame
@@ -813,13 +896,21 @@ class GatewayRuntime(
             emptyList()
         }
         emitEventLocked(
-            GatewayRuntimeEvent.Frame(safeRaw, safeFrame, correlation.sessionId, normalizedEvents),
+            GatewayRuntimeEvent.Frame(safeRaw, safeFrame, correlation.sessionId, normalizedEvents,
+                gatewayRevision = mutableState.value.gatewayRevision),
             estimatedBytes
         )
-        if (endedLastBackgroundTurn) suspendBackgroundConnectionIfIdleLocked()
+        if (activitySnapshot || endedLastBackgroundTurn || nativeType == "compaction_end" || frame.kind in setOf("sent", "aborted", "dequeued")) suspendBackgroundConnectionIfIdleLocked()
     }
 
     private suspend fun correlateLocked(frame: GatewayFrame): Correlation {
+        if (frame.kind == "compact-finished") {
+            if (frame.sessionId.isNullOrBlank() || frame.isStreaming == null || frame.isCompacting == null) {
+                rejectLocked("transport", "invalid-compact-state", frame.sessionId)
+                return Correlation(false, null)
+            }
+            return Correlation(true, frame.sessionId)
+        }
         if (frame.kind in UNCORRELATED_KINDS) {
             if (frame.kind == "pong") {
                 val pending = pendingLanes["pong"]?.active?.request ?: return Correlation(false, null)
@@ -892,6 +983,16 @@ class GatewayRuntime(
             if (requestType == "message") releaseTurnLocked(request.targetSessionId)
             completeLaneLocked(entry.key)
             return Correlation(true, frame.sessionId ?: request.targetSessionId)
+        }
+        // sent 按协议必须带真实会话。缺失时不能消费当前发送或绑定新会话。
+        if (frame.kind == "sent" && frame.sessionId.isNullOrBlank()) {
+            rejectLocked("transport", ERROR_SESSION_MISMATCH)
+            return Correlation(false, null)
+        }
+        if (frame.kind == "sent" && hasPromptDisposition && (frame.isStreaming == null || frame.isCompacting == null)) {
+            // 无效帧不消费输入lane，后续合法ACK仍可认领；不直接拆连接。
+            rejectLocked("transport", "invalid-message-ack", frame.sessionId)
+            return Correlation(false, null)
         }
         val lane = pendingLanes[frame.kind]
         if (lane == null) {
@@ -986,14 +1087,19 @@ class GatewayRuntime(
     }
 
     private fun responseCorrelationMatches(request: GatewayRequest, frame: GatewayFrame): Boolean = when (request.requestType) {
+        "entry-copy", "label-put" -> frame.entryId == request.correlationId && frame.sessionId == request.targetSessionId
+        "dequeue" -> frame.queueRequestId == request.correlationId && frame.sessionId == request.targetSessionId &&
+            frame.queued != null && frame.queuedMessages != null && frame.isStreaming != null && frame.isCompacting != null
         "model-scope-put" -> frame.scopeRequestId == request.correlationId
         in INPUT_ASSIST_REQUEST_TYPES -> frame.queryId == request.correlationId && frame.sessionId == request.targetSessionId
         else -> true
     }
 
-    private fun responseCorrelation(frame: GatewayFrame): String? = frame.queryId ?: frame.scopeRequestId
+    private fun responseCorrelation(frame: GatewayFrame): String? = frame.queueRequestId ?: frame.queryId ?: frame.scopeRequestId
 
     private fun explicitResponseCorrelation(request: GatewayRequest, frame: GatewayFrame): String? = when (request.requestType) {
+        "entry-copy", "label-put" -> frame.entryId
+        "dequeue" -> frame.queueRequestId
         "model-scope-put" -> frame.scopeRequestId
         in INPUT_ASSIST_REQUEST_TYPES -> frame.queryId
         else -> null
@@ -1091,6 +1197,8 @@ class GatewayRuntime(
     }
 
     private fun clearTurnsLocked() {
+        observedRunningSessions.clear()
+        observedCompactingSessions.clear()
         activeTurnCountsBySession.clear()
         unassociatedTurnCount = 0
         publishTurnStateLocked()
@@ -1211,9 +1319,16 @@ class GatewayRuntime(
         publishTurnStateLocked()
     }
 
+    private fun updateObservedActivity(sessionId: String?, streaming: Boolean, compacting: Boolean) {
+        if (sessionId == null) return
+        if (streaming) observedRunningSessions.add(sessionId) else observedRunningSessions.remove(sessionId)
+        if (compacting) observedCompactingSessions.add(sessionId) else observedCompactingSessions.remove(sessionId)
+        publishTurnStateLocked()
+    }
+
     private fun publishTurnStateLocked() {
         mutableState.value = mutableState.value.copy(
-            activeTurnSessionIds = activeTurnCountsBySession.keys.toSet(),
+            activeTurnSessionIds = activeTurnCountsBySession.keys + observedRunningSessions + observedCompactingSessions,
             hasUnassociatedTurn = unassociatedTurnCount > 0
         )
     }
@@ -1244,14 +1359,16 @@ class GatewayRuntime(
         requestType: String,
         code: String,
         targetSessionId: String? = null,
-        correlationId: String? = null
+        correlationId: String? = null,
+        serverResponse: Boolean = false,
     ) {
         emitEventLocked(
             GatewayRuntimeEvent.RequestRejected(
                 requestType,
                 code,
                 targetSessionId,
-                correlationId
+                correlationId,
+                serverResponse,
             )
         )
     }
@@ -1404,8 +1521,8 @@ class GatewayRuntime(
             "event", "hello", "paired", "pong"
         )
         private val RESPONSE_KINDS_REQUIRING_ACTIVE_REQUEST = setOf(
-            "history", "sent", "subscribed", "unsubscribed", "state", "aborted", "sessions", "model-scope-saved",
-            "input-resources", "input-completions"
+            "history", "sent", "subscribed", "unsubscribed", "state", "aborted", "dequeued", "sessions", "model-scope-saved",
+            "input-resources", "input-completions", "entry-copy", "label-put"
         )
         private val INPUT_ASSIST_REQUEST_TYPES = setOf("input-resources", "input-completions")
         private val IDEMPOTENT_CONNECTION_STATES = setOf(

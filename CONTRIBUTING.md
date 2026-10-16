@@ -67,4 +67,4 @@ export ANDROID_HOME=/path/to/android-sdk
 CI 流水线不在仓库文件里，在所用 Git 托管平台的 CI 界面按以下定义创建两条（手机仓一条、网关仓一条）：
 
 - 手机仓：Linux runner + JDK 17 + Node 22.19+；同级检出网关仓（跨仓一致性测试 `GatewayConformanceTest` 需要它，缺失时用例自动跳过）；网关仓先 `npm ci`；手机仓跑 `./gradlew :shared:testAndroidHostTest :androidApp:testDebugUnitTest`
-- 网关仓（`pi-mobile-gateway`）：Node 22.19+；`npm ci` 后跑 `npm run typecheck && npm test`（`lint` 暂不进门禁：历史存量问题未清，当前以 `typecheck` + 单测为准）
+- 网关仓（`pi-mobile-gateway`）：Node 22.19+；`npm ci` 后跑 `npm run check`（类型检查、格式检查和单测）

@@ -30,7 +30,9 @@ data class GatewayFrame(
     val code: String? = null,
     val message: String? = null,
     val mode: String? = null,
+    val disposition: String? = null,
     val requestType: String? = null,
+    val queueRequestId: String? = null,
     // sessions 应答：pi SessionInfo 投影
     val items: List<JsonValue>? = null,
     // history 应答：pi 渲染消息 + 条目游标
@@ -97,6 +99,15 @@ data class GatewayFrame(
     val alreadyAt: Boolean? = null,
     val editorText: String? = null,
     val queued: List<String>? = null,
+    // entry-copy 应答（PROTOCOL §4.26，Pi Ctrl+X）：整条 entry 的可复制全文。
+    // 超网关 512 KiB 上限时不带 text、只带 oversized=true + bytes，客户端必须
+    // 明确报“过大未复制”，不能把截断内容当全文粘给用户。
+    val text: String? = null,
+    val oversized: Boolean? = null,
+    // label-put 应答（PROTOCOL §4.27，Pi Shift+L）：写入后的标签值（null=清除）、
+    // 新追加的 LabelEntry id 与写入后的运行时叶子（标签追加会推进叶子）。
+    val label: String? = null,
+    val labelEntryId: String? = null,
     // commands 应答：自定义命令清单（三源，PROTOCOL §4.21）
     val commands: List<GatewaySlashCommand>? = null,
     // 输入辅助（PROTOCOL §4.24–4.25）：queryId 隔离光标/目录/会话的迟到应答。
@@ -235,16 +246,17 @@ data class GatewayHistoryMessage(
     val stopReason: String? = null,
     val errorMessage: String? = null,
     @SerialName("customType") val customType: String? = null,
+    val entryType: String? = null,
     val display: Boolean? = null,
     /** pi 消息自带的 epoch 毫秒（网关原样透传）；缺省或非正表示时间未知。 */
     val timestamp: Double? = null,
     /** assistant 消息的请求模型（pi message.provider/model 原样透传；轨迹详情标题用）。 */
     val provider: String? = null,
     val model: String? = null,
-    /** `role:"custom"` 条目的载荷（如 empty-stop-retry 的 attempt/reason/model）。 */
+    /** 历史来源附带元数据；不据插件自选customType推断业务语义。 */
     val details: JsonValue? = null
 ) {
-    val isDisplayable: Boolean get() = display != false
+    val isDisplayable: Boolean get() = display == true
 }
 
 // ---------------------------------------------------------------------------

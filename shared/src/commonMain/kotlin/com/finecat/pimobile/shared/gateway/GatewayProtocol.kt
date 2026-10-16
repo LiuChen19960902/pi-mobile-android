@@ -358,7 +358,21 @@ object GatewayRequests {
         "aborted",
         sessionId,
         lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
-    ) { put("sessionId", sessionId) }
+    ) {
+        put("sessionId", sessionId)
+        put("restoreQueued", true)
+    }
+
+    /** queueRequestId由调用方生成，须非空白且不超过128字符；UI使用UUID。 */
+    fun dequeue(sessionId: String, queueRequestId: String): GatewayRequest = request(
+        "dequeue", "dequeued", sessionId,
+        correlationId = queueRequestId,
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY,
+    ) {
+        require(queueRequestId.isNotBlank() && queueRequestId.length <= 128)
+        put("sessionId", sessionId)
+        put("queueRequestId", queueRequestId)
+    }
 
     fun message(
         text: String,
@@ -463,6 +477,38 @@ object GatewayRequests {
     ) {
         put("sessionId", sessionId)
         put("entryId", entryId)
+    }
+
+    /** 整条 entry 的可复制全文（pi TUI Ctrl+X，PROTOCOL.md §4.26）。
+     *  响应 `entry-copy` 带 text，或超限时只带 oversized+bytes（不截断充全文）；
+     *  无可复制文本回 `entry-copy-empty` 错误帧。离散用户动作：忙时明确拒绝，
+     *  不静默合并掉上一次未完成的取文。 */
+    fun entryCopy(sessionId: String, entryId: String): GatewayRequest = request(
+        "entry-copy",
+        "entry-copy",
+        sessionId,
+        correlationId = entryId,
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
+    ) {
+        put("sessionId", sessionId)
+        put("entryId", entryId)
+    }
+
+    /** 标签写（pi TUI Shift+L → `appendLabelChange`，PROTOCOL.md §4.27）。
+     *  `label` 为 null / 空白 = 清除标签（Pi LabelInput 语义）；网关只追加
+     *  LabelEntry，targetId 指向 entryId，最后记录生效，并会推进运行时叶子。
+     *  需网关侧 live 会话（先 subscribe），否则 `session-not-found`。 */
+    fun labelPut(sessionId: String, entryId: String, label: String?): GatewayRequest = request(
+        "label-put",
+        "label-put",
+        sessionId,
+        correlationId = entryId,
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
+    ) {
+        put("sessionId", sessionId)
+        put("entryId", entryId)
+        // 写操作不得静默丢：忙时由 Runtime 回 request-busy，客户端提示重试。
+        if (label == null) put("label", JsonNull) else put("label", label)
     }
 
     /** 自定义命令清单（三源聚合，PROTOCOL §4.21）。

@@ -346,25 +346,6 @@ class ConversationDisplayGroupsTest {
         assertTrue(entries[2] is ConversationDisplayEntry.Message)
     }
 
-    @Test
-    fun runningAgentToolsExtractsOnlyUnfinishedAgentCalls() {
-        // toolCallId 有 call、无 result 的 Agent 调用 = 运行中；
-        // 完成的 Agent、普通工具、result 混序都不影响判定。
-        val tools = runningAgentTools(
-            listOf(
-                item("agent-a", ConversationItemKind.TOOL, title = "Agent", toolCallId = "c-a", seconds = 1.0),
-                item("read-call", ConversationItemKind.TOOL, title = "read", toolCallId = "c-read", seconds = 2.0),
-                item("read-result", ConversationItemKind.TOOL_RESULT, toolCallId = "c-read", seconds = 3.0),
-                item("agent-b", ConversationItemKind.TOOL, title = "Agent", toolCallId = "c-b", seconds = 4.0),
-                item("b-result", ConversationItemKind.TOOL_RESULT, toolCallId = "c-b", seconds = 5.0),
-                item("agent-result", ConversationItemKind.TOOL_RESULT, toolCallId = "c-agent", seconds = 9.0)
-            ),
-            nowEpochSeconds = 20.0
-        )
-        // c-b 的 result 先于 c-agent 到达：按 callId 精确摘除，c-a 已完成。
-        assertEquals(1, tools.size)
-        assertEquals("agent-a", tools.single().call?.id)
-    }
 
     @Test
     fun processGroupPairsResultsByToolCallIdBeforeFifo() {
@@ -385,18 +366,6 @@ class ConversationDisplayGroupsTest {
         assertEquals("b-result", process.tools.first { it.call?.id == "b-call" }.result?.id)
     }
 
-    @Test
-    fun runningAgentToolsDropsStaleCallsBeyondThirtyMinutes() {
-        val now = 1_800_000.0 // epoch 秒
-        val tools = runningAgentTools(
-            listOf(
-                item("fresh", ConversationItemKind.TOOL, title = "Agent", toolCallId = "c-fresh", seconds = now - 60.0),
-                item("stale", ConversationItemKind.TOOL, title = "Agent", toolCallId = "c-stale", seconds = now - 3600.0)
-            ),
-            nowEpochSeconds = now
-        )
-        assertEquals(listOf("fresh"), tools.map { it.call?.id })
-    }
 
 
     // ---- F02：助手回合分组（步骤组提到正文前合成回合；回合间 24dp 由渲染层落） ----

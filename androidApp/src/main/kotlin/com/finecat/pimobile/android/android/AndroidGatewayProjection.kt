@@ -37,7 +37,10 @@ private val adapterJson = Json {
  *  （进会话转圈 bug 的根因），消息解码单独放宽未知键。 */
 private val historyMessageJson = Json { ignoreUnknownKeys = true }
 private const val MAX_UPSTREAM_ERROR_CHARACTERS = 240
-private val SESSION_OUTCOME_EVENTS = setOf("assistant/message", "user/message", "turn/start")
+private val SESSION_OUTCOME_EVENTS = setOf(
+    "assistant/message", "user/message", "turn/start",
+    "compact/start", "compact/end", "compact/done", "notice/compact"
+)
 
 /** Android 的 KMP MVI 适配器：history/live 水位与流式 patch 均由现有共享 Store 决定。 */
 internal class AndroidGatewayProjection(
@@ -51,11 +54,21 @@ internal class AndroidGatewayProjection(
     private val historyEvents = mutableMapOf<String, List<SessionEvent>>()
     /** 已由合并后的消息确认的失败；选择会话重载期间保留，显式换分支/重置时失效。 */
     private val failedSessionIds = mutableSetOf<String>()
+    /** 压缩失败不落Pi消息文件；旧历史重载不能用上次成功回答覆盖这次已知失败。 */
+    private val failedCompactionTimes = mutableMapOf<String, Double>()
     /** history 帧 latestEntryId（最新叶子：通常为文件视图、与 getLeafId 同源；
      *  网关并入 live 未落盘尾部时为 live 叶子/活跃链尾，非文件水位）与活跃
      *  链尾条目 id，供“活跃链落后于最新”的跳最新出口比对（1.5.9）。 */
     private val latestLeafEntryIds = mutableMapOf<String, String>()
     private val activeTailEntryIds = mutableMapOf<String, String>()
+    /** 本端写入的、不会投影成 wire message 的叶子 entry id（label-put 追加的 LabelEntry）：
+     *  history 的 `latestEntryId` 是原始文件叶子，而 `entryIds` 只收可渲染消息，
+     *  写标签后两者必然不等，`isBehindLatest` 会误报“跳到最新”（点了还会把
+     *  switch-branch 打到 LabelEntry 上）。这些 id 是我们自己写的，可以确知其
+     *  不渲染，遇它不算落后；后续真有新消息时文件叶子会变成新消息 id，判定自然恢复。
+     *  只覆盖本端写入：其他客户端产生的尾部簿记条目（改会话名/切模型）仍会误报，
+     *  整类归一属 §4.6 语义变更，见 TODO HIST03（隔离工作区原误编号HIST02）。 */
+    private val nonRenderingLeafIds = mutableMapOf<String, MutableSet<String>>()
     private val historyLastSequences = mutableMapOf<String, Int>()
     private val historyHasMore = mutableMapOf<String, Boolean>()
     private val historySessionStates = mutableMapOf<String, HistorySessionState>()
@@ -193,7 +206,10 @@ internal class AndroidGatewayProjection(
     }
 
     private fun clearSessionBuffers(sessionId: String, preserveFailure: Boolean = false) {
-        if (!preserveFailure) failedSessionIds.remove(sessionId)
+        if (!preserveFailure) {
+            failedSessionIds.remove(sessionId)
+            failedCompactionTimes.remove(sessionId)
+        }
         historyStore.clearSession(sessionId)
         conversationStore.clearSession(sessionId)
         historyEvents.remove(sessionId)
@@ -204,6 +220,7 @@ internal class AndroidGatewayProjection(
         historySessionStates.remove(sessionId)
         latestLeafEntryIds.remove(sessionId)
         activeTailEntryIds.remove(sessionId)
+        nonRenderingLeafIds.remove(sessionId)
         conversationItems.remove(sessionId)
         conversationLastSequences.remove(sessionId)
         mobileStore.clearSessionEvents(sessionId)
@@ -215,6 +232,7 @@ internal class AndroidGatewayProjection(
         correlatedSessionId: String?,
         normalizedEvents: List<SessionEvent> = emptyList()
     ): SharedMobileSnapshot {
+        if (frame.kind == "paired") return reset()
         lastFrameKind = frame.kind
         lastError = null
         when (frame.kind) {
@@ -225,7 +243,7 @@ internal class AndroidGatewayProjection(
                 controlSnapshot = mobileStore.acceptFrame(rawJson)
             }
             "event" -> acceptLive(frame, normalizedEvents)
-            "paired", "hello" -> Unit
+            "hello" -> Unit
             "sent" -> {
                 controlSnapshot = mobileStore.acceptFrame(rawJson)
                 // pi：新会话的真实 sessionId 只在 sent 帧里揭晓，而 startHistory 的常规
@@ -252,11 +270,13 @@ internal class AndroidGatewayProjection(
         }
         historyEvents.clear()
         failedSessionIds.clear()
+        failedCompactionTimes.clear()
         historyLastSequences.clear()
         historyHasMore.clear()
         historySessionStates.clear()
         latestLeafEntryIds.clear()
         activeTailEntryIds.clear()
+        nonRenderingLeafIds.clear()
         historySyntheticSeqs.clear()
         historyOldestEntryIds.clear()
         historyStartedSessions.clear()
@@ -286,6 +306,10 @@ internal class AndroidGatewayProjection(
         conversationSubscription.cancel()
     }
 
+    fun historyRejected(sessionId: String, code: String) {
+        failHistoryLoad(sessionId, code)
+    }
+
     fun historyTimedOut(sessionId: String) {
         historyStore.timedOut(sessionId)
         flushPendingLatestReload(sessionId)
@@ -307,7 +331,19 @@ internal class AndroidGatewayProjection(
     internal fun isBehindLatest(sessionId: String): Boolean {
         val latest = latestLeafEntryIds[sessionId] ?: return false
         val tail = activeTailEntryIds[sessionId] ?: return false
-        return latest != tail
+        if (latest == tail) return false
+        // 文件叶子只是本端写出的不渲染条目（标签）：没有“更新的消息”可跳，不算落后。
+        if (latest in nonRenderingLeafIds[sessionId].orEmpty()) return false
+        return true
+    }
+
+    /** 记录本端写入的不渲染叶子（label-put 的 LabelEntry），见字段注释。
+     *  线程前置条件：只能在 Main（projection actor 的 uiDispatcher/mutationLock
+     *  上下文，即 afterFramePublish 路径）调用；生产路径下 projection 的其余
+     *  变更都经 actor 串行，不要在 graph != null 时从其它线程直调（审查B风险4）。 */
+    internal fun markNonRenderingLeaf(sessionId: String, entryId: String) {
+        if (entryId.isBlank()) return
+        nonRenderingLeafIds.getOrPut(sessionId) { mutableSetOf() }.add(entryId)
     }
 
     internal fun latestEntryId(sessionId: String): String? = latestLeafEntryIds[sessionId]
@@ -352,7 +388,7 @@ internal class AndroidGatewayProjection(
         }
         historyFailures.remove(sessionId)
         historyHasMore[sessionId] = frame.hasMore == true
-        updateFailureOutcome(sessionId)
+        updateFailureOutcome(sessionId, fromHistory = true)
         conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()))
         flushPendingLatestReload(sessionId)
     }
@@ -428,39 +464,14 @@ internal class AndroidGatewayProjection(
                     name = message.toolName,
                     preview = PiEventNormalizer.textOf(message.content)
                 )
-                "custom" -> when (message.customType) {
-                    // 历史重建还原实时路径的"上游错误可见"提示（与 PiEventNormalizer
-                    // 的 entry_appended 归一一致）：只显示首次，避免重试刷屏。
-                    // 该 customType 由 empty-stop-guard 一类扩展写入（非 pi 原生）。
-                    //
-                    // 扩展会写两种形态：带 data 的 custom entry（真实提示）与
-                    // display=false 的 custom_message（注入给模型的隐藏续跑指令）。
-                    // 后者必须跳过——pi 契约里 display=false 表示完全隐藏（TUI 同样
-                    // 不渲染），否则翻历史会多出一条假的"上游没有返回可见正文"错误。
-                    "empty-stop-retry" -> {
-                        if (!message.isDisplayable) {
-                            null
-                        } else {
-                            val attempt = message.details?.get("attempt")?.doubleValue ?: 1.0
-                            if (attempt > 1.0) {
-                                null
-                            } else {
-                                val reason = message.details?.get("reason")?.stringValue?.trim().orEmpty()
-                                GatewayEvent(
-                                    type = "notice/upstream",
-                                    text = reason.take(240).ifEmpty { "上游没有返回可见正文" },
-                                    isError = true
-                                )
-                            }
-                        }
-                    }
-                    // pi 历史重建里的压缩痕迹：对齐 TUI 的 `[compaction: Nk tokens]` 行，
-                    // 也与实时侧 entry_appended(compaction) 的归一一致。
+                "custom" -> if (!message.isDisplayable) null else when (message.entryType) {
                     "compaction" -> {
                         val tokensBefore = message.details?.get("tokensBefore")?.doubleValue
                         val tokens = tokensBefore?.let { (it / 1000).toInt().coerceAtLeast(1) }
                         GatewayEvent(type = "compact/done", text = tokens?.let { "压缩前 ${it}k tokens" })
                     }
+                    null, "custom_message", "wire_oversized" -> PiEventNormalizer.textOf(message.content)
+                        .takeIf(String::isNotBlank)?.let { GatewayEvent(type = "notice/custom", text = it) }
                     else -> null
                 }
                 else -> null
@@ -518,10 +529,24 @@ internal class AndroidGatewayProjection(
     }
 
     /** 只用当前分支的已合并消息；旧页、工具报错和网络错误不能覆写最新结果。 */
-    private fun updateFailureOutcome(sessionId: String) {
-        val outcome = historyEvents[sessionId]?.lastOrNull { it.event.type in SESSION_OUTCOME_EVENTS }?.event
-        if (outcome?.type == "assistant/message" && outcome.isError == true) failedSessionIds.add(sessionId)
+    private fun updateFailureOutcome(sessionId: String, fromHistory: Boolean = false) {
+        val knownFailureTime = failedCompactionTimes[sessionId]
+        val outcomes = historyEvents[sessionId].orEmpty().filter { it.event.type in SESSION_OUTCOME_EVENTS }
+        // 旧live seq可能排在新拉到的历史之后；已知压缩失败按同一宿主时间对账。
+        val record = if (fromHistory && knownFailureTime != null) {
+            outcomes.maxByOrNull { historyEpochSeconds(it.time) }
+        } else outcomes.lastOrNull()
+        if (fromHistory && knownFailureTime != null && historyEpochSeconds(record?.time) <= knownFailureTime) return
+        val outcome = record?.event
+        val failed = outcome?.isError == true && (outcome.type == "assistant/message" ||
+            (outcome.type == "notice/compact" && outcome.reason !in setOf("aborted", "declined")))
+        if (failed) failedSessionIds.add(sessionId)
         else failedSessionIds.remove(sessionId)
+        if (failed && outcome?.type == "notice/compact") {
+            failedCompactionTimes[sessionId] = historyEpochSeconds(record?.time)
+        } else {
+            failedCompactionTimes.remove(sessionId)
+        }
     }
 
     private fun acceptHistoryMviEvent(event: SharedMviEvent) {

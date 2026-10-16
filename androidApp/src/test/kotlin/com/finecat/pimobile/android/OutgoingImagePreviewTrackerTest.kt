@@ -18,6 +18,19 @@ import org.junit.Test
  */
 class OutgoingImagePreviewTrackerTest {
     @Test
+    fun handledConsumesOnlyItsOwnPreviewWithoutWaitingForUserEcho() {
+        val tracker = OutgoingImagePreviewTracker()
+        for (token in listOf("handled", "other")) {
+            tracker.begin(token, "s-1", 0L, "draft", images(token), restoreImages(token))
+        }
+        tracker.trackAwaiting("handled", "s-1")
+        assertEquals("handled", tracker.consumeSent("s-1", 10L, sdkAccepted = true)?.sendToken)
+        assertNull(tracker.headAwaitingToken())
+        assertEquals(listOf("other"), tracker.previews.map { it.sendToken })
+        assertNull(tracker.settleLocalFailure("handled"))
+    }
+
+    @Test
     fun terminalPreviewsBeyondTheCapAreEvictedOldestFirst() {
         val tracker = OutgoingImagePreviewTracker()
         (1..8).forEach { index -> failedSend(tracker, "send-$index", "s-1") }

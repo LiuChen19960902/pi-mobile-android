@@ -104,6 +104,11 @@ internal class AndroidProjectionActor(
     suspend fun reset(afterPublish: () -> Unit = {}) =
         mutate(afterPublish = afterPublish, mutation = projection::reset)
 
+    suspend fun historyRejected(sessionId: String, code: String) = mutate {
+        projection.historyRejected(sessionId, code)
+        projection.snapshot()
+    }
+
     suspend fun historyTimedOut(sessionId: String) = mutate {
         projection.historyTimedOut(sessionId)
         projection.snapshot()

@@ -12,6 +12,19 @@ import com.finecat.pimobile.shared.protocol.GatewayProvider
 import com.finecat.pimobile.shared.protocol.GatewayProviderModel
 import com.finecat.pimobile.shared.protocol.JsonValue
 
+/** 当前应用运行期间的离线草稿；密钥不进入Bundle或本地持久化。 */
+internal class ProviderEditorDraft(
+    val initialProvider: GatewayProvider?,
+    val id: String,
+    val name: String,
+    val baseUrl: String,
+    val apiKey: String,
+    val rows: List<ProviderModelDraft>,
+    val modelViewOrder: List<String>,
+) {
+    override fun toString(): String = "ProviderEditorDraft(<redacted>)"
+}
+
 /**
  * P10a/P10b FineCat Provider 表单的纯逻辑（无 Compose，JVM 可测）。
  *
@@ -20,6 +33,10 @@ import com.finecat.pimobile.shared.protocol.JsonValue
  * UI 里改，测试结论的判定口径不会分叉）。
  */
 internal object FineCatProviderForm {
+
+    // Pi SDK 1.0.4 自定义模型的缺省容量，不代表上游已声明的真实能力。
+    const val DEFAULT_CONTEXT_WINDOW = 128_000L
+    const val DEFAULT_MAX_TOKENS = 16_384L
 
     /** 保存改动包含全部模型草稿；连接测试指纹只负责测试有效性，视图顺序不参与。 */
     fun hasChanges(
@@ -76,14 +93,6 @@ internal object FineCatProviderForm {
     fun idLocked(existing: GatewayProvider?, row: ProviderModelDraft): Boolean =
         row.id in existing?.models.orEmpty().map { it.id }
 
-    /**
-     * 「待配置」的唯一判据（行内标记与保存拦截共用，不会出现标了红却还能存）：
-     * 这一行不在 existing 里（手动新增或从上游拉回来的）、填了 id 却没填上下文窗口。
-     * 已有模型缺窗口是 pi 走目录默认，按原样保留，不算没配好。
-     */
-    fun unconfigured(existing: GatewayProvider?, row: ProviderModelDraft): Boolean =
-        row.id.isNotBlank() && row.contextWindow.isBlank() && !idLocked(existing, row)
-
     /** 拉取上游时给新模型的协议：跟当前表单走，空表回落到默认方言。 */
     fun pullApi(rows: List<ProviderModelDraft>): String =
         rows.firstOrNull()?.api?.takeIf(String::isNotBlank) ?: PROVIDER_DEFAULT_API
@@ -113,15 +122,15 @@ internal object FineCatProviderForm {
      * 返回 `null` 表示可以提交（[ParsedProviderModels.rows] 即下发内容）；
      * 非 null 是必须**行内可见**的错误——不静默 0、不丢弃该行、也不关表单。
      *
-     * 数值：空白=未设置（网关保留已存值），K/M/原始数字按 shared 同一倍率解析；
+     * 数值：已有模型空白=保留，新模型空白=SDK缺省；K/M/原始数字按 shared 同一倍率解析；
      * `compat` 是三态（`DEC-F09-COMPAT`）：**没动过 → 整个字段不下发**（网关按合并语义
      * 原样保留电脑上那一层）；动过 → 手机是权威的，草稿里没有的键会被清除，整表为空则
      * 清空所有手机管理的键。序列化顺序按协议键集声明顺序冻结，见 [FineCatCompat.orderedForWire]。
      * 两种情况都**不发显式 null**（网关 `normalizeCompat` 直接跳过 null 条目，且未知键被丢弃，
      * 发 null 与省略等价，但没有理由多发一个会被跳过的键）。
      *
-     * [existing] 用来区分「新行」和「已有行」：新行必须补齐上下文窗口才允许进
-     * models（拉回来只标待配置却能存 = 把没配好的模型直接落盘）；已有行留空照旧放行。
+     * [existing] 用来区分新旧模型：新行容量留空使用可编辑的 SDK 缺省值；
+     * 已有行留空不发该字段，由网关保留原配置。不要求目录元数据或电脑端认证。
      */
     fun parseModels(
         rows: List<ProviderModelDraft>,
@@ -144,12 +153,6 @@ internal object FineCatProviderForm {
             ) {
                 return ParsedProviderModels(error = "$modelId: 模型地址应以 http:// 或 https:// 开头，留空可继承 Provider。")
             }
-            if (unconfigured(existing, row = draft.copy(id = modelId))) {
-                return ParsedProviderModels(
-                    error = "$modelId 还没填上下文窗口：新添加/从上游拉回来的模型要配好才能保存。" +
-                        "已有模型可以留空（沿用电脑端已存值），这一条不行。",
-                )
-            }
             val contextWindow = ModelNumberParsing.parseTokenCount(draft.contextWindow)
             if (contextWindow is ModelNumberResult.Invalid) {
                 return ParsedProviderModels(error = "$modelId: 上下文窗口 ${contextWindow.message}")
@@ -158,11 +161,14 @@ internal object FineCatProviderForm {
             if (maxTokens is ModelNumberResult.Invalid) {
                 return ParsedProviderModels(error = "$modelId: 最大输出 ${maxTokens.message}")
             }
+            val isNew = !idLocked(existing, draft.copy(id = modelId))
             upserts += ProviderModelUpsert(
                 id = modelId,
                 name = draft.name.trim().takeIf(String::isNotEmpty),
-                contextWindow = (contextWindow as? ModelNumberResult.Ok)?.value,
-                maxTokens = (maxTokens as? ModelNumberResult.Ok)?.value,
+                contextWindow = (contextWindow as? ModelNumberResult.Ok)?.value
+                    ?: DEFAULT_CONTEXT_WINDOW.takeIf { isNew },
+                maxTokens = (maxTokens as? ModelNumberResult.Ok)?.value
+                    ?: DEFAULT_MAX_TOKENS.takeIf { isNew },
                 reasoning = draft.reasoning,
                 supportsImages = draft.imageOn,
                 // 协议逐模型显式下发（pi 只按 model.api 分派流实现），新模型不再传空串。

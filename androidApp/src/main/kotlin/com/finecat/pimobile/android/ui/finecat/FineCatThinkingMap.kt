@@ -5,7 +5,7 @@ import com.finecat.pimobile.shared.protocol.GatewayModelCatalog
 
 /**
  * 思考映射草稿：键来自Pi七档枚举，值为上游字符串或显式null。
- * 初始显示目录档位与已有映射键的并集，保留被null过滤出目录的既有项。
+ * 编辑器提供完整标准档位，不以模型目录声明作为编辑前置；已有映射原样保留。
  * 2026-10-08负责人要求键和值均可编辑；改键整体提交映射，不覆盖其他列。
  *
  * 网关provider-put：整个map省略或空map归一化后保留宿主映射；非空map整体替换，
@@ -21,18 +21,17 @@ internal object FineCatThinkingMap {
     const val UNSUPPORTED = "-"
 
     /**
-     * 「未设置」在单元格里的显示字形。它只用于展示，但用户可能照着敲进输入框；那样会被当成
+     * 「默认」在单元格里的显示字形。它只用于展示，但用户可能照着敲进输入框；那样会被当成
      * 一个真实取值原样下发，与所见（未设置）矛盾，所以提交时与 [UNSET]/[UNSUPPORTED] 一起拒绝。
      */
-    const val UNSET_GLYPH = "—"
+    const val UNSET_GLYPH = "默认"
 
     /** 这一档是否真的已配置（显式 null 也算已配置——它是一条会被下发的 override）。 */
     private fun String.isConfigured(): Boolean = isNotBlank()
 
     /**
      * 该模型在**目录帧**里真实声明的档位；`null` = 目录里查不到这个模型
-     * （没认证、不在 `enabledModels` 白名单、或 `models` 帧没到），此时**不知道**它有哪些
-     * 档位，不能拿全集或演示数据顶替。
+     * （没认证、或 `models` 帧没到）。这仍是目录事实；编辑器提供标准键不代表模型支持它们。
      */
     fun declaredLevels(
         catalog: GatewayModelCatalog?,
@@ -71,12 +70,6 @@ internal object FineCatThinkingMap {
         /** 模型不支持推理：没有强度可映射（原型 `mpBlock` 第一分支）。 */
         data object NoReasoning : Plan
 
-        /** 目录帧里查不到这个模型，读不到它真实声明了哪些档位。 */
-        data object ModelNotInCatalog : Plan
-
-        /** 查到了，但它没有声明任何推理档位（原型 `mpBlock` 第二分支）。 */
-        data object NoDeclaredLevels : Plan
-
         /** 一档一列。 */
         data class Columns(val columns: List<Column>) : Plan
     }
@@ -110,9 +103,7 @@ internal object FineCatThinkingMap {
         displayLevels: List<String>? = null,
     ): Plan {
         if (!reasoning) return Plan.NoReasoning
-        if (declared == null) return Plan.ModelNotInCatalog
-        val levels = displayLevels ?: orderedLevels(declared, draftMap.keys)
-        if (levels.isEmpty()) return Plan.NoDeclaredLevels
+        val levels = displayLevels ?: editableLevels(declared, draftMap.keys)
         return Plan.Columns(
             levels.map { level ->
                 Column(
@@ -123,6 +114,10 @@ internal object FineCatThinkingMap {
             },
         )
     }
+
+    /** 标准键是编辑选项；不补写 override，也不把它们当目录能力声明。 */
+    fun editableLevels(declared: List<String>?, existingKeys: Set<String>): List<String> =
+        orderedLevels(PI_THINKING_LEVELS + declared.orEmpty(), existingKeys)
 
     /**
      * 列顺序 = pi 档位顺序（[PI_THINKING_LEVELS]）：声明的与已存的都在同一轮里按 pi 次序
@@ -146,14 +141,23 @@ internal object FineCatThinkingMap {
     /** 该档当前在草稿里的编码；键缺失与空串都归一为 [UNSET]。 */
     fun targetOf(draftMap: Map<String, String>, level: String): String = draftMap[level] ?: UNSET
 
-    /** 改键保留其取值及所有其他映射；重复键拒绝，不能静默覆盖另一列。 */
+    /** 改键可占用尚未配置的标准档位；已有实值或 null 不得被覆盖。 */
     fun renameLevel(draftMap: Map<String, String>, displayed: List<String>, from: String, to: String): Map<String, String>? {
-        if (from !in displayed || to !in PI_THINKING_LEVELS) return null
+        if (from !in displayed) return null
         if (from == to) return draftMap
-        if (to in displayed || to in draftMap) return null
+        if (to !in PI_THINKING_LEVELS) return null
+        if (targetOf(draftMap, to).isConfigured()) return null
         val target = draftMap[from] ?: return draftMap
         return (draftMap - from) + (to to target)
     }
+
+    /** 目标标准键已有默认列时交换位置，保持完整键集且不产生重复列。 */
+    fun renamedColumns(displayed: List<String>, from: String, to: String): List<String> =
+        displayed.map { when (it) { from -> to; to -> from; else -> it } }
+
+    fun keyChoices(draftMap: Map<String, String>, current: String): List<String> =
+        (PI_THINKING_LEVELS + current).distinct()
+            .filter { it == current || !targetOf(draftMap, it).isConfigured() }
 
     /** SDK通用强度字面值加实际配置值；任意上游自定义串仍可手填。 */
     fun targetChoices(draftMap: Map<String, String>): List<String> =
@@ -182,19 +186,16 @@ internal object FineCatThinkingMap {
     fun applyUnsupported(draftMap: Map<String, String>, level: String): Map<String, String> =
         draftMap + (level to UNSUPPORTED)
 
-    /** 单元格显示文本：[UNSET] 用破折号表示「不下发」，[UNSUPPORTED] 显示 `null`。 */
+    /** 未设置 override 时由 SDK 按协议处理默认映射；显式 null 与它不同。 */
     fun displayTarget(target: String): String = when {
         target == UNSUPPORTED -> "null"
         target.isBlank() -> UNSET_GLYPH
         else -> target
     }
 
-    /** 空态文案（原型 `mpBlock` 的两条 `f-note`；第三种是我们自己的诚实说明）。 */
+    /** 只由用户关闭推理能力产生空态；目录缺失不阻止编辑。 */
     fun emptyHint(plan: Plan): String? = when (plan) {
         is Plan.NoReasoning -> "这个模型不支持推理，没有强度可映射。"
-        is Plan.NoDeclaredLevels -> "这个模型还没声明有哪些强度档位。"
-        is Plan.ModelNotInCatalog ->
-            "模型目录里没有这个模型，读不到它真实声明的档位。先在电脑上认证并启用它，再回来编辑。"
         is Plan.Columns -> null
     }
 

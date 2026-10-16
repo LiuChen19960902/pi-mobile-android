@@ -1,5 +1,7 @@
 package com.finecat.pimobile.android.ui.finecat
 
+import com.finecat.pimobile.shared.gateway.GatewayErrorText
+
 import android.os.SystemClock
 import android.util.Log
 import androidx.activity.compose.BackHandler
@@ -114,7 +116,6 @@ import com.finecat.pimobile.android.ui.attachmentIdsByRoundKey
 import com.finecat.pimobile.android.ui.displayRoundKey
 import com.finecat.pimobile.android.ui.isTimelinePinnedToBottom
 import com.finecat.pimobile.android.ui.makeConversationDisplayEntries
-import com.finecat.pimobile.android.ui.runningAgentTools
 import com.finecat.pimobile.android.ui.scrollToTimelineBottom
 import com.finecat.pimobile.android.ui.shouldPublishPinnedState
 import com.finecat.pimobile.android.ui.shouldScrollToLatest
@@ -229,6 +230,18 @@ fun FineCatApp(
     stateHolder: AndroidSharedStateHolder,
     onPickImage: () -> Unit = {},
     modifier: Modifier = Modifier,
+) {
+    androidx.compose.runtime.key(stateHolder.gatewayUiEpoch) {
+        FineCatAppContent(stateHolder, onPickImage, modifier)
+    }
+    FineCatCrashReportDialog(darkTheme = isFineCatDark(stateHolder.appearanceMode))
+}
+
+@Composable
+private fun FineCatAppContent(
+    stateHolder: AndroidSharedStateHolder,
+    onPickImage: () -> Unit,
+    modifier: Modifier,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     // 最近照片托盘的媒体权限（02 §6 行 2）：未授权先弹系统框，拒绝降级系统选择器
@@ -703,7 +716,9 @@ fun FineCatApp(
                     FcHeader(
                         modifier = Modifier.onGloballyPositioned { treeHeaderPx = it.size.height },
                         title = selectedSession?.title.orEmpty().ifEmpty { "FineCat" },
-                        showConnectionDot = connected,
+                        // TREE05/CHAT08：树页标题不挂绿色连接点（与对话页/首页同口径）。
+                        // 连接状态只在设置页读，树行自己的活动/当前标识不受影响。
+                        showConnectionDot = false,
                         leading = {
                             com.finecat.pimobile.android.ui.finecat.components.FcIconButton(
                                 onClick = { drawerOpen = true },
@@ -819,30 +834,6 @@ fun FineCatApp(
                         }
                     },
                 )
-                // 扩展运行条（R25 保留决定：迁到新样式；Agent 工具来自 pi-subagents 类扩展）
-                val runningAgentToolsList = remember(snapshot.conversation) {
-                    runningAgentTools(snapshot.conversation)
-                }
-                if (runningAgentToolsList.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp)
-                            .testTag("finecat.agentStrip"),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        FcStatusTag(text = "扩展运行中", style = FcTagStyle.Wait)
-                        Text(
-                            text = runningAgentToolsList.joinToString(" · ") { tool ->
-                                tool.call?.title?.ifBlank { null } ?: "Agent"
-                            },
-                            style = LocalFineCatType.current.xs,
-                            color = colors.text3,
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                }
                 if (sessionState?.isCompacting == true) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
@@ -853,7 +844,7 @@ fun FineCatApp(
                 }
                 // 全局瞬态提示（对话页原位，tree 页由 GlobalTransientNotice 同步可见）
                 GlobalTransientNotice(stateHolder = stateHolder)
-                // 未确认/失败图片发送的恢复条（P4d 保留入口）
+                // 失败/未确认发送的恢复条；已有会话纯文本明确被拒也可手动取回。
                 stateHolder.outgoingPreviews.forEach { preview ->
                     val visibleHere = preview.isVisibleFor(
                         snapshot.selectedSessionId,
@@ -873,9 +864,9 @@ fun FineCatApp(
                         ) {
                             Text(
                                 text = if (preview.state == com.finecat.pimobile.android.OutgoingImagePreviewState.FAILED) {
-                                    "图片发送失败"
+                                    if (preview.images.isEmpty()) "消息发送失败" else "图片发送失败"
                                 } else {
-                                    "图片发送未确认"
+                                    if (preview.images.isEmpty()) "消息发送未确认" else "图片发送未确认"
                                 },
                                 style = LocalFineCatType.current.xs,
                                 color = colors.text2,
@@ -884,6 +875,7 @@ fun FineCatApp(
                             FcTextButton(
                                 text = "恢复草稿",
                                 onClick = { stateHolder.restoreOutgoingPreviewDraft(preview.sendToken) },
+                                enabled = stateHolder.canRestoreOutgoingDraft,
                             )
                         }
                     }
@@ -916,7 +908,7 @@ fun FineCatApp(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(
-                                        text = "更早记录加载失败：${historyError.orEmpty()}",
+                                        text = GatewayErrorText.request("history", historyError),
                                         style = LocalFineCatType.current.xs,
                                         color = colors.err,
                                         modifier = Modifier.weight(1f),
@@ -987,9 +979,13 @@ fun FineCatApp(
                                         onRetryImage = stateHolder::retryAttachment,
                                         onOpenImage = { attachments, index -> imagePreview = ConversationImagePreviewRequest(attachments, index) },
                                         onCopyText = { entryId, text ->
-                                            clipboard.setText(AnnotatedString(text))
-                                            copiedMessageId = entryId
-                                            copiedTick += 1
+                                            try {
+                                                clipboard.setText(AnnotatedString(text))
+                                                copiedMessageId = entryId
+                                                copiedTick += 1
+                                            } catch (_: Exception) {
+                                                stateHolder.notifyUser("复制失败，请重试")
+                                            }
                                         },
                                         onOpenGroup = { groupId ->
                                             pinnedToBottom = false
@@ -1142,6 +1138,14 @@ fun FineCatApp(
                             style = LocalFineCatType.current.xs,
                             color = colors.text3,
                         ) }
+                        if ("dequeue" in stateHolder.gatewayState.capabilities) {
+                            FcTextButton(
+                                text = if (queued.steering.size + queued.followUp.size > 1) "全部撤回到输入框" else "撤回到输入框",
+                                onClick = stateHolder::recallQueuedMessages,
+                                enabled = stateHolder.canRecallQueuedMessages,
+                                modifier = Modifier.align(Alignment.End).testTag("finecat.queued.recall"),
+                            )
+                        }
                     }
                 }
                 FcComposer(
@@ -1303,7 +1307,9 @@ fun FineCatApp(
                     onBack = { gatewaySheetOpen = false },
                     onOpenScanner = { showQrScanner = true },
                     onOpenManualPairing = { showManualPairing = true },
-                    onEditProvider = { id -> providerEditId = id },
+                    onEditProvider = { id ->
+                        if (stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED) providerEditId = id
+                    },
                     modifier = Modifier.statusBarsPadding(),
                 )
             }
@@ -1340,10 +1346,10 @@ fun FineCatApp(
                 onDismiss = { drawerOpen = false },
                 onOpenSettings = { gatewaySheetOpen = true },
                 onOpenTheme = { stateHolder.updateAppearanceMode(if (colors.isDark) "light" else "dark") },
-                // 新建：从已有会话退出时沿用其工作区（prepareNewSession(cwd)）；
-                // 空白页再点则保留既有沿用值（holder 文档语义）。
-                onNewSession = {
-                    val cwd = if (showHome) stateHolder.fineCatNewSessionDirectoryPath else selectedSession?.cwd
+                // 具体目录药丸优先；“全部”沿用首页选择或当前会话目录。
+                onNewSession = { directory ->
+                    val cwd = directory?.takeIf(String::isNotBlank)
+                        ?: if (showHome) stateHolder.fineCatNewSessionDirectoryPath else selectedSession?.cwd
                     dismissComposer()
                     drawerOpen = false
                     selectedView = 0
@@ -1408,6 +1414,31 @@ fun FineCatApp(
                     onDismiss = { heroEditorOpen = false },
                 )
             }
+            stateHolder.branchDraftConfirmation?.let {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = stateHolder::dismissBranchDraftConfirmation,
+                    containerColor = colors.surface,
+                    titleContentColor = colors.text,
+                    textContentColor = colors.text2,
+                    modifier = Modifier.testTag("finecat.branchDraftConfirmation"),
+                    title = { Text("保留未发送内容？", style = LocalFineCatType.current.title) },
+                    text = { Text("跳转后可保留当前草稿，或改用节点内容。", style = LocalFineCatType.current.sm) },
+                    confirmButton = {
+                        FcTextButton(
+                            text = "使用节点内容",
+                            onClick = { stateHolder.confirmBranchDraftNavigation(useNodeDraft = true) },
+                            modifier = Modifier.testTag("finecat.branchDraftReplace"),
+                        )
+                    },
+                    dismissButton = {
+                        FcTextButton(
+                            text = "保留草稿",
+                            onClick = { stateHolder.confirmBranchDraftNavigation(useNodeDraft = false) },
+                            modifier = Modifier.testTag("finecat.branchDraftKeep"),
+                        )
+                    },
+                )
+            }
             // P4d：全局错误（R24）——定向动作按 action 类型，不把所有错误都接重连
             stateHolder.platformError?.let { error ->
                 androidx.compose.material3.AlertDialog(
@@ -1419,8 +1450,7 @@ fun FineCatApp(
                             AndroidSharedStateHolder.PlatformErrorAction.RETRY_DIRECTORY -> FcTextButton(
                                 text = "重试",
                                 onClick = {
-                                    stateHolder.clearPlatformError()
-                                    stateHolder.browseDirectories(stateHolder.directoryPath)
+                                    stateHolder.retryDirectoryBrowsing()
                                 },
                             )
                             AndroidSharedStateHolder.PlatformErrorAction.RECONNECT -> FcTextButton(
@@ -1439,11 +1469,42 @@ fun FineCatApp(
                 )
             }
             contextAnchor?.takeIf { composerControlsExpanded }?.let { anchor ->
+                val compactReady = stateHolder.canStartManualCompact()
+                // 禁用原因（R6）：与 canStartManualCompact 的闸门同源，按序取首个命中的原因。
+                val compactDisabledReason = if (compactReady) null else if (
+                    stateHolder.gatewayState.connection != GatewayConnectionState.CONNECTED
+                ) {
+                    "连接网关后可压缩上下文"
+                } else if (!stateHolder.supportsRequest("compact")) {
+                    "网关不支持手动压缩，请升级网关"
+                } else if (snapshot.selectedSessionId == null) {
+                    "选择会话后可压缩上下文"
+                } else {
+                    "当前状态暂不能压缩（压缩中/在途/撤回停止中）"
+                }
                 FcContextPopover(
                     anchor = anchor,
                     usage = sessionState?.contextUsage,
                     isCompacting = sessionState?.isCompacting == true,
                     onDismiss = { contextAnchor = null },
+                    // CTX02：真实压缩入口；「会中止当前回答」说明行在浮层按钮上方。
+                    onCompact = if (compactReady) {
+                        {
+                            contextAnchor = null
+                            stateHolder.startManualCompact()
+                        }
+                    } else null,
+                    // 仅已选会话且有统计对象时才可补拉；新会话/空白页无从刷新（M3）。
+                    onRefreshUsage = if (snapshot.selectedSessionId != null &&
+                        sessionState?.contextUsage != null &&
+                        stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED
+                    ) {
+                        { stateHolder.refreshSessionControls() }
+                    } else null,
+                    usageIsUnknown = sessionState?.contextUsage?.let {
+                        it.percent == null && it.tokens == null
+                    } == true,
+                    compactDisabledReason = compactDisabledReason,
                 )
             }
             // 模型目录和即时选择语义保持；底部面板独立于输入框焦点，外点/返回关闭。
@@ -1451,6 +1512,15 @@ fun FineCatApp(
                 LaunchedEffect(modelSheetOpen) { if (modelSheetOpen) stateHolder.refreshModelCatalog() }
                 FcModelPicker(
                     catalog = snapshot.modelCatalog,
+                    onRetry = if (stateHolder.modelCatalogError != null &&
+                        stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED
+                    ) stateHolder::refreshModelCatalog else null,
+                    emptyText = when {
+                        stateHolder.gatewayState.connection != GatewayConnectionState.CONNECTED -> "网关未连接"
+                        stateHolder.modelCatalogIsLoading -> "模型加载中…"
+                        stateHolder.modelCatalogError != null -> stateHolder.modelCatalogError!!
+                        else -> "暂无可用模型"
+                    },
                     current = effectiveModel,
                     currentThinking = effectiveThinking,
                     onSelect = { provider, modelId, level ->

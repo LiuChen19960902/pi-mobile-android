@@ -6,10 +6,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.assertIsNotFocused
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performTextReplacement
@@ -33,6 +35,7 @@ import com.finecat.pimobile.android.FakeTransport
 import com.finecat.pimobile.android.waitUntil
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -92,6 +95,82 @@ class FineCatHomeInteractionDeviceTest {
             waitUntil { holder.snapshot.conversation.size == 12 }
         }
         compose.waitForIdle()
+    }
+
+    @Test
+    fun rejectedExistingText_showsManualRecovery_preservesNewDraft_andDoesNotResend() {
+        showHistory()
+        compose.runOnIdle {
+            holder.messageDraft = "失败恢复合成原稿"
+            holder.sendMessage()
+        }
+        runBlocking { waitUntil { transport.payloadsOfType("message").size == 1 } }
+        runBlocking {
+            transport.receive("""{"kind":"error","requestType":"message","sessionId":"history-ime","code":"future-message-rejection"}""")
+        }
+        compose.waitUntil(5_000) { holder.outgoingPreviews.size == 1 }
+        compose.runOnIdle { assertEquals("失败恢复合成原稿", holder.messageDraft) }
+        compose.onNodeWithText("好").performClick()
+        compose.onNodeWithText("消息发送失败").assertIsDisplayed()
+        compose.runOnIdle { holder.messageDraft = "发送后新写的草稿" }
+        compose.onNodeWithText("恢复草稿").assertIsNotEnabled()
+        compose.runOnIdle { assertEquals("发送后新写的草稿", holder.messageDraft) }
+        compose.runOnIdle { holder.messageDraft = "" }
+        compose.onNodeWithText("恢复草稿").performClick()
+        compose.runOnIdle {
+            assertEquals("失败恢复合成原稿", holder.messageDraft)
+            assertTrue(holder.outgoingPreviews.isEmpty())
+        }
+        assertEquals("恢复不是重发", 1, transport.payloadsOfType("message").size)
+    }
+
+    @Test
+    fun recallingRemoteQueueKeepsWorkingAndRestoresDraftWithoutAbortOrResend() {
+        showHistory()
+        runBlocking {
+            transport.receive("""{"kind":"hello","capabilities":["dequeue"],"sessions":[]}""")
+            graph.gatewayRuntime.requestState("history-ime")
+            transport.receive("""{"kind":"state","sessionId":"history-ime","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":["注入稿"],"followUp":["追加稿"]}}""")
+            waitUntil { holder.snapshot.sessionStates["history-ime"]?.queuedMessages?.followUp?.size == 1 }
+        }
+        compose.runOnIdle { holder.messageDraft = "已有新稿" }
+        compose.onNodeWithTag("finecat.queued.recall").performClick()
+        runBlocking {
+            waitUntil { transport.payloadsOfType("dequeue").size == 1 }
+            val request = transport.payloadsOfType("dequeue").single()
+            val requestId = request.getValue("queueRequestId").jsonPrimitive.content
+            transport.receive("""{"kind":"dequeued","sessionId":"history-ime","queueRequestId":"$requestId","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["注入稿","追加稿"]}""")
+            waitUntil { holder.messageDraft == "注入稿\n\n追加稿\n\n已有新稿" }
+        }
+        compose.onNodeWithTag("finecat.queued").assertDoesNotExist()
+        compose.onNodeWithTag("finecat.workingText").assertIsDisplayed()
+        compose.runOnIdle { assertTrue(holder.snapshot.sessionStates.getValue("history-ime").isStreaming) }
+        assertEquals(0, transport.payloadsOfType("message").size)
+        assertEquals(0, transport.payloadsOfType("abort").size)
+    }
+
+    @Test
+    fun stoppingAcceptedFollowUpRemovesWorkingAndRestoresTextWithoutSendingAgain() {
+        showHistory()
+        runBlocking {
+            graph.gatewayRuntime.requestState("history-ime")
+            transport.receive("""{"kind":"state","sessionId":"history-ime","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":["尚未执行的追加稿"]}}""")
+            waitUntil { holder.snapshot.sessionStates["history-ime"]?.queuedMessages?.followUp?.size == 1 }
+        }
+        compose.onNodeWithText("Follow-up: 尚未执行的追加稿").assertIsDisplayed()
+        compose.onNodeWithContentDescription("停止生成").performClick()
+        runBlocking {
+            waitUntil { transport.payloadsOfType("abort").size == 1 }
+            transport.receive("""{"kind":"aborted","sessionId":"history-ime","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["尚未执行的追加稿"]}""")
+            waitUntil { holder.messageDraft == "尚未执行的追加稿" }
+        }
+        compose.onNodeWithTag("finecat.queued").assertDoesNotExist()
+        compose.onNodeWithTag("finecat.workingText").assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals("尚未执行的追加稿", holder.messageDraft)
+            assertFalse(holder.snapshot.sessionStates.getValue("history-ime").isStreaming)
+        }
+        assertEquals("停止恢复不得自动重发", 0, transport.payloadsOfType("message").size)
     }
 
     private fun imeVisible(): Boolean = ViewCompat.getRootWindowInsets(compose.activity.window.decorView)

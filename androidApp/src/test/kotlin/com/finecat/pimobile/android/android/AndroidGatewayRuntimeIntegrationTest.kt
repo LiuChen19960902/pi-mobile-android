@@ -3,6 +3,7 @@ package com.finecat.pimobile.android
 import com.finecat.pimobile.shared.gateway.GatewayConnectionState
 import com.finecat.pimobile.shared.gateway.GatewayRuntime
 import com.finecat.pimobile.shared.gateway.GatewayRuntimeEvent
+import com.finecat.pimobile.shared.gateway.GatewayRequests
 import com.finecat.pimobile.shared.projection.ConversationItemKind
 import com.finecat.pimobile.shared.platform.GatewayAttachmentCache
 import com.finecat.pimobile.shared.platform.GatewayClock
@@ -16,6 +17,11 @@ import com.finecat.pimobile.shared.platform.GatewayTransport
 import com.finecat.pimobile.shared.platform.GatewayTransportFrame
 import com.finecat.pimobile.shared.platform.GatewayTransportEvent
 import com.finecat.pimobile.shared.platform.GatewayTransportState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -32,6 +38,252 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AndroidGatewayRuntimeIntegrationTest {
+    @Test
+    fun compactAcknowledgementLongStartupAndFinalStateUseProductionHooks() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val transport = FakeTransport()
+        val clock = object : GatewayClock {
+            override fun nowEpochMilliseconds(): Long = 0L
+            override suspend fun delay(milliseconds: Long) = kotlinx.coroutines.delay(milliseconds)
+        }
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), clock, backgroundScope)
+        val holder = AndroidSharedStateHolder(compactWatchScopeForTest = backgroundScope)
+        holder.compactGateForceOpenForTest = true
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                when (event) {
+                    is GatewayRuntimeEvent.Frame -> {
+                        holder.wirePayload = event.rawJson
+                        holder.submitWirePayload()
+                    }
+                    is GatewayRuntimeEvent.RequestRejected -> holder.finishManualCompactRequest(
+                        event.requestType, event.targetSessionId, "压缩请求被拒绝")
+                    is GatewayRuntimeEvent.RequestCancelled -> holder.finishManualCompactRequest(
+                        event.requestType, event.targetSessionId, "压缩请求未确认")
+                    is GatewayRuntimeEvent.RequestTimedOut -> holder.finishManualCompactRequest(
+                        event.requestType, event.targetSessionId, "压缩请求未确认")
+                    else -> Unit
+                }
+            }
+        }
+        try {
+            runCurrent()
+            runtime.connectStoredIfPaired(); runCurrent()
+            transport.open()
+            transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["compact","state"]}""")
+            runCurrent()
+            holder.selectSession("s-compact")
+            holder.messageDraft = "保留草稿"
+            holder.startManualCompact()
+            assertTrue(runtime.sendRequest(GatewayRequests.compact("s-compact")))
+            transport.receive("""{"kind":"compact-started","sessionId":"s-compact","isStreaming":true,"isCompacting":false}""")
+            runCurrent()
+            advanceTimeBy(9_000); runCurrent()
+            assertFalse(holder.canStartManualCompact())
+            holder.startManualCompact()
+            assertEquals(listOf("s-compact"), holder.compactRequestsForTest)
+            assertEquals(1, transport.sentPayloads.count { "\"type\":\"compact\"" in it })
+            transport.receive("""{"kind":"event","sessionId":"s-compact","seq":1,"time":1,"event":{"type":"compaction_end","aborted":true,"willRetry":false}}""")
+            runCurrent()
+            assertTrue(holder.canStartManualCompact())
+            assertEquals("保留草稿", holder.messageDraft)
+            // 新网关在SDK开始前已报告占用，最终state无Pi事件也能释放显示状态。
+            holder.startManualCompact()
+            assertTrue(runtime.sendRequest(GatewayRequests.compact("s-compact")))
+            // 上一轮完成通知不得认领/释放尚未收到ACK的第二轮请求。
+            transport.receive("""{"kind":"compact-finished","sessionId":"s-compact","isStreaming":false,"isCompacting":false}""")
+            runCurrent()
+            assertFalse(holder.canStartManualCompact())
+            transport.receive("""{"kind":"compact-started","sessionId":"s-compact","isStreaming":false,"isCompacting":true}""")
+            runCurrent()
+            assertFalse(holder.canStartManualCompact())
+            transport.receive("""{"kind":"compact-finished","sessionId":"s-compact","isStreaming":false,"isCompacting":false}""")
+            runCurrent()
+            assertTrue(holder.canStartManualCompact())
+            holder.startManualCompact()
+            assertTrue(runtime.sendRequest(GatewayRequests.compact("s-compact")))
+            holder.selectSession("s-other")
+            val oldNotice = holder.transientNotice
+            transport.failWebSocket(); runCurrent()
+            assertEquals(oldNotice, holder.transientNotice)
+        } finally {
+            holder.reset()
+            holder.close()
+            runtime.disconnect()
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun directoryWebSocketFailureKeepsListingAndRetryResponseClearsError() = runTest {
+        val transport = FakeTransport()
+        val clock = object : GatewayClock {
+            override fun nowEpochMilliseconds(): Long = 0L
+            override suspend fun delay(milliseconds: Long) = kotlinx.coroutines.delay(milliseconds)
+        }
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), clock, backgroundScope)
+        val holder = AndroidSharedStateHolder()
+        val cancelled = mutableListOf<GatewayRuntimeEvent.RequestCancelled>()
+        // 使用真Runtime与生产取消处理；Application collector和触控另由设备用例覆盖。
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                when (event) {
+                    is GatewayRuntimeEvent.RequestCancelled -> {
+                        cancelled += event
+                        holder.handleWorkspaceRequestCancelled(event)
+                    }
+                    is GatewayRuntimeEvent.Frame -> if (event.frame.kind == "directories") {
+                        holder.wirePayload = event.rawJson
+                        holder.submitWirePayload()
+                    }
+                    else -> Unit
+                }
+            }
+        }
+        try {
+            runCurrent()
+            runtime.connectStoredIfPaired(); runCurrent()
+            transport.open()
+            transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["directories"]}""")
+            runCurrent()
+            assertTrue(runtime.sendRequest(GatewayRequests.directories("/workspace")))
+            transport.receive("""{"kind":"directories","path":"/workspace","home":"/workspace","entries":[{"name":"project","path":"/workspace/project","hidden":false}]}""")
+            runCurrent()
+            val entries = holder.directoryEntries
+            assertEquals("/workspace", holder.directoryPath)
+            assertEquals(1, entries.size)
+            holder.messageDraft = "保留新稿"
+
+            assertTrue(runtime.sendRequest(GatewayRequests.directories("/workspace/project")))
+            transport.failWebSocket()
+            runCurrent()
+            assertTrue(cancelled.any { it.requestType == "directories" && it.reason == "websocket-failure" })
+            assertEquals("连接已断开，请重试", holder.directoryError)
+            assertEquals("/workspace", holder.directoryPath)
+            assertEquals(entries, holder.directoryEntries)
+            assertEquals("保留新稿", holder.messageDraft)
+
+            runtime.connectStoredIfPaired(); runCurrent()
+            transport.open()
+            transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["directories"]}""")
+            runCurrent()
+            assertTrue(runtime.sendRequest(GatewayRequests.directories("/workspace/project")))
+            transport.receive("""{"kind":"directories","path":"/workspace/project","home":"/workspace","entries":[]}""")
+            runCurrent()
+            assertEquals(null, holder.directoryError)
+            assertEquals("/workspace/project", holder.directoryPath)
+            assertTrue(holder.directoryEntries.isEmpty())
+            assertEquals("保留新稿", holder.messageDraft)
+        } finally {
+            holder.close()
+            runtime.disconnect()
+        }
+    }
+
+    @Test
+    fun runtimeMessageTerminalsUseProductionHolderHook_unknownRejectBusyAndMalformedAck() = runTest {
+        val transport = FakeTransport()
+        val clock = object : GatewayClock {
+            override fun nowEpochMilliseconds(): Long = 0L
+            override suspend fun delay(milliseconds: Long) = kotlinx.coroutines.delay(milliseconds)
+        }
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), clock, backgroundScope)
+        val holder = AndroidSharedStateHolder().also { it.elapsedRealtimeMs = { 0L } }
+        val errors = mutableListOf<GatewayRuntimeEvent.RequestRejected>()
+        // 真Runtime事件接生产终态方法；不构造Application，不能据此称整个Android collector已实跑。
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                when (event) {
+                    is GatewayRuntimeEvent.RequestRejected -> {
+                        errors += event
+                        holder.handleOutgoingMessageRejection(event)
+                    }
+                    is GatewayRuntimeEvent.Frame -> if (event.frame.kind == "sent") {
+                        holder.recordOutgoingSent(event.frame.sessionId)
+                    }
+                    is GatewayRuntimeEvent.RequestCancelled -> if (event.requestType == "message") {
+                        holder.handleOutgoingSendUnconfirmed()
+                    }
+                    is GatewayRuntimeEvent.RequestTimedOut -> if (event.requestType == "message") {
+                        holder.handleOutgoingSendUnconfirmed()
+                    }
+                    else -> Unit
+                }
+            }
+        }
+        try {
+            runCurrent()
+            runtime.connectStoredIfPaired(); runCurrent()
+            transport.open()
+            transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["sessions","message"]}""")
+            transport.receive("""{"kind":"sessions","items":[]}""")
+            runCurrent()
+            holder.selectSession("s-a")
+            suspend fun send(text: String): AndroidSharedStateHolder.PreparedOutgoingSend {
+                holder.messageDraft = text
+                val submission = holder.captureMessageSubmissionForTest()
+                val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
+                val accepted = runtime.sendMessage(text, emptyList(), submission.sessionId, null)
+                holder.settleOutgoingSendLocally(submission, outgoing, accepted, clearInputOnSuccess = true)
+                runCurrent()
+                return outgoing
+            }
+
+            // 新拒绝码与本地busy同名也必须按来源区分，不能只靠字符串白名单。
+            for (code in listOf("future-message-rejection", "request-busy")) {
+                val outgoing = send("待恢复原稿")
+                transport.receive("""{"kind":"error","requestType":"message","sessionId":"s-a","code":"$code"}""")
+                runCurrent()
+                assertTrue(errors.any { it.reason == code && it.serverResponse })
+                assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+                assertEquals(outgoing.sendToken, holder.outgoingPreviews.single().sendToken)
+                assertEquals(OutgoingImagePreviewState.FAILED, holder.outgoingPreviews.single().state)
+                assertEquals("待恢复原稿", holder.messageDraft)
+                holder.messageDraft = ""
+                holder.restoreOutgoingPreviewDraft(outgoing.sendToken)
+                assertEquals("待恢复原稿", holder.messageDraft)
+                assertTrue(holder.outgoingPreviews.isEmpty())
+            }
+
+            send("A")
+            val beforeBusy = transport.sentPayloads.count { "\"type\":\"message\"" in it }
+            send("B") // 本地busy只结束B；A仍应等待自己的ACK。
+            assertEquals(beforeBusy, transport.sentPayloads.count { "\"type\":\"message\"" in it })
+            assertTrue(errors.any { it.reason == "request-busy" && !it.serverResponse })
+            assertEquals("B", holder.messageDraft)
+            assertTrue(holder.outgoingPreviews.isEmpty())
+            transport.receive("""{"kind":"sent","sessionId":"wrong-session"}""")
+            transport.receive("""{"kind":"sent"}""")
+            runCurrent()
+            assertEquals(setOf("s-a"), runtime.state.value.activeTurnSessionIds)
+            transport.receive("""{"kind":"error","requestType":"message","sessionId":"s-a","code":"future-message-rejection"}""")
+            runCurrent()
+            assertEquals("A", holder.outgoingPreviews.single().draftText)
+            assertEquals("B", holder.messageDraft)
+            assertFalse(holder.canRestoreOutgoingDraft)
+            assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+
+            holder.messageDraft = ""
+            holder.restoreOutgoingPreviewDraft(holder.outgoingPreviews.single().sendToken)
+            val unconfirmed = send("通用错误前的原稿")
+            transport.receive("""{"kind":"error","code":"internal"}""")
+            runCurrent()
+            // 通用错误取消 message 并保留未确认稿；随后 gateway 拒绝不二次消费或改成失败。
+            assertEquals(unconfirmed.sendToken, holder.outgoingPreviews.single().sendToken)
+            assertEquals(OutgoingImagePreviewState.UNCONFIRMED, holder.outgoingPreviews.single().state)
+            val wireCount = transport.sentPayloads.count { "\"type\":\"message\"" in it }
+            holder.restoreOutgoingPreviewDraft(unconfirmed.sendToken)
+            assertEquals("通用错误前的原稿", holder.messageDraft)
+            assertEquals(wireCount, transport.sentPayloads.count { "\"type\":\"message\"" in it })
+            assertFalse(runtime.state.value.shouldKeepAliveInBackground)
+        } finally {
+            holder.close()
+        }
+    }
+
     @Test
     fun oversizedHistoryRecoversWithoutCancellingLoading_andPartialTurnPagesMergeWithoutDuplicates() = runTest {
         val transport = FakeTransport()
@@ -239,6 +491,13 @@ class AndroidGatewayRuntimeIntegrationTest {
         }
         fun open() {
             emitState(GatewayTransportState.Open(specs.last().generation))
+        }
+        fun failWebSocket() {
+            emitState(GatewayTransportState.Failed(
+                generation = specs.last().generation,
+                reason = "websocket-failure",
+                recoverable = false,
+            ))
         }
         fun receive(json: String) {
             assertTrue(

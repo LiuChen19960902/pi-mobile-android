@@ -20,6 +20,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
@@ -94,6 +95,7 @@ fun FcSettingRow(
     tag: String? = null,
     tagStyle: FcTagStyle = FcTagStyle.Bad,
     showChevron: Boolean = true,
+    enabled: Boolean = true,
     onClick: (() -> Unit)? = null,
 ) {
     val colors = LocalFineCatColors.current
@@ -102,7 +104,8 @@ fun FcSettingRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
+            .then(if (onClick != null) Modifier.clickable(enabled = enabled, role = Role.Button, onClick = onClick) else Modifier)
+            .alpha(if (enabled) 1f else 0.45f)
             .defaultMinSize(minHeight = 48.dp)
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,

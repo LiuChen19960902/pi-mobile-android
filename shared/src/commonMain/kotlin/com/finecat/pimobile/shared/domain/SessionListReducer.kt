@@ -11,7 +11,7 @@ data class SessionSummary(
     val hasUnread: Boolean,
     /** pi 会话的项目目录（新会话落点用）。 */
     val cwd: String? = null,
-    /** 已加载的当前分支最后一条 assistant 消息确认为上游 error；未知不造失败。 */
+    /** 当前会话已确认的 assistant/压缩失败；未知结果不造失败。 */
     val hasFailure: Boolean = false
 )
 
@@ -45,6 +45,8 @@ sealed interface SessionListAction {
         val insertedAtEpochSeconds: Double
     ) : SessionListAction
     data class MarkRead(val sessionId: String) : SessionListAction
+    /** 来自会话快照/生命周期事件的 streaming || compacting，不等同于一轮聊天。 */
+    data class ActivityChanged(val sessionId: String, val isRunning: Boolean) : SessionListAction
 
     /** 会话改名（session-named 帧）：列表标题即时更新，选择态不动。 */
     data class Renamed(val sessionId: String, val name: String) : SessionListAction
@@ -89,6 +91,14 @@ object SessionListReducer {
         is SessionListAction.MarkRead -> state.copy(
             sessions = state.sessions.map {
                 if (it.id == action.sessionId) it.copy(hasUnread = false) else it
+            }
+        )
+        is SessionListAction.ActivityChanged -> state.copy(
+            sessions = state.sessions.map {
+                if (it.id == action.sessionId) it.copy(
+                    isRunning = action.isRunning,
+                    hasUnread = it.hasUnread || (it.isRunning && !action.isRunning && state.selectedSessionId != it.id)
+                ) else it
             }
         )
         is SessionListAction.Renamed -> state.copy(
@@ -152,7 +162,8 @@ object SessionListReducer {
         }
         var sessions = upsert(state.sessions, record.sessionId, title, labels, insertedAtEpochSeconds)
         val updatesMetadata = event.type in setOf(
-            "user/message", "session/title", "turn/start", "turn/end", "assistant/message"
+            "user/message", "session/title", "turn/start", "turn/end", "assistant/message",
+            "compact/start", "compact/end", "compact/done", "notice/compact"
         )
         if (!updatesMetadata) return state.copy(sessions = sessions)
         sessions = sessions.map { session ->
@@ -164,7 +175,8 @@ object SessionListReducer {
                     "turn/end" -> false
                     else -> session.isRunning
                 },
-                hasUnread = state.selectedSessionId != record.sessionId
+                hasUnread = if (event.type == "compact/start") session.hasUnread
+                    else state.selectedSessionId != record.sessionId
             )
         }.sortedByDescending(SessionSummary::lastActivityEpochSeconds)
         return state.copy(sessions = sessions)

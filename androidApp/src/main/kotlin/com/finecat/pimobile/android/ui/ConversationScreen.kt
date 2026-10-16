@@ -1,5 +1,7 @@
 package com.finecat.pimobile.android.ui
 
+import com.finecat.pimobile.shared.gateway.GatewayErrorText
+
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -854,11 +856,6 @@ private fun ConversationPage(
             }
             PendingDispatchBar(stateHolder, onDismissInput)
             QueuedMessagesBar(stateHolder, sessionId)
-            // kimi swarm 的 aboveEditor widget 语义：Agent 运行中动效常驻
-            // 输入框上方（不随对话流滚走），完成后调用进折叠区、条消失。
-            val conversationForStrips = stateHolder.snapshot.conversation
-            val runningStrips = remember(conversationForStrips) { runningAgentTools(conversationForStrips) }
-            RunningAgentStrips(tools = runningStrips)
             // 工作区行常驻：未绑定时（含发送预览）仍可选目录，绑定后只读当前 cwd。
             // 显示模式不决定能否改目录，避免失败预览把新会话误判成已绑定会话。
             val boundSession = stateHolder.snapshot.sessions.firstOrNull { it.id == sessionId }
@@ -975,7 +972,7 @@ internal fun HistoryLoadErrorCard(
                 fontWeight = FontWeight.SemiBold
             )
             Text(
-                errorCode,
+                GatewayErrorText.request("history", errorCode),
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.50f),
                 fontSize = 13.sp,
                 textAlign = TextAlign.Center
@@ -2734,106 +2731,6 @@ internal fun waveDotLevels(frame: Int, seed: Int, cells: Int = 6): List<Float> =
         ((kotlin.math.sin(phase) + 1.0) / 2.0).toFloat()
     }
 
-/** 运行中 Agent 常驻条（输入框上方，kimi aboveEditor 语义）：每条一个 Agent。
- *  数据源见 runningAgentTools——`Agent` 工具来自 pi-subagents 类扩展，未安装时恒为空。 */
-@Composable
-private fun RunningAgentStrips(tools: List<ConversationProcessTool>) {
-    if (tools.isEmpty()) return
-    val transition = rememberInfiniteTransition(label = "agent-run-strips")
-    val wavePhase by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = (25.0 * 2 * kotlin.math.PI / 0.32).toFloat(),
-        animationSpec = infiniteRepeatable(
-            tween(
-                durationMillis = (25.0 * 2 * kotlin.math.PI / 0.32 * 80).toInt(),
-                easing = LinearEasing
-            )
-        ),
-        label = "agent-run-strips-phase"
-    )
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 2.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp)
-    ) {
-        tools.forEach { tool ->
-            val call = tool.call
-            val args: JsonElement? = remember(tool.id) {
-                try {
-                    Json.parseToJsonElement(call?.text.orEmpty())
-                } catch (_: SerializationException) {
-                    null
-                }
-            }
-            val description = (args as? JsonObject)?.get("description")?.jsonPrimitive?.contentOrNull
-                ?.singleLinePreview()?.take(40) ?: "Agent"
-            val seed = call?.id?.hashCode() ?: 0
-            val dotLevels = waveDotLevels(wavePhase.toInt(), seed)
-            val elapsed = (System.currentTimeMillis() / 1000.0 - (call?.epochSeconds ?: 0.0)).coerceAtLeast(0.0)
-            // 长任务分钟级是常态：恢复 h/m/s 三段可读格式。
-            val elapsedText = when {
-                elapsed >= 3600.0 -> "%.1fh".format(elapsed / 3600)
-                elapsed >= 60.0 -> {
-                    // 先取整再拆分钟/秒：分别对浮点四舍五入会出现 119.6s → "2m60s"。
-                    val totalSeconds = elapsed.toLong()
-                    "%dm%02ds".format(totalSeconds / 60, totalSeconds % 60)
-                }
-                else -> "%.0fs".format(elapsed)
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .background(
-                        MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
-                        RoundedCornerShape(10.dp)
-                    )
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(7.dp)
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_process_terminal),
-                    contentDescription = null,
-                    modifier = Modifier.size(14.dp),
-                    tint = PiColors.Ocean
-                )
-                Text(
-                    "Agent · $description",
-                    color = PiColors.Ocean,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false)
-                )
-                Canvas(
-                    Modifier
-                        .size(width = 34.dp, height = 14.dp)
-                        .semantics { contentDescription = "agent-run-strip-wave" }
-                ) {
-                    val r = 2.dp.toPx()
-                    val gap = 1.6.dp.toPx()
-                    dotLevels.forEachIndexed { i, level ->
-                        val cx = r + i * (r * 2 + gap)
-                        val cy = (0.2f + 0.6f * level) * size.height
-                        drawCircle(
-                            color = PiColors.Ocean.copy(alpha = 0.45f + 0.55f * level),
-                            radius = r,
-                            center = Offset(cx, cy)
-                        )
-                    }
-                }
-                Text(
-                    elapsedText,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.52f),
-                    fontSize = 11.sp
-                )
-            }
-        }
-    }
-}
-
 @Composable
 private fun ProcessChevron(expanded: Boolean) {
     Icon(
@@ -2903,7 +2800,7 @@ private fun OutgoingImagePreviewRow(
             TextButton(
                 shape = RoundedCornerShape(6.dp),
                 onClick = { stateHolder.restoreOutgoingPreviewDraft(preview.sendToken) },
-                enabled = stateHolder.messageDraft.isBlank() && stateHolder.preparedImages.isEmpty()
+                enabled = stateHolder.canRestoreOutgoingDraft
             ) {
                 Text("恢复草稿", fontSize = 13.sp, color = PiColors.Ocean)
             }

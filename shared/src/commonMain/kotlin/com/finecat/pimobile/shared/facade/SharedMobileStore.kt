@@ -98,6 +98,17 @@ class SharedMobileStore(
                                 ?: nowEpochSeconds()
                         )
                     )
+                    if (frame.isStreaming != null && frame.isCompacting != null) {
+                        sessionStates[sessionId] = GatewaySessionState(
+                            sessionId = sessionId,
+                            isStreaming = frame.isStreaming,
+                            isCompacting = frame.isCompacting,
+                            model = frame.model,
+                            thinkingLevel = frame.thinkingLevel,
+                            contextUsage = frame.contextUsage,
+                            queuedMessages = queuedMessagesOf(frame.queuedMessages)
+                        )
+                    }
                 }
                 "models" -> modelCatalog = GatewayModelCatalog(frame.groups.orEmpty())
                 // state/model-set 应答就是会话级状态快照；无 sessionId 的 model-set 无法归属，忽略。
@@ -107,7 +118,7 @@ class SharedMobileStore(
                 // 事件丢失，重连 catch-up 拉回的 history 帧是 isStreaming 的唯一纠正
                 // 机会——拉式 state 只在手动刷新/轮末来，长断连后 Working 会陈旧。
                 // session-restarted（重载配置）同样以 state 快照形状下发。
-                "history", "state", "model-set", "compact-started", "branch-switched", "session-restarted" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
+                "history", "state", "model-set", "compact-started", "compact-finished", "branch-switched", "session-restarted" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
                     sessionStates[sessionId] = GatewaySessionState(
                         sessionId = sessionId,
                         isStreaming = frame.isStreaming == true,
@@ -116,6 +127,15 @@ class SharedMobileStore(
                         thinkingLevel = frame.thinkingLevel,
                         contextUsage = frame.contextUsage,
                         queuedMessages = queuedMessagesOf(frame.queuedMessages)
+                    )
+                }
+                "aborted", "dequeued" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
+                    // 新网关在 idle ACK 中带权威快照；旧网关裸 ACK 不证明队列已清空。
+                    val previous = sessionStates[sessionId] ?: GatewaySessionState(sessionId = sessionId)
+                    sessionStates[sessionId] = previous.copy(
+                        isStreaming = frame.isStreaming ?: if (frame.kind == "aborted") false else previous.isStreaming,
+                        isCompacting = frame.isCompacting ?: if (frame.kind == "aborted") false else previous.isCompacting,
+                        queuedMessages = if (frame.queuedMessages != null) queuedMessagesOf(frame.queuedMessages) else previous.queuedMessages,
                     )
                 }
                 "session-named" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
@@ -135,6 +155,10 @@ class SharedMobileStore(
                     }
                 }
                 "history" -> Unit // pi history 由 AndroidGatewayProjection 直接接管
+            }
+            // 抽屉与Working使用同一份权威忙闲状态；快照只对账，不声明压缩成功。
+            if (frame.isStreaming != null && frame.isCompacting != null) {
+                frame.sessionId?.let(::syncSessionActivity)
             }
         } catch (error: Throwable) {
             lastError = error.message ?: error::class.simpleName ?: "decode-error"
@@ -192,11 +216,9 @@ class SharedMobileStore(
             }
             "compact/start" -> {
                 updateCompacting(record.sessionId, true)
-                return
             }
             "compact/end", "notice/compact" -> {
                 updateCompacting(record.sessionId, false)
-                if (record.event.type != "notice/compact") return
             }
             // pi 原生 queue_update 归一：steer/followUp 消费后立即刷新快照，
             // 对齐 TUI 的实时清条（state 帧是请求-应答，轮内不会刷新）。
@@ -216,6 +238,10 @@ class SharedMobileStore(
             sessionListState,
             SessionListAction.EventReceived(record, normalizeEpochSeconds(record.time))
         )
+        if (record.event.type in setOf("turn/start", "turn/end", "compact/start", "compact/end", "notice/compact")) {
+            syncSessionActivity(record.sessionId)
+        }
+        if (record.event.type == "compact/start" || record.event.type == "compact/end") return
         val existing = eventsBySession[record.sessionId].orEmpty()
         val records = existing.associateBy(SessionEvent::seq).toMutableMap().apply { put(record.seq, record) }
         eventsBySession[record.sessionId] = records.values.sortedBy(SessionEvent::seq)
@@ -224,6 +250,14 @@ class SharedMobileStore(
     private fun updateCompacting(sessionId: String, value: Boolean) {
         sessionStates[sessionId] = (sessionStates[sessionId]
             ?: GatewaySessionState(sessionId = sessionId)).copy(isCompacting = value)
+    }
+
+    private fun syncSessionActivity(sessionId: String) {
+        val state = sessionStates[sessionId] ?: return
+        sessionListState = SessionListReducer.reduce(
+            sessionListState,
+            SessionListAction.ActivityChanged(sessionId, state.isStreaming || state.isCompacting)
+        )
     }
 
     /** state 帧的 queuedMessages（JsonValue）→ 结构化排队消息；异常形状安全降级为空。 */

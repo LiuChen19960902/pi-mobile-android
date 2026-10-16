@@ -50,6 +50,8 @@ internal data class FcContextUsageDisplay(val progress: Float, val percent: Stri
 
 /** 只显示会话快照；SDK 压缩后返回的 null 不改写成零或旧轮次统计。 */
 internal fun contextUsageDisplay(usage: GatewayContextUsage?): FcContextUsageDisplay {
+    // 压缩后 SDK 统计可能整体 unknown（percent/tokens 同为 null）：合法显示 —，
+    // 不用旧 percent 伪造“已改善”，未知时由 popover 提供单次补拉。
     val percent = usage?.percent?.takeIf { it.isFinite() && it >= 0 }
     return FcContextUsageDisplay(
         progress = percent?.div(100)?.coerceIn(0.0, 1.0)?.toFloat() ?: 0f,
@@ -103,13 +105,20 @@ internal fun FcContextRing(usage: GatewayContextUsage?, onClick: (IntRect) -> Un
     }
 }
 
-/** 根级浮层复用已有避让IME的定位；本轮只有UI，不持有compact回调。 */
+/** 根级浮层复用已有避让IME的定位；压缩按钮接 CTX02 真实动作（onCompact）。 */
 @Composable
 internal fun FcContextPopover(
     anchor: IntRect,
     usage: GatewayContextUsage?,
     isCompacting: Boolean,
     onDismiss: () -> Unit,
+    /** 真实压缩动作；null = 按钮禁用，此时显示 [compactDisabledReason]（R6）。 */
+    onCompact: (() -> Unit)? = null,
+    /** 会话级重拉统计（压缩后 unknown 统计的合法补拉入口）。 */
+    onRefreshUsage: (() -> Unit)? = null,
+    usageIsUnknown: Boolean = false,
+    /** 按钮禁用原因；可用时传 null，显示中止说明行（M1/R6）。 */
+    compactDisabledReason: String? = null,
 ) {
     val colors = LocalFineCatColors.current
     val radius = LocalFineCatRadius.current
@@ -131,14 +140,34 @@ internal fun FcContextPopover(
                 Text(display.percent, style = type.title.copy(fontWeight = FontWeight.Bold), color = colors.text, modifier = Modifier.alignByBaseline())
                 Text("${display.tokens} / ${display.window}", style = type.xs, color = colors.text3, modifier = Modifier.alignByBaseline())
             }
+            // 压缩会中止当前回答（pi 原生语义）：动作可用时事前明示（M1）；
+            // 禁用时改示原因，不描述一个不可能发生的动作（R6）。
+            Text(
+                compactDisabledReason ?: "会中止当前回答，并把已有对话压缩为摘要",
+                style = type.xs,
+                color = colors.text3,
+                modifier = Modifier.testTag("fc.contextCompactHint"),
+            )
             Box(
                 modifier = Modifier.fillMaxWidth()
-                    .alpha(0.55f).background(colors.ink, RoundedCornerShape(999.dp))
-                    .clickable(enabled = false, role = Role.Button) {}
+                    .alpha(if (onCompact == null) 0.55f else 1f).background(colors.ink, RoundedCornerShape(999.dp))
+                    .clickable(enabled = onCompact != null && !isCompacting, role = Role.Button) { onCompact?.invoke() }
                     .padding(horizontal = 16.dp, vertical = 8.dp).testTag("fc.contextCompact"),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(if (isCompacting) "压缩中…" else "压缩上下文", style = type.sm, color = colors.onInk)
+            }
+            // 压缩后 SDK 统计合法 unknown 显示 —；仅“有统计但数值 unknown”时给单次
+            // 补拉入口（不轮询）。完全无统计（新会话/空白页）不显示，避免死点击（M3）。
+            if (usageIsUnknown && onRefreshUsage != null) {
+                Box(
+                    modifier = Modifier.fillMaxWidth()
+                        .clickable(role = Role.Button) { onRefreshUsage() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp).testTag("fc.contextRefreshUsage"),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("刷新占用统计", style = type.xs, color = colors.text3)
+                }
             }
         }
     }

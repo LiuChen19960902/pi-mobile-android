@@ -57,9 +57,13 @@ internal fun FineCatModelScopeSheet(stateHolder: AndroidSharedStateHolder, onDis
     var confirmReset by remember { mutableStateOf(false) }
     var pendingSave by remember { mutableStateOf<String?>(null) }
     val busy = stateHolder.modelScopeIsLoading || stateHolder.modelScopeIsSaving
-    val connected = stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED
+    val connection = stateHolder.gatewayState.connection
+    val connected = connection == GatewayConnectionState.CONNECTED
     val supported = "model-scope-v1" in stateHolder.gatewayState.capabilities
-    LaunchedEffect(Unit) { stateHolder.loadModelScope() }
+    LaunchedEffect(connected, supported) {
+        // 首次读取被断线取消时自动补读；已有选择草稿不被重连覆盖。
+        if (connected && supported && snapshot == null) stateHolder.loadModelScope()
+    }
     LaunchedEffect(stateHolder.modelScopeLoadRevision) {
         if (stateHolder.modelScopeLoadRevision > openingRevision) {
             snapshot = stateHolder.modelScope
@@ -73,7 +77,7 @@ internal fun FineCatModelScopeSheet(stateHolder: AndroidSharedStateHolder, onDis
     }
     fun saveSelection() {
         val loaded = snapshot ?: return
-        if (busy) return
+        if (busy || !connected || !supported) return
         pendingSave = stateHolder.saveModelScope(loaded.patterns, selected, preserveUnmatched)
     }
     FcSheet(
@@ -110,9 +114,16 @@ internal fun FineCatModelScopeSheet(stateHolder: AndroidSharedStateHolder, onDis
                         modifier = Modifier.fillMaxWidth().heightIn(max = 72.dp).verticalScroll(rememberScrollState())
                             .padding(horizontal = 20.dp, vertical = 8.dp))
                 }
-                if (!connected || !supported) {
-                    FcHint(text = if (!connected) "请先连接网关。" else "请升级网关后编辑模型范围。")
-                }
+                if (!connected) {
+                    Row(Modifier.fillMaxWidth().testTag("finecat.modelScopeOffline"), verticalAlignment = Alignment.CenterVertically) {
+                        Text("网关未连接，选择已保留。", style = type.xs, color = colors.warn,
+                            modifier = Modifier.weight(1f).padding(start = 20.dp))
+                        FcTextButton("重新连接", onClick = stateHolder::connect,
+                            enabled = connection !in setOf(GatewayConnectionState.CONNECTING,
+                                GatewayConnectionState.AUTHENTICATING, GatewayConnectionState.WAITING_FOR_NETWORK),
+                            modifier = Modifier.padding(end = 12.dp).testTag("finecat.modelScopeReconnect"))
+                    }
+                } else if (!supported) FcHint(text = "请升级网关后编辑模型范围。")
                 if (stateHolder.modelScopeIsLoading) FcHint(text = "正在读取 Pi 模型范围…")
                 val loaded = snapshot
                 if (loaded != null) {

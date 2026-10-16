@@ -1,6 +1,6 @@
 # 架构
 
-Pi Mobile 是 Kotlin Multiplatform 项目：**KMP `shared` 模块是业务状态与纯逻辑的唯一来源**，Android 侧提供 Compose UI、状态门面与平台 effect。
+Pi Mobile 是 Kotlin Multiplatform 项目：KMP `shared` 模块承载跨平台协议、领域逻辑与连接运行时；Android 侧提供 Compose UI、平台能力，并持有草稿、编辑确认等界面状态。
 `shared` 目前只编译 Android 目标；本项目不做 iOS 客户端（见 README“支持的环境”）。
 
 ## 1. 分层
@@ -31,24 +31,28 @@ Pi Mobile 是 Kotlin Multiplatform 项目：**KMP `shared` 模块是业务状态
 
 正式入口使用 `FineCatApp`；旧 `PiProductApp` 保留为 debug 对照。FineCat 会话只有对话与树视图，轨迹投影用于对话里的思考和工具步骤。
 
+Pi 接入以网关实际锁定的 SDK 契约为边界；通用消息/工具语义、扩展 UI 与插件私有状态的区分见 [Pi 支持边界](Docs/pi-compatibility.md)。SDK 的 RPC 模式绑定不等于镜像终端或完整接入扩展 UI。
+
 依赖方向单向向下：`ui → android 门面 → shared → platform 契约`。`shared` 不得 import 任何 Android 类型。
+
+Tree的浏览选择与真实active leaf分开。`tree-view-v1`在网关计算筛选/搜索/折叠与前缀；`tree-actions-v1`提供entry全文复制和追加LabelEntry。客户端按会话+entry关联离散动作，导航/改配清理旧发布态；只有明确跳转才调用既有switch-branch。标签钉子只跟随其运行时后代，普通手动跳转钉子保留原行为。协议真源见网关 `PROTOCOL.md` §4.26–4.27。
 
 ## 2. 一条消息的生命周期
 
 1. Compose 事件 → `AndroidSharedStateHolder` 的语义化方法 → `GatewayRuntime.sendMessage(...)`
 2. Runtime 在**串行边界**（同一把 `Mutex`）内记账本轮 turn、按 lane 策略排队或直发
 3. `GatewayTransport`（Android 实现基于 OkHttp）发出文本帧；每个 socket 打一个**代次（generation）**，入站帧与状态事件都带代次，旧代次一律拒绝
-4. 服务端 `event` 帧 → `PiEventNormalizer` 把 pi 的事件序列归一成内部视图事件（`turn/start`、`assistant/chunk`、`tool/call`、`turn/end`…），下游投影与 UI 不感知 pi 与 dsh 的差异
+4. 服务端 `event` 帧 → `PiEventNormalizer` 把已支持的 Pi 事件归一成内部视图事件（`turn/start`、`assistant/chunk`、`tool/call`、`turn/end`…），交给投影与 UI
 5. 投影更新 → 状态门面同步 Compose 状态 → UI 重组（Runtime 内部通过 `StateFlow` 提供连接状态）
 
-回合结束判定用 `agent_settled`（pi 语义：一轮运行彻底落定，含重试），它同时决定后台保活是否释放。
+支持 `prompt-disposition-v1` 时，待回执输入与实际运行/压缩分别记账；`sent` 回传 SDK 输入处置和受理后状态，网关先排空旧事件再同步发快照回执。`handled` 仅表示该输入被消费，不能当作运行结束。实际模型运行以 `agent_start` / `agent_settled` 更新，权威状态/历史补拉纠正断线期间的活动状态；不合成结束事件。旧网关保留原计数路径及其边界。
 
 ## 3. GatewayRuntime 的关键设计
 
-所有可变状态与平台 I/O 都过同一把 `Mutex`（`serialized { }`），避免并发下的状态分叉。
+连接与请求状态通过同一把 `Mutex`（`serialized { }`）串行更新，避免并发下的状态分叉；附件缓存的读写在锁外执行。
 
 **请求 lane**：按 `responseKind` 建 lane，策略三种 —— `FIFO`、`COALESCE_LATEST`（同类请求只保留最新，例如 `sessions` 刷新）、`REJECT_IF_BUSY`。
-一般请求超时（默认 30s）会回收连接并重放未完成项；输入资源和补全查询超时仅结束该关联请求，避免打断生成；`hello` 之后统一 replay（`sessions` + 当前订阅 + 排队请求）。
+一般请求超时（默认 30s）会结束该活动请求并回收连接，不自动重发它；回收时其他在途请求也可能被取消。输入资源和补全查询超时仅结束该关联请求，避免打断生成。重新收到 `hello` 后刷新 `sessions`、恢复当前订阅，并重发已转入 deferred 的排队请求。
 
 **连接与重连**：
 
@@ -66,7 +70,7 @@ Pi Mobile 是 Kotlin Multiplatform 项目：**KMP `shared` 模块是业务状态
 
 - 配对码一次性；成功后服务端下发长期 token，客户端存平台安全存储
 - token 是**设备级单份**，不按地址分存（网关侧 token 与接入地址无关）
-- 401 语义严格区分：正在配对时收到 401 → 报 `pairing-code-invalid`、**不删本地 token**、立即退回 Bearer 重连；无配对码时收到 401 → 才认定凭据失效并删除、停止自动重连
+- 配对被拒不删除已有 token；有 token 时可退回 Bearer，无 token 则停止重试。非配对期，备用地址的 401 保留凭据并返回首地址；首地址的 401 删除 token 并停止重连，明确撤销码 4003 也会停止重连。单个备用地址拒绝不能证明原宿主凭据失效
 
 ## 4. 平台契约（`shared/platform`）
 
@@ -95,3 +99,5 @@ Android 实现要点：
 | 真机 | `androidApp/src/androidTest` + 手工 | Compose 渲染、Keystore/DataStore、后台生命周期 |
 
 协议变更必须**先改网关仓库的 `PROTOCOL.md` 与一致性测试**，再动本仓库客户端。
+
+手动上下文压缩由composer圆环触发。客户端以请求对象隔离本地等待；8秒只提示，不推断可重试。网关的每句柄在途调用涵盖SDK等待abort的启动期并合并重复触发，收尾先排空原生事件，再发独立compact-finished状态通知。该通知校验会话/活动字段，不消费state请求，也不认领可能已属于下一轮的本地等待。

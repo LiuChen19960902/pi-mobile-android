@@ -58,7 +58,10 @@ class FineCatContextRingDeviceTest {
                     )
                 }
                 if (open) anchor?.let {
-                    FcContextPopover(anchor = it, usage = usage, isCompacting = false, onDismiss = { anchor = null })
+                    FcContextPopover(
+                        anchor = it, usage = usage, isCompacting = false, onDismiss = { anchor = null },
+                        compactDisabledReason = "压缩暂不可用",
+                    )
                 }
             }
         }
@@ -78,6 +81,9 @@ class FineCatContextRingDeviceTest {
         rule.onNodeWithTag("fc.contextRing").performClick()
         rule.onNodeWithText("74%").assertIsDisplayed()
         rule.onNodeWithText("148K / 200K").assertIsDisplayed()
+        // CTX02 接线后按钮可用性由 onCompact 回调驱动；本夹具不提供回调 → 禁用。
+        // 禁用态显示原因而非中止说明（R6）；可用时才显示「会中止当前回答」说明（M1）。
+        rule.onNodeWithText("压缩暂不可用").assertIsDisplayed()
         rule.onNodeWithTag("fc.contextCompact").assertIsNotEnabled()
         rule.onNodeWithTag("fc.composer.input").assertIsFocused()
         rule.runOnIdle { changeUsage(GatewayContextUsage(null, 200_000, null)) }

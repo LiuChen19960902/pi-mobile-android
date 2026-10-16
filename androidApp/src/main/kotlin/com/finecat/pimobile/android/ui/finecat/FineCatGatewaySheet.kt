@@ -1,5 +1,7 @@
 package com.finecat.pimobile.android.ui.finecat
 
+import com.finecat.pimobile.shared.gateway.GatewayErrorText
+
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -299,7 +301,7 @@ internal fun pairingOutcomeText(
     validationError: String?,
     lastError: String?,
 ): PairingOutcomeText? {
-    if (validationError != null) return PairingOutcomeText("配对信息无效：$validationError", true)
+    if (validationError != null) return PairingOutcomeText("配对信息无效", true)
     if (!didAttemptPair) return null
     return when (connection) {
         GatewayConnectionState.CONNECTED ->
@@ -309,11 +311,7 @@ internal fun pairingOutcomeText(
         GatewayConnectionState.WAITING_FOR_NETWORK ->
             PairingOutcomeText("正在提交配对信息…", false)
         GatewayConnectionState.FAILED -> PairingOutcomeText(
-            when (lastError) {
-                "pairing-code-invalid" -> "配对码已过期或已被使用，请在电脑上重新生成一条。"
-                "endpoint-unreachable" -> "列表里的地址都没连上；检查备用地址顺序（在家局域网优先，外出 Tailscale）。"
-                else -> lastError ?: "请检查配对信息后重新连接。"
-            },
+            GatewayErrorText.connection(lastError),
             true,
         )
         GatewayConnectionState.DISCONNECTED,

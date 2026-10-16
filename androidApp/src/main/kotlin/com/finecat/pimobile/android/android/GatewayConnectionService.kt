@@ -12,6 +12,10 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.finecat.pimobile.android.platform.GatewayLifecycleEvent
+import com.finecat.pimobile.android.platform.GatewayForegroundLifecycle
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /**
@@ -21,6 +25,21 @@ import kotlinx.coroutines.launch
 class GatewayConnectionService : Service() {
     private val graph: AndroidAppGraph
         get() = (application as PiAndroidApplication).graph
+    private var idleObserver: Job? = null
+    private val foregroundLifecycle = GatewayForegroundLifecycle(
+        promote = {
+            runCatching { startForeground(NOTIFICATION_ID, makeNotification()) }
+                .onFailure {
+                    graph.diagnostics.lifecycle(GatewayLifecycleEvent.KEEP_ALIVE_START_FAILED)
+                }.isSuccess
+        },
+        isNeeded = { graph.gatewayRuntime.state.value.shouldKeepAliveInBackground },
+        stopSelf = { startId -> stopSelfResult(startId) },
+        removeNotification = {
+            graph.diagnostics.lifecycle(GatewayLifecycleEvent.KEEP_ALIVE_STOP, keepAlive = false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        },
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -29,23 +48,30 @@ class GatewayConnectionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        graph.diagnostics.lifecycle(GatewayLifecycleEvent.SERVICE_STARTED)
+        // 包括通知“断开”在内的每个入口先注册前台，之后才能停止。
+        if (!foregroundLifecycle.beginStart(startId)) return START_NOT_STICKY
         if (intent?.action == ACTION_DISCONNECT) {
             graph.diagnostics.lifecycle(GatewayLifecycleEvent.SERVICE_DISCONNECT)
             graph.gatewayScope.launch { graph.gatewayRuntime.disconnect() }
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            return START_NOT_STICKY
         }
-        graph.diagnostics.lifecycle(GatewayLifecycleEvent.SERVICE_STARTED)
-        // FGS 类型权限配置错误（如 BUG-105 误删 anyOf 权限）时 startForeground 抛
-        // SecurityException 直接崩进程；吞异常必须同时 stopSelf——只吞不停会被
-        // 系统以 "did not then call startForeground" 远程杀进程。
-        runCatching { startForeground(NOTIFICATION_ID, makeNotification()) }
-            .onFailure {
-                graph.diagnostics.lifecycle(GatewayLifecycleEvent.KEEP_ALIVE_START_FAILED)
-                stopSelf()
+        if (idleObserver == null) {
+            idleObserver = graph.applicationScope.launch {
+                graph.gatewayRuntime.state
+                    .map { it.shouldKeepAliveInBackground }
+                    .distinctUntilChanged()
+                    .collect { active -> if (!active) foregroundLifecycle.stopIfIdle() }
             }
+        }
+        // 新 startId 可能在观察器已处理过空闲之后才送达，不能只等待下一次状态变化。
+        foregroundLifecycle.stopIfIdle()
         return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        idleObserver?.cancel()
+        idleObserver = null
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -99,8 +125,5 @@ class GatewayConnectionService : Service() {
             ContextCompat.startForegroundService(context, Intent(context, GatewayConnectionService::class.java))
         }
 
-        fun stop(context: Context) {
-            context.stopService(Intent(context, GatewayConnectionService::class.java))
-        }
     }
 }

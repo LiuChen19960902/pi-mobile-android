@@ -428,7 +428,7 @@ class FineCatSettingsF08DeviceTest {
 
     // ------------------------------------------------------------------
     // 7. 拉取只增不覆盖：ID 集合严格相等、已有模型 compat/映射原样、回执计数、
-    //    保存 wire 逐字段核对（含新模型必填窗口）
+    //    保存 wire 逐字段核对（容量可覆盖默认）
     // ------------------------------------------------------------------
     @Test
     fun s11_provider_pull_appendsOnly_idSetStrict_wireCompatKept() {
@@ -445,8 +445,8 @@ transport.receive(PULL_RESULT_FRAME)
         // 行集合：恰 2 行，ID 集合与 fixture 预期严格相等
         val rowIds = modelRowIds()
         assertEquals(listOf(MODEL_ALPHA_1, MODEL_ALPHA_2), rowIds)
-        // 拉取没有覆盖已有模型：待配置标记只在新行
-        compose.onNodeWithText("待配置").assertExists()
+        // 拉取不覆盖已有模型，容量缺省不再被标为待配置。
+        compose.onNodeWithText("待配置").assertDoesNotExist()
 
         // 既有模型的 compat/thinking 映射原样（打开详情看透传区）。
         // F11/F12 把「本轮不可编辑」透传行换成了编辑区：本 fixture 目录帧没有声明
@@ -454,7 +454,7 @@ transport.receive(PULL_RESULT_FRAME)
         // compat 折叠报「已设置 1 项」。透传语义由下方 put 帧 JSON 逐字段核对兜底。
         compose.onNodeWithTag("finecat.modelRow.0").performClick()
         waitUntilTagPresent("finecat.modelDetail")
-        compose.onNodeWithTag("finecat.thinkingEmpty").assertExists()
+        compose.onNodeWithTag("finecat.thinkingMap").assertExists()
         // compatCount 是折叠区里的 Text，会被合进父语义节点（tag 不在合并树上）；
         // 用其文本判在，语义等价。
         compose.onNodeWithText("已设置 1 项").assertExists()
@@ -462,7 +462,7 @@ transport.receive(PULL_RESULT_FRAME)
         // 返回一级（卡片头返回钮；system Back 由二级卡的 BackHandler 接收）
         waitUntilTagGone("finecat.modelDetail")
 
-        // 新拉回的模型必须补上下文窗口才能保存（未配置拦截）：填好再测再存
+        // 用户可覆盖新模型默认容量；留空保存路径由纯逻辑专项覆盖。
         compose.onNodeWithTag("finecat.modelRow.1").performClick()
         waitUntilTagPresent("finecat.modelDetail")
         fillField("finecat.modelContext", "32K")
@@ -676,7 +676,7 @@ transport.receive(PROVIDER_SAVED_AFTER_PULL_FRAME)
         compose.waitUntil(5_000) { transport.payloadsOfType("provider-put").size == 1 }
         runBlocking { h.connect() }
         compose.waitUntil(6_000) {
-            compose.onAllNodesWithText("Provider 保存已取消，配置未确认，请重试")
+            compose.onAllNodesWithText("保存未确认，请重新打开核对")
                 .fetchSemanticsNodes().isNotEmpty()
         }
         waitUntilTagPresent("finecat.providerEdit")
@@ -699,7 +699,7 @@ transport.receive(PROVIDER_SAVED_AFTER_PULL_FRAME)
         compose.onNodeWithText("保存").performClick()
         compose.waitUntil(5_000) { transport.payloadsOfType("provider-put").size == 1 }
         compose.waitUntil(8_000) { h.providerResult != null }
-        assertEquals("Provider 保存超时，配置未确认，请重试", h.providerResult)
+        assertEquals("保存未确认，请重新打开核对", h.providerResult)
         waitUntilTagPresent("finecat.providerEdit")
         assertTrue(
             "新建 provider 不得在未回执时进入列表",
@@ -845,9 +845,9 @@ transport.receive(PROVIDER_SAVED_AFTER_PULL_FRAME)
         assertEditableText("finecat.modelName", "Alpha One")
         assertEditableText("finecat.modelContext", "128K")
         assertEditableText("finecat.modelMax", "8K")
-        // F11/F12 后透传行变成编辑区：本 fixture 目录帧未声明 thinkingLevels → 思考区空态行；
+        // F11/F12 后透传行变成编辑区：本 fixture 目录帧未声明 thinkingLevels，编辑器仍提供标准键；
         // 断言的是「帧里的透传值确实进了表单」：1 项 compat 在折叠计数里。
-        compose.onNodeWithTag("finecat.thinkingEmpty").assertExists()
+        compose.onNodeWithTag("finecat.thinkingMap").assertExists()
         // compatCount 是折叠区里的 Text，会被合进父语义节点（tag 不在合并树上）；
         // 用其文本判在，语义等价。
         compose.onNodeWithText("已设置 1 项").assertExists()

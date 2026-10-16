@@ -20,6 +20,51 @@ import org.junit.Test
  */
 class AndroidGatewayProjectionTest {
     @Test
+    fun handledAckUsesActualStateWithoutInventingTurnEnd() {
+        val projection = AndroidGatewayProjection()
+        projection.selectSession("s-handled")
+        val normalizer = assistantNormalizer("s-handled")
+        val running = live(normalizer, "s-handled", 1, 1.0, """{"type":"agent_start"}""")
+        projection.acceptFrame(running.raw, running.frame, "s-handled", running.events)
+        assertEquals(true, projection.snapshot().sessionStates["s-handled"]?.isStreaming)
+        val ack = """{"kind":"sent","sessionId":"s-handled","disposition":"handled","isStreaming":false,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]}}"""
+        projection.acceptFrame(ack, GatewayWireDecoder.decode(ack), "s-handled")
+        assertEquals(false, projection.snapshot().sessionStates["s-handled"]?.isStreaming)
+        assertTrue(projection.snapshot().conversation.isEmpty())
+        projection.close()
+    }
+
+    @Test
+    fun visibleCustomMessagesMergeWithHistoryByEntryIdAndIgnorePrivateTypes() {
+        val projection = AndroidGatewayProjection()
+        projection.selectSession("s-custom")
+        val normalizer = assistantNormalizer("s-custom")
+        val first = live(normalizer, "s-custom", 1, 1.0,
+            """{"type":"message_end","message":{"role":"custom","customType":"compaction","content":"same","display":true}}""", "n1")
+        projection.acceptFrame(first.raw, first.frame, "s-custom", first.events)
+        val second = live(normalizer, "s-custom", 2, 2.0,
+            """{"type":"message_end","message":{"role":"custom","customType":"empty-stop-retry","content":"same","display":true}}""", "n2")
+        projection.acceptFrame(second.raw, second.frame, "s-custom", second.events)
+        assertEquals(2, projection.snapshot().conversation.size)
+        val ids = projection.snapshot().conversation.map { it.id }.toSet()
+        val history = historyFrame("s-custom", listOf(
+            """{"role":"custom","entryType":"custom_message","customType":"compaction","content":"same","display":true}""",
+            """{"role":"custom","entryType":"custom_message","customType":"empty-stop-retry","content":"same","display":true}""",
+            """{"role":"custom","entryType":"custom_message","customType":"compaction","content":"hidden","display":false}""",
+            """{"role":"custom","entryType":"custom_message","customType":"notice","content":"missing visibility"}""",
+            """{"role":"custom","entryType":"custom","customType":"private","content":"internal","display":true}""",
+            """{"role":"custom","entryType":"wire_oversized","customType":"wire-oversized","content":"消息过大，已省略","display":true}"""
+        ), listOf("n1", "n2", "hidden", "missing", "private", "omitted"), false)
+        projection.acceptFrame(history, GatewayWireDecoder.decode(history), "s-custom")
+        val items = projection.snapshot().conversation
+        assertEquals(3, items.size)
+        assertEquals(2, items.count { it.text == "same" })
+        assertTrue(items.filter { it.text == "same" }.all { it.id in ids && it.title == "通知" && !it.isError })
+        assertTrue(items.any { it.text == "消息过大，已省略" })
+        projection.close()
+    }
+
+    @Test
     fun failedLatestAssistantSurvivesReadAndClearsOnBranchReload() {
         val projection = AndroidGatewayProjection()
         try {
@@ -136,6 +181,95 @@ class AndroidGatewayProjectionTest {
     }
 
     @Test
+    fun compactionFailureRemainsVisibleAfterFinishedSnapshotAndRead() {
+        val projection = AndroidGatewayProjection()
+        try {
+            projection.selectSession("session-a")
+            val normalizer = PiEventNormalizer("session-a")
+            fun receive(seq: Int, event: String) {
+                val f = live(normalizer, "session-a", seq, 100.0 + seq, event)
+                projection.acceptFrame(f.raw, f.frame, "session-a", f.events)
+            }
+            receive(1, """{"type":"compaction_start","reason":"manual"}""")
+            assertTrue(projection.snapshot().sessions.single().isRunning)
+            receive(2, """{"type":"compaction_end","errorMessage":"Compaction failed: synthetic error","aborted":false}""")
+            assertFalse(projection.snapshot().sessions.single().isRunning)
+            assertTrue(projection.snapshot().sessions.single().hasFailure)
+            val finished = """{"kind":"compact-finished","sessionId":"session-a","isStreaming":false,"isCompacting":false}"""
+            projection.acceptFrame(finished, GatewayWireDecoder.decode(finished), "session-a")
+            assertTrue("finished只代表收尾，不能洗掉失败", projection.snapshot().sessions.single().hasFailure)
+            projection.selectSession("session-a")
+            assertTrue(projection.snapshot().sessions.single().hasFailure)
+            val oldHistory = historyFrame("session-a", listOf(assistantMessage("上次成功")), listOf("old-reply"), false)
+            projection.acceptFrame(oldHistory, GatewayWireDecoder.decode(oldHistory), "session-a")
+            assertTrue("压缩失败不落盘，旧历史不得覆盖本次已知失败", projection.snapshot().sessions.single().hasFailure)
+            receive(3, """{"type":"compaction_start","reason":"manual"}""")
+            assertTrue(projection.snapshot().sessions.single().isRunning)
+            assertFalse(projection.snapshot().sessions.single().hasFailure)
+            receive(4, """{"type":"compaction_end","result":{"summary":"done"},"aborted":false}""")
+            assertFalse(projection.snapshot().sessions.single().isRunning)
+            assertFalse(projection.snapshot().sessions.single().hasFailure)
+        } finally { projection.close() }
+    }
+
+    @Test
+    fun successfulCompactionClearsPreviousAssistantFailureWithoutAgentSettled() {
+        val projection = AndroidGatewayProjection()
+        try {
+            val normalizer = PiEventNormalizer("session-a")
+            val events = listOf(
+                """{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error"}}""",
+                """{"type":"compaction_start","reason":"manual"}""",
+                """{"type":"compaction_end","result":{"summary":"done"},"aborted":false}"""
+            )
+            events.forEachIndexed { i, event ->
+                val f = live(normalizer, "session-a", i + 1, 100.0 + i, event)
+                projection.acceptFrame(f.raw, f.frame, "session-a", f.events)
+                if (i == 0) assertTrue(projection.snapshot().sessions.single().hasFailure)
+            }
+            val session = projection.snapshot().sessions.single()
+            assertFalse(session.isRunning)
+            assertFalse(session.hasFailure)
+            assertTrue(session.hasUnread)
+        } finally { projection.close() }
+    }
+
+    @Test
+    fun newerHistoryOutcomeCanReplaceKnownCompactionFailure() {
+        val projection = AndroidGatewayProjection()
+        try {
+            projection.selectSession("session-a")
+            val normalizer = PiEventNormalizer("session-a")
+            val failed = live(normalizer, "session-a", 1, 1_790_000_000.0,
+                """{"type":"compaction_end","errorMessage":"synthetic failure"}""")
+            projection.acceptFrame(failed.raw, failed.frame, "session-a", failed.events)
+            assertTrue(projection.snapshot().sessions.single().hasFailure)
+            val newer = historyFrame("session-a", listOf(
+                """{"role":"assistant","timestamp":1790000001000,"content":[{"type":"text","text":"newer success"}]}"""
+            ), listOf("newer-reply"), false)
+            projection.acceptFrame(newer, GatewayWireDecoder.decode(newer), "session-a")
+            assertFalse(projection.snapshot().sessions.single().hasFailure)
+        } finally { projection.close() }
+    }
+
+    @Test
+    fun cancelledAndDeclinedCompactionDoNotBecomeDrawerFailures() {
+        for (end in listOf("""{"type":"compaction_end","aborted":true}""", """{"type":"compaction_end","status":"declined"}""")) {
+            val projection = AndroidGatewayProjection()
+            try {
+                val normalizer = PiEventNormalizer("session-a")
+                for ((i, event) in listOf("""{"type":"compaction_start"}""", end).withIndex()) {
+                    val f = live(normalizer, "session-a", i + 1, 100.0 + i, event)
+                    projection.acceptFrame(f.raw, f.frame, "session-a", f.events)
+                }
+                assertFalse(projection.snapshot().sessions.single().isRunning)
+                assertFalse(projection.snapshot().sessions.single().hasFailure)
+                assertTrue(projection.snapshot().sessions.single().hasUnread)
+            } finally { projection.close() }
+        }
+    }
+
+    @Test
     fun hiddenHistoryPageKeepsItsCursorWithoutVisibleEvents() {
         val requests = mutableListOf<Triple<String, String?, Boolean>>()
         val projection = AndroidGatewayProjection(
@@ -213,6 +347,51 @@ class AndroidGatewayProjectionTest {
             } finally {
                 projection.close()
             }
+        }
+    }
+
+    /**
+     * 树页 label-put 写入的 LabelEntry 会成为文件叶子但不投影成消息：
+     * history 帧 latestEntryId=LabelEntry 而 entryIds 尾是真实消息，isBehindLatest
+     * 不得误报“跳到最新”（误报时点下去会把 switch-branch 打到 LabelEntry 上）。
+     * 标记只豁免本端写入的 id；后续主线真有新消息（叶子换成新消息 id）时判定恢复。
+     */
+    @Test
+    fun ownLabelEntryLeafDoesNotFakeBehindLatestAndRealProgressStillDetects() {
+        val projection = AndroidGatewayProjection()
+        try {
+            projection.selectSession("session-l")
+            val first = """{"kind":"history","sessionId":"session-l","messages":[{"role":"user","content":"问题"}],"entryIds":["m1"],"latestEntryId":"m1","oldestEntryId":"m1","hasMore":false}"""
+            projection.acceptFrame(first, GatewayWireDecoder.decode(first), "session-l")
+            assertFalse(projection.isBehindLatest("session-l"))
+
+            // 写标签：文件叶子变成 LabelEntry（lab-1），页内 entryIds 尾仍是 m1。
+            val afterLabel = """{"kind":"history","sessionId":"session-l","messages":[{"role":"user","content":"问题"}],"entryIds":["m1"],"latestEntryId":"lab-1","oldestEntryId":"m1","hasMore":false}"""
+            projection.markNonRenderingLeaf("session-l", "lab-1")
+            projection.acceptFrame(afterLabel, GatewayWireDecoder.decode(afterLabel), "session-l")
+            assertFalse("自己写出的标签叶子不算落后", projection.isBehindLatest("session-l"))
+
+            // 主线真的前进：叶子换成新消息 m2，豁免不得吞掉真实的“跳到最新”。
+            val advanced = """{"kind":"history","sessionId":"session-l","messages":[{"role":"user","content":"问题"}],"entryIds":["m1"],"latestEntryId":"m2","oldestEntryId":"m1","hasMore":false}"""
+            projection.acceptFrame(advanced, GatewayWireDecoder.decode(advanced), "session-l")
+            assertTrue("新消息叶子仍应提示落后", projection.isBehindLatest("session-l"))
+
+            // 未标记的其他簿记叶子（如改会话名）仍按原行为误报——整类归一见 TODO HIST03，
+            // 这里钉住当前边界，防止窄修被误当整类修复。
+            val afterRename = """{"kind":"history","sessionId":"session-l","messages":[{"role":"user","content":"问题"}],"entryIds":["m1"],"latestEntryId":"info-1","oldestEntryId":"m1","hasMore":false}"""
+            projection.acceptFrame(afterRename, GatewayWireDecoder.decode(afterRename), "session-l")
+            assertTrue("未标记的簿记叶子维持现状（HIST03 待裁定归一）", projection.isBehindLatest("session-l"))
+
+            // 竞态顺序（复审C）：网关 appendLabelChange 后叶子立即前进，同一连接上
+            // history 帧可能先于 label-put 应答到达——豁免按具体 entryId 命中，与
+            // 登记/帧的先后无关，mark 到位后判定即收敛为不落后。
+            val frameFirst = """{"kind":"history","sessionId":"session-l","messages":[{"role":"user","content":"问题"}],"entryIds":["m1"],"latestEntryId":"lab-2","oldestEntryId":"m1","hasMore":false}"""
+            projection.acceptFrame(frameFirst, GatewayWireDecoder.decode(frameFirst), "session-l")
+            assertTrue("mark 前的短暂窗口内仍误报（当前实现的诚实边界）", projection.isBehindLatest("session-l"))
+            projection.markNonRenderingLeaf("session-l", "lab-2")
+            assertFalse("mark 后收敛为不落后，顺序无关", projection.isBehindLatest("session-l"))
+        } finally {
+            projection.close()
         }
     }
 
@@ -494,6 +673,21 @@ class AndroidGatewayProjectionTest {
     }
 
     @Test
+    fun rejectedHistorySurfacesFailureAndRetryClearsIt() {
+        val projection = AndroidGatewayProjection()
+        projection.selectSession("session-a")
+        projection.historyRejected("session-a", "history-cursor-invalid")
+        assertFalse(projection.snapshot().selectedHistoryIsLoading)
+        assertEquals("history-cursor-invalid", projection.snapshot().selectedHistoryError)
+        projection.loadHistory("session-a", older = false)
+        assertEquals(null, projection.snapshot().selectedHistoryError)
+        val page = historyFrame("session-a", listOf(userMessage("recovered")), listOf("e1"), false)
+        projection.acceptFrame(page, GatewayWireDecoder.decode(page), "session-a")
+        assertEquals(listOf("recovered"), projection.snapshot().conversation.map { it.text })
+        projection.close()
+    }
+
+    @Test
     fun historyCancellationEndsLoadingSoSelectionCanRequestAgain() {
         val requested = mutableListOf<Pair<String, String?>>()
         val projection = AndroidGatewayProjection(
@@ -594,53 +788,16 @@ class AndroidGatewayProjectionTest {
         projection.close()
     }
 
-    @Test
-    fun historyCustomEmptyStopRetryRestoresUpstreamNotice() {
-        val projection = AndroidGatewayProjection()
-        projection.selectSession("session-a")
-        // 会话文件里的 type=custom entry 经网关转成 role=custom 的 wire message
-        // （details=attempt/reason/model）；历史重建要还原实时侧的红色提示。
-        val history = historyFrame(
-            "session-a",
-            messages = listOf(
-                """{"role":"custom","customType":"empty-stop-retry",""" +
-                    """"details":{"attempt":1,"reason":"流错误: 401 余额不足","model":"relayF/model-x"}}""",
-            ),
-            entryIds = listOf("e1"),
-            hasMore = false
-        )
-        projection.acceptFrame(history, GatewayWireDecoder.decode(history), "session-a")
-        val notice = projection.snapshot().conversation.single()
-        assertEquals(ConversationItemKind.SYSTEM, notice.kind)
-        assertTrue(notice.isError)
-        assertTrue(notice.text.contains("401"))
-        // 重试第二次（attempt=2）不再渲染，与实时侧的去重一致
-        val history2 = historyFrame(
-            "session-a",
-            messages = listOf(
-                """{"role":"custom","customType":"empty-stop-retry",""" +
-                    """"details":{"attempt":2,"reason":"流错误: 401 余额不足"}}"""
-            ),
-            entryIds = listOf("e2"),
-            hasMore = false
-        )
-        projection.acceptFrame(history2, GatewayWireDecoder.decode(history2), "session-a")
-        assertEquals(1, projection.snapshot().conversation.size)
-        projection.close()
-    }
 
     @Test
     fun historyHiddenCustomMessageDoesNotRenderAsUpstreamError() {
         val projection = AndroidGatewayProjection()
         projection.selectSession("session-a")
-        // empty-stop-guard 一类扩展除了写带 details 的 custom entry，还会写一条
-        // display=false 的 custom_message（注入给模型的隐藏续跑指令，没有 details）。
-        // pi 契约里 display=false 表示完全隐藏（TUI 同样不渲染），历史重建必须跳过——
-        // 否则每次重试都会多出一条假的"上游没有返回可见正文"错误。
+        // 通用隐藏custom_message不显示，不依赖任何私有类型。
         val history = historyFrame(
             "session-a",
             messages = listOf(
-                """{"role":"custom","customType":"empty-stop-retry","content":"继续","display":false}"""
+                """{"role":"custom","entryType":"custom_message","customType":"notice","content":"继续","display":false}"""
             ),
             entryIds = listOf("e3"),
             hasMore = false
@@ -659,7 +816,7 @@ class AndroidGatewayProjectionTest {
         val history = historyFrame(
             "session-a",
             messages = listOf(
-                """{"role":"custom","customType":"compaction","content":"摘要...","display":true,"details":{"tokensBefore":118000,"firstKeptEntryId":"e9"}}"""
+                """{"role":"custom","entryType":"compaction","customType":"compaction","content":"摘要...","display":true,"details":{"tokensBefore":118000,"firstKeptEntryId":"e9"}}"""
             ),
             entryIds = listOf("e20"),
             hasMore = false

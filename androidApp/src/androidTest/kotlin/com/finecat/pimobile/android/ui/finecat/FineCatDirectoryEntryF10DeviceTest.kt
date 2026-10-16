@@ -13,6 +13,7 @@ import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -182,6 +183,77 @@ class FineCatDirectoryEntryF10DeviceTest {
         saveShotNamed(rootBitmap(), "f10-cwd-cancel-home.png")
     }
 
+    @Test
+    fun firstDirectoryFailure_globalRetryUsesOriginalRequestedPath() {
+        connectWithOldSession()
+        goHomeWithDraft()
+        openDirectorySheet()
+        val expected = transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull
+        assertEquals(OLD_CWD, expected)
+        transport.receive("""{"kind":"error","code":"bad-request","requestType":"directories"}""")
+        runBlocking { waitUntil { holder.directoryError != null } }
+        compose.waitForIdle()
+        val before = transport.payloadsOfType("directories").size
+        compose.onNode(hasAnyAncestor(isDialog()) and hasText("重试")).performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > before } }
+        assertEquals(expected, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        assertEquals(DRAFT, holder.messageDraft)
+    }
+
+    @Test
+    fun childDirectoryFailure_globalRetryUsesFailedChildNotLastSuccessfulParent() {
+        connectWithOldSession()
+        goHomeWithDraft()
+        browseToHomeParent()
+        val beforeChild = transport.payloadsOfType("directories").size
+        compose.onNodeWithTag("finecat.dirItem.new-proj").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeChild } }
+        transport.receive("""{"kind":"error","code":"bad-request","requestType":"directories"}""")
+        runBlocking { waitUntil { holder.directoryError != null } }
+        compose.waitForIdle()
+        assertEquals(HOME, holder.directoryPath)
+        val beforeRetry = transport.payloadsOfType("directories").size
+        compose.onNode(hasAnyAncestor(isDialog()) and hasText("重试")).performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeRetry } }
+        assertEquals(NEW_CWD, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        assertEquals(DRAFT, holder.messageDraft)
+    }
+
+    @Test
+    fun directoryInFlightWebSocketFailure_keepsListingAndRetriesRequestedChild() {
+        connectWithOldSession()
+        goHomeWithDraft()
+        browseToHomeParent()
+        val entries = holder.directoryEntries
+        val beforeChild = transport.payloadsOfType("directories").size
+        compose.onNodeWithTag("finecat.dirItem.new-proj").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeChild } }
+        assertTrue(holder.directoryIsLoading)
+        transport.fail("websocket-failure")
+        runBlocking { waitUntil { holder.directoryError == "连接已断开，请重试" } }
+        compose.waitForIdle()
+        assertFalse(holder.directoryIsLoading)
+        assertEquals(HOME, holder.directoryPath)
+        assertEquals(entries, holder.directoryEntries)
+        assertEquals(DRAFT, holder.messageDraft)
+        compose.onNodeWithText("连接已断开，请重试").assertExists()
+        compose.onNodeWithText("重试").assertExists()
+
+        runBlocking {
+            graph!!.gatewayRuntime.connectStoredIfPaired()
+            transport.open()
+            transport.receive(HELLO)
+            waitUntil { holder.gatewayState.connection.name == "CONNECTED" }
+        }
+        val beforeRetry = transport.payloadsOfType("directories").size
+        compose.onNodeWithText("重试").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeRetry } }
+        assertEquals(NEW_CWD, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        answerDirectories(NEW_CWD, emptyList())
+        assertEquals(null, holder.directoryError)
+        assertEquals(DRAFT, holder.messageDraft)
+    }
+
     /** 目录读取失败：面板内错误行+重试；状态与草稿不变；重试发出新的 directories 请求。 */
     @Test
     fun newSession_directoryReadFailure_keepsStateAndDraft_retryRequests() {
@@ -197,8 +269,8 @@ class FineCatDirectoryEntryF10DeviceTest {
         // 全局弹窗先收起（「好」只关弹窗，不重试）
         compose.onNode(hasAnyAncestor(isDialog()) and hasText("好")).performClick()
         compose.waitForIdle()
-        // 面板内错误行显示 Runtime 稳定错误码（不回显上游 message，与 provider/切分支同原则）
-        val panelError = compose.onAllNodesWithText("目录加载失败：bad-request").fetchSemanticsNodes().isNotEmpty()
+        // 面板内显示稳定码映射后的短中文，不回显上游 message。
+        val panelError = compose.onAllNodes(hasText("目录路径无效") and hasAnyAncestor(hasTestTag("finecat.dirSheet"))).fetchSemanticsNodes().isNotEmpty()
         val requestsBeforeRetry = transport.payloadsOfType("directories").size
         compose.onNodeWithTag("finecat.dirSheet", useUnmergedTree = true).assertExists()
         val retryNodes = compose.onAllNodes(hasText("重试")).fetchSemanticsNodes()
@@ -216,8 +288,7 @@ class FineCatDirectoryEntryF10DeviceTest {
 
     /**
      * 创建失败（首条 message 被网关拒绝，如 cwd 已被删）：不伪造新会话，旧会话与新会话落点
-     * 不变，纯文本草稿回填到输入框（批准「创建失败保留草稿」）。按真实时序：本地发送成功
-     * 先清空输入框，网关拒绝随后到达。
+     * 不变；本地发送写出后与网关拒绝后，输入框都保留原稿。
      */
     @Test
     fun newSession_firstMessageRejected_noFabricatedSession() {
@@ -227,7 +298,6 @@ class FineCatDirectoryEntryF10DeviceTest {
         compose.onNodeWithContentDescription("发送").performClick()
         runBlocking {
             waitUntil { transport.payloadsOfType("message").isNotEmpty() }
-            waitUntil { holder.messageDraft.isEmpty() }
         }
         transport.receive("""{"kind":"error","code":"bad-request","message":"cwd 不存在","requestType":"message"}""")
         runBlocking { waitUntil { holder.messageDraft.isNotEmpty() } }
