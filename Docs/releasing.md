@@ -39,6 +39,7 @@ Release 已通过 `vcsInfo.include = false` 关闭开发仓版本控制元数据
 
 - 源码：手机端与网关分别建立公开仓库，按配套版本发布；两仓 README 填入实际仓库链接。
 - 安装包：分发包含签名 APK、根目录 `LICENSE`、`Docs/third-party-notices.md` 与 `Docs/licenses/Apache-2.0.txt` 的 ZIP。若另提供 APK 直链，发布页同时附上这些声明和许可文件。
+- 命名：APK 为 `pi-mobile-v<versionName>.apk`，ZIP 为 `pi-mobile-v<versionName>-release.zip`，Git tag 为 `v<versionName>`。对外文件名不带 `versionCode` 或构建哈希；`versionCode` 每次发布递增，记录在包内和发布说明中。改名时复用已验证 APK 的原字节，不重新构建、签名或重置版本号，并同步更新压缩包内的文件名、安装说明、链接和 `SHA256SUMS`，回下载后完整核对。
 - 校验：提供下载文件的 SHA-256；私有构建路径、内部清单和开发提交历史不放入发行附件。
 - 产品截图：使用当前版本的合成会话与示例目录，放在 `Docs/images/` 并更新 README；检查完整图片及元数据，不含配对码、密钥、真实会话、私人目录、网关地址或通知栏私人信息。优先重新截图，必须遮挡时使用不透明覆盖并重编码。
 

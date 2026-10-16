@@ -29,11 +29,15 @@ google-services.json
 *.apk
 *.aab
 
+# 个人 agent 补充规则（AGENTS.md 与 .agents/notes/ 是公开协作规范，需要提交）
+AGENTS.override.md
+AGENTS.local.md
+CLAUDE.local.md
+
 # 私有开发资料与 agent 运行状态，不进入公开仓库
 # 已跟踪文件不受 ignore 影响；首次公开须从筛选后的快照发布。
-.agents/
 .pi/
-AGENTS.md
+/.agents/private/
 Docs/reviews/
 bug-full.md
 gateway-optim.md

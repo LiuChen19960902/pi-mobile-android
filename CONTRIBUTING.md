@@ -61,10 +61,12 @@ export ANDROID_HOME=/path/to/android-sdk
 2. 涉及连接/凭据的行为变化已在 `Docs/gateway-connect.md` 或 `SECURITY.md` 更新，且没有留下与代码不符的旧说法
 3. 新增依赖已登记到 `Docs/third-party-notices.md`（含版本与许可证）
 4. 真机跑过一次受影响的主链路（配对 / 发消息 / 历史分页 / 重连）
+5. 非平凡改动已新增或更新 Agent Note，见 [AGENTS.md](AGENTS.md) 与 [.agents/notes/README.md](.agents/notes/README.md)
+6. 改了文档或 Agent Note：`uv run --no-project python scripts/check-docs.py` 通过；改了该脚本还要跑 `uv run --no-project python -m unittest discover -s scripts -p 'test_*.py'`
 
 ## 持续集成
 
 CI 流水线不在仓库文件里，在所用 Git 托管平台的 CI 界面按以下定义创建两条（手机仓一条、网关仓一条）：
 
-- 手机仓：Linux runner + JDK 17 + Node 22.19+；同级检出网关仓（跨仓一致性测试 `GatewayConformanceTest` 需要它，缺失时用例自动跳过）；网关仓先 `npm ci`；手机仓跑 `./gradlew :shared:testAndroidHostTest :androidApp:testDebugUnitTest`
+- 手机仓：Linux runner + JDK 17 + Node 22.19+ + [uv](https://docs.astral.sh/uv/)；先跑文档检查 `uv run --no-project python scripts/check-docs.py` 与 `uv run --no-project python -m unittest discover -s scripts -p 'test_*.py'`；同级检出网关仓（跨仓一致性测试 `GatewayConformanceTest` 需要它，缺失时用例自动跳过）；网关仓先 `npm ci`；手机仓跑 `./gradlew :shared:testAndroidHostTest :androidApp:testDebugUnitTest`
 - 网关仓（`pi-mobile-gateway`）：Node 22.19+；`npm ci` 后跑 `npm run check`（类型检查、格式检查和单测）
