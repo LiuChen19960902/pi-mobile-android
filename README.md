@@ -2,6 +2,10 @@
 
 在手机上用你电脑里跑的 [pi](https://github.com/earendil-works/pi)：发消息、看流式回复与思考过程、看工具调用与 Pi 会话树、切模型与思考档位。
 
+[![Pi Mobile 演示视频封面](Docs/images/promo/pi-mobile-video-cover.png)](https://github.com/LiuChen19960902/pi-mobile-android/releases/download/v1.0.0/pi-mobile-demo.mp4)
+
+[下载演示视频](https://github.com/LiuChen19960902/pi-mobile-android/releases/download/v1.0.0/pi-mobile-demo.mp4) · 44 秒，含声音
+
 链路只在你自己的电脑和手机之间：
 
 ```text
