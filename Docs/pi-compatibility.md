@@ -1,6 +1,6 @@
 # Pi 支持边界
 
-Pi Mobile 通过网关使用 Pi SDK，提供手机界面；它不镜像正在运行的 Pi 终端。支持范围以网关锁定的 SDK、已实现的协议和客户端投影为准。当前配套网关锁定的依赖为 `@earendil-works/pi-coding-agent 1.0.4`，不能用另一版本 CLI 的表现代替兼容性验证。
+Pi Mobile 通过网关使用 Pi SDK，提供手机界面；它不镜像正在运行的 Pi 终端。支持范围以网关锁定的 SDK、已实现的协议和客户端投影为准。当前配套网关锁定的依赖为 `@earendil-works/pi-coding-agent 1.3.0`，不能用另一版本 CLI 的表现代替兼容性验证。
 
 ## 按公开契约接入
 

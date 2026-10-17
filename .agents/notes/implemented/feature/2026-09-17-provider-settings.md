@@ -32,6 +32,7 @@ Status: implemented
 - **模型级 `baseUrl`**：省略 = 保留，字符串 = 覆盖，显式 `null` = 删除键、恢复继承 Provider；宿主 JSON 中不保留 null。草稿探针的 `modelBaseUrl` 同样区分省略与 null，测试前先 trim、空值转 null。旧网关没有该能力时隐藏编辑。
 - **compat**：整个字段省略 = 保留原配置；发对象但省略某个手机管理的键 = 清除该项覆盖；发 `{}` = 清空全部手机管理的键、保留宿主私有键（网关按 `{...宿主私有键, ...phoneCompat}` 合并）。`null` 值被网关跳过，手机不发显式 null。只有用户动过这一层（`compatTouched`）才把它当权威整份下发；换协议时只在确实有键被过滤时才置 touched。
 - **`thinkingLevelMap`**：键是 Pi 的七个档位，值是 string 或 null。网关对非空 map 整体替换，遗漏旧键会删除覆盖；省略或空 map 保留旧值。改键时保留其取值和所有未编辑的键；显式 null 与“恢复默认”不同。目前不提供用空 map 清除最后一个映射。编辑器显示全部标准键，未改的显示“默认”并省略；换键候选按草稿实际占用判断。
+- 思考映射的键与取值属于不同层：键 `off` 是 Pi 关闭思考的档位；值 `none` 或 `off` 是上游字面值，SDK按协议下发，不能互换。取值候选由通用档位和已有配置组成，不是上游能力声明；按端点契约选择，例如 `off: "none"`。显式 `null` 表示该档不支持，缺键则使用SDK默认映射。
 - **容量**：留空 = 不下发，网关 `put` 按 `{...priorModel, ...model}` 合并，所以留空 = 保留旧值；网关只写入正整数。只有新模型 ID 的空容量写入 Pi SDK 的缺省值（上下文 128000、输出 16384），使新主机不必先从模型目录读出参数就能保存；已有 ID 的空容量省略。SDK 缺省不是厂商能力，SDK 升级后复核 `provider-composer` 的 `modelFromJson`。
 - 数字缩写 K = 1000、M = 1000000；旧整数不能被新倍率整除时原样显示，只改显示和输入解释，不自动转换宿主已存的整数。
 
@@ -40,7 +41,8 @@ Status: implemented
 - `provider-put` 不自动追加 `providerId/*`：新增定义不扩大启用范围。
 - 本次编辑中删掉的模型行调用 `removeEnabledModelPatterns(providerId, removedModelIds)` 清理具体 pattern；`provider-delete` 调用 `removeEnabledModelPatternsForProvider` 按前缀清理（`providerId/*` 与 `providerId/<模型>` 全清）。`enabledModels` 中常是具体 pattern，只拼 `${providerId}/*` 去删会因不匹配而残留。更早遗留的 pattern 需要手改 settings 或删除 Provider 后重建。
 - 模型菜单读 `getGlobalSettings().enabledModels`，再走 SDK resolver 解析通配符、思考级别和顺序；SettingsManager 会合并项目设置，不能把网关工程目录的范围当成手机要读的全局范围。全部 pattern 无匹配时按 Pi 原生回到全部可用模型。
-- 编辑全局范围时：显式保存才写具体 ID，保留已有 `thinkingLevel`；无匹配的既有项单列并默认保留；“恢复默认”写空数组（Pi 语义为全部可用）。读到坏 JSON 或类型无效的 `enabledModels` 拒绝编辑，不能降级后覆盖宿主。保存串入 settings 写队列，flush / reload 确认落盘。SDK 1.0.4 的 `setScopedModels` 只更新循环范围，不调用 `setModel`；恢复会话不重选首个模型。
+- 编辑全局范围时：显式保存才写具体 ID，保留已有 `thinkingLevel`；无匹配的既有项单列并默认保留；“恢复默认”写空数组（Pi 语义为全部可用）。读到坏 JSON 或类型无效的 `enabledModels` 拒绝编辑，不能降级后覆盖宿主。保存串入 settings 写队列，flush / reload 确认落盘。SDK 1.3.0 的 `setScopedModels` 只更新循环范围，不调用 `setModel`；恢复会话不重选首个模型。
+- 范围读取、保存回执、菜单与新会话统一调用 SDK 公开解析器；多 Provider 同名模型和大小写边界见[官方模型范围解析](../architecture/2026-10-17-native-model-scope.md)。
 - 模型调序只是手机进程内的展示顺序，编辑和删除映射回原索引，提交仍按原顺序，不持久化到 `models.json`。
 
 ## 考虑过的方案
