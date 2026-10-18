@@ -28,9 +28,8 @@ internal class ProviderEditorDraft(
 /**
  * P10a/P10b FineCat Provider 表单的纯逻辑（无 Compose，JVM 可测）。
  *
- * 复用旧 UI 已验证过的两份真源：模型行用 [ProviderModelDraft]、连通性指纹用
- * [providerFingerprint]，语义与 `ProviderSettingsUi` 保持一致（同一份配置在两套
- * UI 里改，测试结论的判定口径不会分叉）。
+ * 模型行与连通性指纹复用 [ProviderModelDraft]、[providerFingerprint]。
+ * 保存门槛按有效连接的改动计算，普通参数只做格式校验。
  */
 internal object FineCatProviderForm {
 
@@ -200,45 +199,58 @@ internal object FineCatProviderForm {
     fun fingerprint(baseUrl: String, apiKey: String, rows: List<ProviderModelDraft>): String =
         providerFingerprint(baseUrl, apiKey, rows)
 
+    /** 只用于当前表单内存，不落盘或输出；模型覆盖地址不受公共地址变化影响。 */
+    fun connectionFingerprint(id: String, baseUrl: String, apiKey: String, row: ProviderModelDraft): String =
+        "${id.trim().length}:${id.trim()}" + providerFingerprint(
+            row.baseUrl.trim().ifBlank { baseUrl.trim() }, apiKey,
+            listOf(row.copy(baseUrl = "")),
+        )
+
     /**
-     * 保存门槛（旧 UI 同语义）：本份表单刚测通过，或既有 provider 一字未改且上次
-     * 网关侧结论是通过。没有第三种放行：表单里还没填模型时测试按钮不可用，那时
-     * 就是不能保存（网关虽允许“只凭据”的 provider，但门槛不得被绕过），UI 把
-     * 这一步该做什么写清楚。在途测试不在此进硬拦：同一份配置上次已通过就没必要
-     * 重新排队，而“测试被 lane 挡回、结论不会来”时硬拦会把表单锁死；在途编辑的
-     * 防护靠 [testedFingerprintOnResult] 只给发起时指纹的通行证。
+     * 每组需有一项通过：公共连接可任选受影响模型，模型自身改动必须测该模型。
+     * 普通字段与删除不产生测试要求，也不依赖 Provider 过去是否测过。
      */
-    fun canSave(
-        testedFingerprint: String?,
-        fingerprint: String,
-        initialFingerprint: String,
-        existingStatusOk: Boolean,
-    ): Boolean {
-        if (testedFingerprint != null && testedFingerprint == fingerprint) return true
-        return fingerprint == initialFingerprint && existingStatusOk
+    fun requiredTestGroups(
+        initial: GatewayProvider?, id: String, baseUrl: String, apiKey: String,
+        rows: List<ProviderModelDraft>,
+    ): List<List<ProviderModelDraft>> {
+        val current = testModels(rows)
+        if (initial == null || id.trim() != initial.id) return listOf(current)
+        // 已有 Provider 清空模型时没有可用模型被改变；以后新增仍逐项要求测试。
+        if (current.isEmpty()) return emptyList()
+        val effectiveBaseUrl = baseUrl.trim().ifBlank { initial.baseUrl.orEmpty().trim() }
+        val previous = initialRows(initial).associateBy { it.id }
+        val groups = mutableListOf<List<ProviderModelDraft>>()
+        if (apiKey.isNotBlank()) groups.add(current)
+        if (effectiveBaseUrl != initial.baseUrl.orEmpty().trim()) {
+            // 所有模型均有覆盖地址时，公共地址没有改变它们的实际连接。
+            val inherited = current.filter { row -> row.baseUrl.isBlank() &&
+                previous[row.id]?.baseUrl?.trim()?.ifBlank { initial.baseUrl.orEmpty().trim() } != effectiveBaseUrl }
+            if (inherited.isNotEmpty()) groups.add(inherited)
+        }
+        current.forEach { row ->
+            val before = previous[row.id]
+            val modelUrlChanged = before != null && row.baseUrl.trim() != before.baseUrl.trim() &&
+                row.baseUrl.trim().ifBlank { effectiveBaseUrl } !=
+                before.baseUrl.trim().ifBlank { initial.baseUrl.orEmpty().trim() }
+            if (before == null || row.api != before.api || modelUrlChanged) groups.add(listOf(row))
+        }
+        return groups.distinct()
     }
 
-    /**
-     * 测试结论回来时绑定「发起时那份表单」：只有结论允许保存才记下指纹，
-     * 否则保持原状（失败不能把旧通行证续上）。
-     */
-    fun testedFingerprintOnResult(
-        currentTested: String?,
-        pendingFingerprint: String?,
-        outcomeAllowsSave: Boolean,
-    ): String? = if (outcomeAllowsSave && pendingFingerprint != null) pendingFingerprint else currentTested
-
-    /** 表单变化后旧结论失效：仅当已测指纹 != 当前指纹时抹掉。 */
-    fun testedFingerprintAfterEdit(currentTested: String?, fingerprint: String): String? =
-        currentTested?.takeIf { it == fingerprint }
+    fun untestedGroups(
+        groups: List<List<ProviderModelDraft>>, id: String, baseUrl: String, apiKey: String,
+        results: Map<String, ProviderTestAttempt>,
+    ): List<List<ProviderModelDraft>> = groups.filter { group ->
+        group.none { results[connectionFingerprint(id, baseUrl, apiKey, it)]?.ok == true }
+    }
 
     /**
      * 本卡片发起过、还没取走结论的一次 provider 请求。
      *
-     * 网关的 provider 应答帧**没有 requestId**（PROTOCOL.md §4.17 只回显 `id`），
-     * 所以归属只能做在有界的地方：发起方自己记住「我在等哪个 id 的结果」，结果帧的
-     * `providerId` 必须与发起时一致才算数。`providerId == null` 表示发起时表单还没
-     * id（新建未命名），它和「没在等」是两回事，故用非空的 key 包一层。
+     * 卡片领取门面结果时核对 Provider；单模型探针另在 Runtime / 门面按
+     * providerTestId 严格关联。`providerId == null` 表示新建时还没填 ID，
+     * 与「没在等」不同，故用非空 key 包一层。
      */
     data class ProviderRequestKey(val providerId: String?, val token: String? = null)
 

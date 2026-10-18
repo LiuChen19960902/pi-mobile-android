@@ -108,6 +108,7 @@ class AndroidSharedStateHolder(
     private var providerTestJob: Job? = null
     private var pendingProviderProbe: CompletableDeferred<ProviderProbeReply>? = null
     private var providerProbeId: String? = null
+    private var providerProbeRequestId: String? = null
     /** 手动注入的 event 帧按会话持有归一器，与 GatewayRuntime 的实时路径同语义。 */
     private val wirePayloadNormalizers = mutableMapOf<String, PiEventNormalizer>()
     private var inputGeneration = 0L
@@ -1578,12 +1579,17 @@ class AndroidSharedStateHolder(
         baseUrl: String?,
         apiKey: String?,
         targets: List<ProviderTestTarget>,
+        requiredModelGroups: List<Set<String>> = emptyList(),
     ) {
         val appGraph = graph ?: return
         val uiScope = scope ?: return
         if (providerTestIsLoading || targets.isEmpty()) return
         if (gatewayState.connection != GatewayConnectionState.CONNECTED) {
             providerTestResult = ProviderTestOutcome(false, "请先连接 Pi 网关", id)
+            return
+        }
+        if ("provider-test-id-v1" !in gatewayState.capabilities) {
+            providerTestResult = ProviderTestOutcome(false, "请更新网关后测试连接", id)
             return
         }
         val capturedTargets = targets.toList()
@@ -1595,6 +1601,7 @@ class AndroidSharedStateHolder(
             try {
                 val outcome = testProviderModelsUntilSuccess(
                     targets = capturedTargets,
+                    requiredModelGroups = requiredModelGroups,
                     onAttempt = { index, total, target ->
                         if (ownerEpoch != gatewayUiEpoch) throw CancellationException("gateway-replaced")
                         providerTestProgress = "测试 $index/$total · ${target.modelId ?: "默认模型"}"
@@ -1603,6 +1610,8 @@ class AndroidSharedStateHolder(
                         val reply = CompletableDeferred<ProviderProbeReply>()
                         pendingProviderProbe = reply
                         providerProbeId = id
+                        val probeRequestId = java.util.UUID.randomUUID().toString()
+                        providerProbeRequestId = probeRequestId
                         try {
                             // Runtime的30s lane超时及断连取消是主终态；这里给接线
                             // 自身补45s上限，避免异常事件丢失使表单永久等待。
@@ -1612,6 +1621,7 @@ class AndroidSharedStateHolder(
                                         GatewayRequests.providerTest(
                                             id, baseUrl, apiKey, target.modelId, target.api,
                                             target.modelBaseUrl, target.modelBaseUrlSpecified,
+                                            providerTestId = probeRequestId,
                                         )
                                     )
                                 }
@@ -1643,6 +1653,7 @@ class AndroidSharedStateHolder(
                 if (ownerEpoch == gatewayUiEpoch) {
                     pendingProviderProbe = null
                     providerProbeId = null
+                    providerProbeRequestId = null
                     providerTestProgress = null
                     providerTestBatchActive = false
                     providerTestIsLoading = false
@@ -2383,6 +2394,7 @@ class AndroidSharedStateHolder(
         providerTestBatchActive = false
         pendingProviderProbe = null
         providerProbeId = null
+        providerProbeRequestId = null
         clearProviderRequestLoading()
         providerTestResult = null
         providerTestProgress = null
@@ -4071,17 +4083,19 @@ class AndroidSharedStateHolder(
                 val ok = frame.ok == true
                 val outcome = ProviderTestOutcome(
                     ok = ok,
-                    summary = if (ok) {
-                        "连接正常" + (frame.latencyMs?.let { "（${it}ms）" } ?: "")
-                    } else frame.error ?: "连接失败",
+                    summary = providerTestSummary(ok, frame.code, frame.httpStatus),
                     providerId = frame.id,
                     url = frame.url,
                     failureKind = frame.failureKind,
                     httpStatus = frame.httpStatus,
+                    latencyMs = frame.latencyMs,
+                    diagnosticCode = frame.code,
                 )
                 if (providerTestBatchActive) {
                     // 批次只认自己的Provider回执；中间失败不对表单发通行证。
-                    if (frame.id == providerProbeId) pendingProviderProbe?.complete(ProviderProbeReply(outcome))
+                    if (frame.id == providerProbeId && frame.providerTestId == providerProbeRequestId) {
+                        pendingProviderProbe?.complete(ProviderProbeReply(outcome))
+                    }
                 } else {
                     providerTestIsLoading = false
                     providerTestResult = outcome
@@ -4290,10 +4304,7 @@ class AndroidSharedStateHolder(
         val model: GatewayModelSelection? = null
     )
 
-    /** provider 连接测试的展示态（表单内联提示）：失败原因是网关给的可操作文案。
-     *  `providerId` 用于归属：编辑弹窗只展示当前对象的结论，避免跨 provider 残留误读。
-     *  `failureKind`：`config` 需用户改配置（阻止保存）；`transient` 是上游临时问题
-     *  （超时/5xx/429，不阻止保存）。注意失败原因文案已自带实际请求的 URL。 */
+    /** 测试结论归属当前 Provider；失败分类不代替表单的改动与保存判定。 */
     data class ProviderTestOutcome(
         val ok: Boolean,
         val summary: String,
@@ -4302,6 +4313,8 @@ class AndroidSharedStateHolder(
         val failureKind: String? = null,
         val attempts: List<ProviderTestAttempt> = emptyList(),
         val httpStatus: Int? = null,
+        val latencyMs: Long? = null,
+        val diagnosticCode: String? = null,
     ) {
         /** 是否允许据此保存：连接正常，或失败属于上游临时问题。 */
         val allowsSave: Boolean get() = ok || failureKind == "transient"

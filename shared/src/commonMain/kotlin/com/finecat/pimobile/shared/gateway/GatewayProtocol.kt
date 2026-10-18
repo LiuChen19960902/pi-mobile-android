@@ -617,11 +617,14 @@ object GatewayRequests {
         api: String? = null,
         modelBaseUrl: String? = null,
         modelBaseUrlSpecified: Boolean = false,
+        providerTestId: String? = null,
     ): GatewayRequest = request(
         "provider-test",
         "provider-test-result",
+        correlationId = providerTestId,
         lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
     ) {
+        providerTestId?.let { put("providerTestId", it) }
         id?.takeIf(String::isNotBlank)?.let { put("id", it) }
         baseUrl?.takeIf(String::isNotBlank)?.let { put("baseUrl", it) }
         apiKey?.takeIf(String::isNotBlank)?.let { put("apiKey", it) }

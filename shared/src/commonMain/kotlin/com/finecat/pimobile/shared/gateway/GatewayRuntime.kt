@@ -1091,16 +1091,19 @@ class GatewayRuntime(
         "dequeue" -> frame.queueRequestId == request.correlationId && frame.sessionId == request.targetSessionId &&
             frame.queued != null && frame.queuedMessages != null && frame.isStreaming != null && frame.isCompacting != null
         "model-scope-put" -> frame.scopeRequestId == request.correlationId
+        "provider-test" -> request.correlationId == null || frame.providerTestId == request.correlationId
         in INPUT_ASSIST_REQUEST_TYPES -> frame.queryId == request.correlationId && frame.sessionId == request.targetSessionId
         else -> true
     }
 
-    private fun responseCorrelation(frame: GatewayFrame): String? = frame.queueRequestId ?: frame.queryId ?: frame.scopeRequestId
+    private fun responseCorrelation(frame: GatewayFrame): String? =
+        frame.queueRequestId ?: frame.queryId ?: frame.scopeRequestId ?: frame.providerTestId
 
     private fun explicitResponseCorrelation(request: GatewayRequest, frame: GatewayFrame): String? = when (request.requestType) {
         "entry-copy", "label-put" -> frame.entryId
         "dequeue" -> frame.queueRequestId
         "model-scope-put" -> frame.scopeRequestId
+        "provider-test" -> frame.providerTestId
         in INPUT_ASSIST_REQUEST_TYPES -> frame.queryId
         else -> null
     }
@@ -1217,7 +1220,9 @@ class GatewayRuntime(
             releaseTurnLocked(lane.active.request.targetSessionId)
         }
         while (lane.queued.isNotEmpty()) deferredRequests.addLast(lane.queued.removeFirst())
-        if (responseKind == "attachment" || lane.active.request.requestType in INPUT_ASSIST_REQUEST_TYPES) {
+        if (responseKind == "attachment" || lane.active.request.requestType in INPUT_ASSIST_REQUEST_TYPES ||
+            (lane.active.request.requestType == "provider-test" && lane.active.request.correlationId != null)
+        ) {
             // §4.22 超时只结束自己：attachment 是只读请求且响应严格三元校验，迟到的
             // 错图帧本就可忽略，同一 Pi 条目的图不可变，不需要靠整连接回收消除无
             // 关联小请求的歧义；连接回收会连带误取消在途 message/history 与 turn
@@ -1225,6 +1230,7 @@ class GatewayRuntime(
             // 清掉其它 lane，超出“只结束自己”的范围。先完成等待者终态再发事件，
             // 避免事件队列背压推迟 caller 恢复。
             // 输入辅助也有严格 queryId，超时只结束该查询，不能切断正在生成的回复。
+            // 带独立标识的 Provider 探针同理；无标识的旧请求仍回收连接消除歧义。
             if (responseKind == "attachment") releasePendingAttachmentFetchLocked()
             emitEventLocked(
                 GatewayRuntimeEvent.RequestTimedOut(
@@ -1522,7 +1528,7 @@ class GatewayRuntime(
         )
         private val RESPONSE_KINDS_REQUIRING_ACTIVE_REQUEST = setOf(
             "history", "sent", "subscribed", "unsubscribed", "state", "aborted", "dequeued", "sessions", "model-scope-saved",
-            "input-resources", "input-completions", "entry-copy", "label-put"
+            "input-resources", "input-completions", "entry-copy", "label-put", "provider-test-result"
         )
         private val INPUT_ASSIST_REQUEST_TYPES = setOf("input-resources", "input-completions")
         private val IDEMPOTENT_CONNECTION_STATES = setOf(

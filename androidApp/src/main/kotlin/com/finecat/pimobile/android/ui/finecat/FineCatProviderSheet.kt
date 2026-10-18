@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import com.finecat.pimobile.android.ProviderTestTarget
 import com.finecat.pimobile.android.ProviderTestAttempt
+import com.finecat.pimobile.android.providerTestHint
 import com.finecat.pimobile.android.AndroidSharedStateHolder
 import com.finecat.pimobile.android.ui.PROVIDER_COMPAT_HINTS
 import com.finecat.pimobile.android.ui.ProviderModelDraft
@@ -104,7 +105,7 @@ import kotlinx.coroutines.delay
  *   点行进二级卡（`.mv-back` 可返回）；「手动添加模型」直接进新行的二级卡；
  *   `pv-pull` **只补新的**，回执一行「新增 N · 跳过 M（已存在）」。
  * - 旧 UI `ProviderSettingsUi`：API Key 留空=保留既有凭据（掩码不上 wire）、
- *   测试连接绑定「测试时的表单指纹」、测不过不让保存、协议逐模型下发。
+ *   测试连接绑定发起时的连接配置、协议逐模型下发。
  * - 解析/校验/拉取合并/门槛判定都在 [FineCatProviderForm]（纯函数，JVM 可测）。
  *
  * 只有异常才写字；Provider 副行不写协议（协议是模型级，components.md §8）。
@@ -414,23 +415,20 @@ private fun ProviderEditorForm(
             confirmDelete = false
         }
     }
-    // 测试门槛：testedFingerprint = 「哪份表单」刚测通过；pendingTestFingerprint =
-    // 点测试那一刻的指纹（结果绑那时的配置，不把旧结论洗给在途编辑后的新表单）。
-    val fingerprint = FineCatProviderForm.fingerprint(baseUrl, apiKey, rows.toList())
-    val initialFingerprint = remember {
-        // rememberSaveable恢复的输入可能已被编辑，不能把它当作未编辑/已测的原配置。
-        FineCatProviderForm.fingerprint(initialProvider?.baseUrl.orEmpty(), "", FineCatProviderForm.initialRows(initialProvider))
-    }
-    var testedFingerprint by remember { mutableStateOf<String?>(null) }
+    val fingerprint = "${id.trim()}\n" + FineCatProviderForm.fingerprint(baseUrl, apiKey, rows.toList())
+    // 公共地址留空在 provider-put 中表示保留；测试指纹与实际生效地址一致。
+    val effectiveProviderBaseUrl = baseUrl.trim().ifBlank { initialProvider?.baseUrl.orEmpty() }
+    val connectionKeys = rows.associate { row -> row.id.trim() to
+        FineCatProviderForm.connectionFingerprint(id, effectiveProviderBaseUrl, apiKey, row) }
+    var connectionResults by remember { mutableStateOf<Map<String, ProviderTestAttempt>>(emptyMap()) }
+    var pendingTestConnections by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var pendingTestFingerprint by remember { mutableStateOf<String?>(null) }
     var testOutcomeFingerprint by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(fingerprint) {
-        // 表单一变（指纹变）旧结论即失效；改回同一份配置不会自动复活。
-        testedFingerprint = FineCatProviderForm.testedFingerprintAfterEdit(testedFingerprint, fingerprint)
-        if (testOutcomeFingerprint != fingerprint) testOutcomeFingerprint = null
+    LaunchedEffect(connectionKeys) {
+        connectionResults = connectionResults.filterKeys { it in connectionKeys.values }
     }
-    // 结果归属：holder 的 provider 结果是全局的、应答帧又没有 requestId，所以只认
-    // 「本卡片发起过、且还没取走」的那一次（pending* 随卡片 remember 新建而重置）。
+    // holder 的结果由各卡片共享；卡片仅领取自己发起的结果。
+    // 测试回执另由 Runtime / holder 按 providerTestId 匹配，再按连接指纹认领。
     var pendingPull by remember { mutableStateOf<FineCatProviderForm.ProviderRequestKey?>(null) }
     var pendingTest by remember { mutableStateOf<FineCatProviderForm.ProviderRequestKey?>(null) }
     var pendingSave by remember { mutableStateOf<FineCatProviderForm.ProviderRequestKey?>(null) }
@@ -447,13 +445,15 @@ private fun ProviderEditorForm(
         pendingTestFingerprint = null
         testOutcome = outcome
         testOutcomeFingerprint = pending.takeIf { it == fingerprint }
-        // 结果只给「发起时那份表单」通行证：在途又改了表单的，洗不到新配置上。
-        testedFingerprint = FineCatProviderForm.testedFingerprintOnResult(
-            currentTested = testedFingerprint,
-            pendingFingerprint = pending,
-            outcomeAllowsSave = outcome.ok,
-        )
+        // 只认发起时的模型连接；迟到回执不认证随后修改的地址、Key、ID或协议。
+        val accepted = outcome.attempts.mapNotNull { attempt ->
+            val captured = pendingTestConnections[attempt.modelId]
+            if (captured != null && captured == connectionKeys[attempt.modelId]) captured to attempt else null
+        }.toMap()
+        connectionResults = connectionResults + accepted
+        pendingTestConnections = emptyMap()
     }
+
     // 保存：发出就收卡会把网关失败一起丢了。现在发出后留在卡里等**自己的**终态：
     // 成功才收起，失败/未确认把原因留在卡内，草稿不没。
     //
@@ -489,19 +489,49 @@ private fun ProviderEditorForm(
         }
     }
     val testTargets = FineCatProviderForm.testModels(viewIndices.map { rows[it] })
-    val gatePassed = FineCatProviderForm.canSave(
-        testedFingerprint = testedFingerprint,
-        fingerprint = fingerprint,
-        initialFingerprint = initialFingerprint,
-        existingStatusOk = existing?.status?.ok == true,
+    val requiredGroups = FineCatProviderForm.requiredTestGroups(
+        initialProvider, id, effectiveProviderBaseUrl, apiKey, rows.toList(),
+    )
+    val untestedGroups = FineCatProviderForm.untestedGroups(
+        requiredGroups, id, effectiveProviderBaseUrl, apiKey, connectionResults,
     )
     val saveBlockedReason = when {
-        gatePassed -> null
-        testTargets.isEmpty() ->
-            "请先同步模型或手动添加模型。"
-        stateHolder.providerTestIsLoading ->
-            "测试中，请稍候。"
-        else -> "请先测试连接。"
+        untestedGroups.isEmpty() -> null
+        "provider-test-id-v1" !in stateHolder.gatewayState.capabilities -> "请更新网关后测试连接。"
+        testTargets.isEmpty() -> "请先同步模型或手动添加模型。"
+        stateHolder.providerTestIsLoading -> "测试中，请稍候。"
+        untestedGroups.first().size == 1 -> "请先测试 ${untestedGroups.first().single().id}。"
+        else -> "连接配置已更改，请先测试连接。"
+    }
+
+    fun startTest(onlyModel: ProviderModelDraft? = null): String? {
+        if (!connected) return "请先连接 Pi 网关。"
+        if (stateHolder.providerTestIsLoading || stateHolder.providerModelsIsLoading) return "请求处理中，请稍候。"
+        if ("provider-test-id-v1" !in stateHolder.gatewayState.capabilities) return "请更新网关后测试连接。"
+        val modelIds = rows.map { it.id.trim() }.filter(String::isNotEmpty)
+        if (modelIds.distinct().size != modelIds.size) return "模型 ID 重复，请先修改。"
+        val groups = if (onlyModel != null) listOf(listOf(onlyModel)) else untestedGroups
+        val ids = groups.flatten().map { it.id.trim() }.toSet()
+        val targets = if (groups.isEmpty()) testTargets else testTargets.filter { it.id in ids }
+        if (targets.isEmpty()) return "请先添加模型。"
+        pendingTestFingerprint = fingerprint
+        pendingTestConnections = targets.associate { it.id to
+            FineCatProviderForm.connectionFingerprint(id, effectiveProviderBaseUrl, apiKey, it) }
+        pendingTest = FineCatProviderForm.requestKey(id)
+        testOutcome = null
+        testOutcomeFingerprint = null
+        localError = null
+        stateHolder.testProviderModels(
+            id = id.trim().takeIf(String::isNotBlank),
+            baseUrl = baseUrl.trim().takeIf(String::isNotBlank),
+            apiKey = apiKey.trim().takeIf(String::isNotBlank),
+            targets = targets.map {
+                ProviderTestTarget(it.id, it.api, it.baseUrl.takeIf(String::isNotEmpty),
+                    modelBaseUrlSpecified = "provider-model-base-url-v1" in stateHolder.gatewayState.capabilities)
+            },
+            requiredModelGroups = groups.map { group -> group.map { it.id.trim() }.toSet() },
+        )
+        return null
     }
     // 本地校验随当前草稿重算；离线时由连接提示说明原因，业务失败/未确认仍保留。
     val saveValidationError = if (showSaveValidation && connected) {
@@ -763,27 +793,11 @@ private fun ProviderEditorForm(
                     ) { Text("同步模型", style = type.sm.copy(lineHeight = 20.sp, fontWeight = FontWeight.Medium), maxLines = 1) }
                     Spacer(Modifier.width(6.dp))
                     Button(
-                        onClick = {
-                            pendingTestFingerprint = fingerprint
-                            pendingTest = FineCatProviderForm.requestKey(id)
-                            testOutcome = null
-                            testOutcomeFingerprint = null
-                            localError = null
-                            stateHolder.testProviderModels(
-                                id = id.trim().takeIf(String::isNotBlank),
-                                baseUrl = baseUrl.trim().takeIf(String::isNotBlank),
-                                apiKey = apiKey.trim().takeIf(String::isNotBlank),
-                                targets = testTargets.map {
-                                    ProviderTestTarget(
-                                        it.id, it.api, it.baseUrl.takeIf(String::isNotEmpty),
-                                        modelBaseUrlSpecified = "provider-model-base-url-v1" in stateHolder.gatewayState.capabilities,
-                                    )
-                                },
-                            )
-                        },
+                        onClick = { localError = startTest() },
                         enabled = connected && !stateHolder.providerTestIsLoading &&
                             !stateHolder.providerModelsIsLoading && testTargets.isNotEmpty() &&
-                            stateHolder.supportsRequest("provider-test"),
+                            stateHolder.supportsRequest("provider-test") &&
+                            "provider-test-id-v1" in stateHolder.gatewayState.capabilities,
                         shape = RoundedCornerShape(10.dp),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White,
@@ -797,52 +811,13 @@ private fun ProviderEditorForm(
                             .semantics { liveRegion = LiveRegionMode.Polite }
                             .testTag("finecat.providerTestProgress"))
                 }
-                if (testOutcome != null && testOutcomeFingerprint != fingerprint) {
-                    Text("表单已更改，请重新测试", style = type.xs, color = colors.text3,
+                if (testOutcome != null && testOutcomeFingerprint != fingerprint && untestedGroups.isNotEmpty()) {
+                    Text("连接配置已更改，请重新测试", style = type.xs, color = colors.text3,
                         modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp)
                             .testTag("finecat.providerTestResult"))
                 }
                 testOutcome?.takeIf { testOutcomeFingerprint == fingerprint }?.let { outcome ->
-                    var expanded by remember(outcome, fingerprint) { mutableStateOf(false) }
-                    Column(Modifier.padding(horizontal = 24.dp, vertical = 4.dp)) {
-                        Row(
-                            Modifier.fillMaxWidth().heightIn(min = 48.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(colors.surface2.copy(alpha = 0.55f))
-                                .clickable(role = Role.Button) { expanded = !expanded }
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
-                                .semantics {
-                                    liveRegion = LiveRegionMode.Polite
-                                    stateDescription = if (expanded) "详情已展开" else "详情已收起"
-                                }
-                                .testTag("finecat.providerTestResult"),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(outcome.summary.lineSequence().first(), style = type.xs,
-                                color = if (outcome.ok) colors.ok else colors.err,
-                                maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                            Text("详情", style = type.xs, color = colors.text2, modifier = Modifier.padding(start = 8.dp))
-                            Icon(if (expanded) FineCatIcons.Down else FineCatIcons.Right, contentDescription = null,
-                                tint = colors.text3, modifier = Modifier.padding(start = 4.dp).size(14.dp))
-                        }
-                        if (expanded) {
-                            // 完整诊断仍可查看，首失败不会被后续成功覆盖。
-                            outcome.attempts.dropLast(1).forEachIndexed { index, attempt ->
-                                Text(
-                                    text = "${attempt.modelId}：${if (attempt.ok) "通过" else "未通过"}\n${attempt.summary}",
-                                    style = type.xs,
-                                    color = if (attempt.ok) colors.ok else colors.err,
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
-                                        .testTag("finecat.providerTestAttempt.$index"),
-                                )
-                            }
-                            SelectionContainer {
-                                Text(outcome.summary, style = type.xs, color = colors.text2,
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
-                                        .testTag("finecat.providerTestDetail"))
-                            }
-                        }
-                    }
+                    ProviderTestFeedback(outcome)
                 }
                 if (stateHolder.providerModelsIsLoading) {
                     Text("正在同步模型…", style = type.xs, color = colors.text3,
@@ -865,10 +840,8 @@ private fun ProviderEditorForm(
                     ModelRow(
                         index = index,
                         row = row,
-                        attempt = FineCatProviderForm.currentTestAttempt(
-                            row.id, fingerprint, testOutcomeFingerprint, testOutcome?.attempts.orEmpty(),
-                        ),
-                        showTestStatus = testOutcome != null && testOutcomeFingerprint == fingerprint,
+                        attempt = connectionResults[connectionKeys[row.id.trim()]],
+                        showTestStatus = connectionResults.isNotEmpty(),
                         enabled = connected,
                         canMoveUp = viewIndex > 0 && row.id.isNotBlank() &&
                             rows[viewIndices[viewIndex - 1]].id.isNotBlank(),
@@ -930,6 +903,9 @@ private fun ProviderEditorForm(
                 row = detailRow,
                 existing = existing,
                 idLocked = FineCatProviderForm.idLocked(existing, detailRow),
+                testAttempt = connectionResults[connectionKeys[detailRow.id.trim()]],
+                testProgress = stateHolder.providerTestProgress.takeIf { pendingTest != null },
+                onTest = { startTest(detailRow) },
                 onBack = { detailIndex = null },
                 onChange = { next -> if (detailIndex == index && index in rows.indices) rows[index] = next },
                 onRemove = {
@@ -943,13 +919,51 @@ private fun ProviderEditorForm(
     }
 }
 
+/** 摘要只给结论；详情按模型列协议、状态码、耗时和可操作的短建议。 */
+@Composable
+private fun ProviderTestFeedback(outcome: AndroidSharedStateHolder.ProviderTestOutcome) {
+    val colors = LocalFineCatColors.current
+    val type = LocalFineCatType.current
+    var expanded by remember(outcome) { mutableStateOf(false) }
+    Column(Modifier.padding(horizontal = 24.dp, vertical = 4.dp)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(10.dp)).background(colors.surface2.copy(alpha = 0.55f))
+            .clickable(role = Role.Button) { expanded = !expanded }.padding(horizontal = 12.dp, vertical = 8.dp)
+            .semantics { liveRegion = LiveRegionMode.Polite; stateDescription = if (expanded) "详情已展开" else "详情已收起" }
+            .testTag("finecat.providerTestResult"), verticalAlignment = Alignment.CenterVertically) {
+            Text(outcome.summary.lineSequence().first(), style = type.xs,
+                color = if (outcome.ok) colors.ok else colors.err,
+                modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text("详情", style = type.xs, color = colors.text2, modifier = Modifier.padding(start = 8.dp))
+            Icon(if (expanded) FineCatIcons.Down else FineCatIcons.Right, contentDescription = null,
+                tint = colors.text3, modifier = Modifier.padding(start = 4.dp).size(14.dp))
+        }
+        if (expanded) SelectionContainer {
+            Column(Modifier.testTag("finecat.providerTestDetail")) {
+                outcome.attempts.forEachIndexed { index, attempt ->
+                    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)
+                        .testTag("finecat.providerTestAttempt.$index")) {
+                        Text("${attempt.modelId} · ${if (attempt.interrupted) "未完成" else attempt.summary}",
+                            style = type.xs, color = if (attempt.ok) colors.ok else colors.err)
+                        Text(listOfNotNull(attempt.api, attempt.httpStatus?.let { "HTTP $it" },
+                            attempt.latencyMs?.let { "${it}ms" }).joinToString(" · "), style = type.xs, color = colors.text3)
+                        if (!attempt.ok) Text(
+                            if (attempt.interrupted) attempt.summary else providerTestHint(attempt.diagnosticCode, attempt.httpStatus),
+                            style = type.xs, color = colors.text2)
+                    }
+                }
+                if (outcome.attempts.isEmpty()) Text(outcome.summary, style = type.xs, color = colors.text2)
+            }
+        }
+    }
+}
+
 /**
  * 提交前的本地判定：只回答“这份表单能不能发 provider-put”。
  * 任一不过就把错误留在当前卡内可见；全过时由调用方发出请求并等它自己的结论，
  * 这里不发保存、不收卡（保存失败不该把草稿一起丢了）。
  *
- * 判据顺序：连接 → id → 测试门槛 → 数值解析 → 网关同口径兜底。
- * “把已有模型全删”不再另加限制：模型为空时门槛本来就要“先有一个能测的模型”。
+ * 判据顺序：连接 → 字段合法性 → 本次连接改动的测试要求。
  */
 private fun validateForSave(
     connected: Boolean,
@@ -962,9 +976,8 @@ private fun validateForSave(
 ): String? {
     if (!connected) return "未连接 Pi 网关，保存发不出去。"
     if (id.trim().isEmpty()) return "ID 不能为空"
-    if (saveGateMessage != null) return saveGateMessage
     if (parsed.error != null) return parsed.error
-    return runCatching {
+    val invalid = runCatching {
         // 与网关同口径的兜底校验（id 必填、baseUrl/apiKey 至少其一、模型 id 不重复、
         // name 过长…）：能在本地拦住的先拦住，拦不住的由回执留在卡内。
         requireValidProviderUpsert(
@@ -976,6 +989,7 @@ private fun validateForSave(
         )
         null
     }.getOrElse { it.message ?: "表单校验失败" }
+    return invalid ?: saveGateMessage
 }
 
 /**
@@ -1082,6 +1096,9 @@ private fun FineCatModelDetailSheet(
     row: ProviderModelDraft,
     existing: GatewayProvider?,
     idLocked: Boolean,
+    testAttempt: ProviderTestAttempt?,
+    testProgress: String?,
+    onTest: () -> String?,
     onBack: () -> Unit,
     onChange: (ProviderModelDraft) -> Unit,
     onRemove: () -> Unit,
@@ -1100,7 +1117,8 @@ private fun FineCatModelDetailSheet(
     var thinkPickKey by remember { mutableStateOf(false) }
     var thinkingColumns by remember(row.id) { mutableStateOf<List<String>?>(null) }
     var validateDetail by remember { mutableStateOf(false) }
-    val detailError = if (validateDetail) FineCatProviderForm.parseModels(listOf(row), existing).error else null
+    var testStartError by remember(row) { mutableStateOf<String?>(null) }
+    val detailError = testStartError ?: if (validateDetail) FineCatProviderForm.parseModels(listOf(row), existing).error else null
     val declaredThinking = FineCatThinkingMap.declaredLevels(stateHolder.snapshot.modelCatalog, providerId, row.id)
     val thinkingLevels = thinkingColumns ?: FineCatThinkingMap.editableLevels(declaredThinking, row.thinkingMap.keys)
     // F12 compat 编辑区：展开态、枚举取值浮层。展开态跟着这张卡走（切模型即换新状态，
@@ -1186,6 +1204,27 @@ private fun FineCatModelDetailSheet(
             }
             // FcSheet consumes IME insets; only the body scrolls beneath the fixed header and error.
             Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text(testProgress ?: if ("provider-test-id-v1" in stateHolder.gatewayState.capabilities)
+                        "连接测试" else "请更新网关后测试连接", style = type.xs,
+                        color = colors.text3,
+                        modifier = Modifier.weight(1f).padding(end = 8.dp))
+                    Button(onClick = { testStartError = onTest() },
+                        enabled = connected && row.id.isNotBlank() && !stateHolder.providerTestIsLoading &&
+                            !stateHolder.providerModelsIsLoading && stateHolder.supportsRequest("provider-test") &&
+                            "provider-test-id-v1" in stateHolder.gatewayState.capabilities,
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White),
+                        modifier = Modifier.testTag("finecat.modelTest")) {
+                        Text("测试连接", style = type.sm)
+                    }
+                }
+                testAttempt?.let { attempt ->
+                    ProviderTestFeedback(AndroidSharedStateHolder.ProviderTestOutcome(
+                        attempt.ok, attempt.summary, attempts = listOf(attempt),
+                    ))
+                }
                 Text("基本信息", style = type.sm.copy(fontWeight = FontWeight.SemiBold), color = colors.text,
                     modifier = Modifier.padding(start = 24.dp, top = 20.dp, bottom = 10.dp))
                 Column(Modifier.padding(horizontal = 16.dp).fillMaxWidth()

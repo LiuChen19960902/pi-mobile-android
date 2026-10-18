@@ -30,6 +30,8 @@
   网关盲读回显（只给 `apiKeySet` 布尔，不回传原文），手机端不持久化该 key（仅活在表单状态里）
 - 撤销：管理面 `POST /mgw/devices/<id>/revoke` 会删除设备并关闭其在线连接（close code 4003）
 
+Provider 测试结果仅在当前编辑期间用于核对连接改动，相关指纹不落盘；普通参数保存不需要历史测试成功。测试由网关向所填上游发出最小生成请求，手机只显示稳定诊断码映射的文案、HTTP 状态和耗时，不回显上游原始错误或地址。
+
 ## 3. 客户端权限与本地存储
 
 Manifest 声明的权限（`androidApp/src/main/AndroidManifest.xml`）与用途：

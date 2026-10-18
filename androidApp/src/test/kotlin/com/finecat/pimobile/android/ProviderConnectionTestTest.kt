@@ -71,4 +71,42 @@ class ProviderConnectionTestTest {
         assertEquals(1, result.attempts.size)
         assertEquals("已取消", result.attempts.single().summary)
     }
+
+    @Test fun editingTwoModelsDoesNotStopOnOneSuccessfulModel() = runTest {
+        val calls = mutableListOf<String>()
+        val result = testProviderModelsUntilSuccess(targets, { _, _, _ -> },
+            requiredModelGroups = listOf(setOf("first"), setOf("second")),
+        ) { target ->
+            calls += target.modelId!!
+            ProviderProbeReply(AndroidSharedStateHolder.ProviderTestOutcome(true, "ok", latencyMs = 32))
+        }
+        assertTrue(result.ok)
+        assertEquals(listOf("first", "second"), calls)
+        assertEquals(listOf(32L, 32L), result.attempts.map { it.latencyMs })
+        assertEquals(listOf("anthropic-messages", "openai-completions"), result.attempts.map { it.api })
+    }
+
+    @Test fun anotherModelsSuccessCannotHideRequiredModelsFailure() = runTest {
+        val result = testProviderModelsUntilSuccess(targets.take(2), { _, _, _ -> },
+            requiredModelGroups = listOf(setOf("first"), setOf("second")),
+        ) { target ->
+            ProviderProbeReply(AndroidSharedStateHolder.ProviderTestOutcome(
+                target.modelId == "second", "reply", httpStatus = if (target.modelId == "second") 200 else 401,
+                diagnosticCode = if (target.modelId == "first") "auth-rejected" else null,
+            ))
+        }
+        assertFalse(result.ok)
+        assertTrue(result.summary.contains("1 个未通过"))
+        assertEquals("auth-rejected", result.attempts.first().diagnosticCode)
+    }
+
+    @Test fun stableDiagnosticsDescribeFailuresWithoutUpstreamText() {
+        assertEquals("认证被拒", providerTestSummary(false, null, 401))
+        assertEquals("请求超时", providerTestSummary(false, "timeout", null))
+        assertEquals("未收到有效模型响应", providerTestSummary(false, "invalid-response", 200))
+        assertEquals("上游拒绝请求", providerTestSummary(false, "unknown", 400))
+        assertTrue(providerTestHint("timeout", null).contains("重试"))
+        assertTrue(providerTestHint(null, 401).contains("API Key"))
+        assertTrue(providerTestHint("invalid-response", 200).contains("协议"))
+    }
 }

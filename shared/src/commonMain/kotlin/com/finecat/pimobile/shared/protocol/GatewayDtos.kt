@@ -65,6 +65,7 @@ data class GatewayFrame(
     val groups: List<GatewayModelGroup>? = null,
     val scope: GatewayModelScope? = null,
     val scopeRequestId: String? = null,
+    val providerTestId: String? = null,
     // providers 应答：pi models.json 的凭证盲投影
     val providers: List<GatewayProvider>? = null,
     val catalogProviders: List<GatewayCatalogProvider>? = null,

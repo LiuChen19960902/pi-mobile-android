@@ -68,6 +68,59 @@ import org.junit.Test
 class GatewayConformanceTest {
 
     @Test
+    fun providerProbeCarriesSafeDiagnosticsAndRequiresModelResponse() = runBlocking {
+        // 真实 HTTP → 网关探针/router → Kotlin 解码，完全回环，不访问真实上游。
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val upstream = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+        upstream.createContext("/v1/chat/completions") { exchange ->
+            exchange.requestBody.use { it.readBytes() }
+            val attempt = calls.getAndIncrement()
+            val body = when (attempt) {
+                0 -> """{"error":{"message":"synthetic-private-key-and-url"}}"""
+                1 -> "{}"
+                else -> """{"choices":[{"message":{"content":"pong"}}]}"""
+            }.toByteArray()
+            exchange.responseHeaders.set("Content-Type", "application/json")
+            exchange.sendResponseHeaders(if (attempt == 0) 401 else 200, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        upstream.start()
+        val fixture = try { startFixtureProcess() } catch (error: Throwable) { upstream.stop(0); throw error }
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        try {
+            val runtime = buildRuntime()
+            connectProjection(runtime, frames)
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue("新版探针需回显请求标识", "provider-test-id-v1" in runtime.state.value.capabilities)
+            listOf("auth-rejected", "invalid-response", null).forEachIndexed { index, expectedCode ->
+                frames.clear()
+                assertTrue(runtime.sendRequest(GatewayRequests.providerTest(
+                    baseUrl = "http://127.0.0.1:${upstream.address.port}/v1",
+                    apiKey = "synthetic-key", model = "synthetic-model", api = "openai-completions",
+                    providerTestId = "probe-$index",
+                )))
+                val result = awaitFrame(frames) { it.frame.kind == "provider-test-result" }.frame
+                assertEquals(index == 2, result.ok)
+                assertEquals(expectedCode, result.code)
+                assertEquals("probe-$index", result.providerTestId)
+                assertEquals(if (index == 0) 401 else 200, result.httpStatus)
+                assertTrue(requireNotNull(result.latencyMs) >= 0)
+                assertNull("探针不回显服务地址", result.url)
+                assertTrue(result.error?.contains("synthetic-private") != true)
+                assertEquals(if (index == 2) null else "config", result.failureKind)
+            }
+            assertEquals(3, calls.get())
+            assertNoErrorFrames(frames, runtime)
+        } finally {
+            upstream.stop(0)
+            fixture.process.destroy()
+            fixture.process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
     fun handledInputUsesRealGatewayAckAndDoesNotWaitForInventedRun() = runBlocking {
         val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
         val fixture = startFixtureProcess()
@@ -789,10 +842,15 @@ class GatewayConformanceTest {
             awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
 
             runtime.subscribe(fixture.info.fixtureSessionId)
-            assertTrue(runtime.requestState(fixture.info.fixtureSessionId))
-            val state = awaitFrame(frames) {
-                it.frame.kind == "state" && it.correlatedSessionId == fixture.info.fixtureSessionId
+            // state 在订阅加载完成前可合法返回文件态；先等 live 句柄就绪。
+            awaitFrame(frames) {
+                it.frame.kind == "subscribed" && it.frame.sessionId == fixture.info.fixtureSessionId
             }
+            val stateStartIndex = frames.size
+            assertTrue(runtime.requestState(fixture.info.fixtureSessionId))
+            val state = awaitNewFrame(frames, stateStartIndex) {
+                it.frame.kind == "state" && it.correlatedSessionId == fixture.info.fixtureSessionId
+            }.second
             assertEquals(42.0, state.frame.contextUsage?.percent)
             assertEquals("fixture", state.frame.model?.provider)
             assertNoErrorFrames(frames, runtime)
