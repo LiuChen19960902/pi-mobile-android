@@ -842,10 +842,15 @@ class GatewayConformanceTest {
             awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
 
             runtime.subscribe(fixture.info.fixtureSessionId)
-            assertTrue(runtime.requestState(fixture.info.fixtureSessionId))
-            val state = awaitFrame(frames) {
-                it.frame.kind == "state" && it.correlatedSessionId == fixture.info.fixtureSessionId
+            // state 在订阅加载完成前可合法返回文件态；先等 live 句柄就绪。
+            awaitFrame(frames) {
+                it.frame.kind == "subscribed" && it.frame.sessionId == fixture.info.fixtureSessionId
             }
+            val stateStartIndex = frames.size
+            assertTrue(runtime.requestState(fixture.info.fixtureSessionId))
+            val state = awaitNewFrame(frames, stateStartIndex) {
+                it.frame.kind == "state" && it.correlatedSessionId == fixture.info.fixtureSessionId
+            }.second
             assertEquals(42.0, state.frame.contextUsage?.percent)
             assertEquals("fixture", state.frame.model?.provider)
             assertNoErrorFrames(frames, runtime)
