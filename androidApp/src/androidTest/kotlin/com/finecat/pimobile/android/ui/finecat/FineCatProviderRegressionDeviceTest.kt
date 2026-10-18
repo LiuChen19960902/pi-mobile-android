@@ -8,6 +8,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -110,8 +111,8 @@ class FineCatProviderRegressionDeviceTest {
         runBlocking {
             waitUntil { transport.specs.isNotEmpty() } // runtime 自动发起连接
             transport.open()
-            transport.receive(if (modelBaseUrl) """{"kind":"hello","authenticated":true,"protocol":3,"capabilities":["provider-model-base-url-v1"]}"""
-                else """{"kind":"hello","authenticated":true,"protocol":3}""")
+            transport.receive(if (modelBaseUrl) """{"kind":"hello","authenticated":true,"protocol":3,"capabilities":["provider-model-base-url-v1","provider-test-id-v1","provider-test","provider-put","providers","provider-models","sessions"]}"""
+                else """{"kind":"hello","authenticated":true,"protocol":3,"capabilities":["provider-test-id-v1","provider-test","provider-put","providers","provider-models","sessions"]}""")
             waitUntil { stateHolder.gatewayState.connection.name == "CONNECTED" }
         }
         compose.setContent {
@@ -313,19 +314,19 @@ class FineCatProviderRegressionDeviceTest {
 
         // 网关结论：配置类失败（failureKind=config → 不可保存）
         transport.receive(
-            """{"kind":"provider-test-result","ok":false,"error":"synthetic-upstream-refused","failureKind":"config","id":"reg-provider"}"""
+            """{"kind":"provider-test-result","providerTestId":"${transport.payloadsOfType("provider-test").last().getValue("providerTestId").jsonPrimitive.content}","ok":false,"code":"auth-rejected","httpStatus":401,"error":"synthetic-upstream-refused","failureKind":"config","id":"reg-provider"}"""
         )
         waitUntilTag("finecat.providerTestResult")
         compose.onNodeWithTag("finecat.providerTestResult")
             .assertTextContains("均未通过", substring = true).performClick()
         scrollTagIntoView("finecat.providerTestDetail")
         compose.onNodeWithTag("finecat.providerTestDetail")
-            .assertTextContains("synthetic-upstream-refused", substring = true)
+            .assert(hasAnyDescendant(hasText("认证被拒", substring = true)))
 
         compose.onNodeWithText("保存").performClick()
         waitUntilTag("finecat.formError")
         compose.onNodeWithTag("finecat.formError")
-            .assertTextContains("至少一个模型测试通过", substring = true)
+            .assertTextContains("请先测试 reg-model", substring = true)
         compose.waitForIdle()
         assertTrue(transport.payloadsOfType("provider-put").isEmpty())
         assertTrue(

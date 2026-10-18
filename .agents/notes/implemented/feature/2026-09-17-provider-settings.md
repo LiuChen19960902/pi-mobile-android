@@ -12,18 +12,18 @@ Status: implemented
 
 | 协议 | 测试端点 | 模型清单端点 | baseUrl 约定 |
 | --- | --- | --- | --- |
-| `openai-completions` | `baseUrl + /chat/completions` | `GET {baseUrl}/models` | 必须含 `/v1` |
+| `openai-completions` | `baseUrl + /chat/completions` | `GET {baseUrl}/models` | 按服务商保留路径，常见为 `/v1` |
+| `openai-responses` | `baseUrl + /responses` | `GET {baseUrl}/models` | 按服务商保留路径 |
 | `anthropic-messages` | `baseUrl + /v1/messages` | `GET {baseUrl}/v1/models` | 不含 `/v1`，SDK 自己拼 |
 | `google-generative-ai` | `baseUrl + /models/{id}:generateContent` | `GET {baseUrl}/models` | 已含版本段 |
 
 - 测试按请求的模型 ID 找宿主模型，不用数组首项的 API 或 Base URL 代替。存在模型级 baseUrl 覆盖时用覆盖值；漏用会产生 `/v1/v1/messages`。不按站点或协议自动增删 `/v1`，任意中转路径都保留。无覆盖时才测表单公共地址，新模型不借旧模型的覆盖。Provider 级模型清单只用公共地址。
 - 请求必须带所测模型的 api；新建的 anthropic / google 模型没有宿主回退，不能被默认的 openai 探针测。
-- 测试按草稿顺序串行，首个成功即停；transient（超时等）继续测下一项，不发放保存许可。聚合终态按测试顺序保留每个模型的 ID、结果和摘要，不能只留最后一项（否则末项成功会盖住前面的失败）。
+- 探针按草稿视图顺序串行，逐项保留结果；具体停止条件和保存要求见[按连接改动决定测试要求](2026-10-18-provider-connection-save.md)。
 
 ### 测试结果能授权什么
 
-- 测试结果绑定发起时的连接指纹（baseUrl、apiKey、模型 id@api）；编辑后不能借用旧结果，回执时也不按新草稿重新授予。
-- 保存门槛：至少一个模型实际测试成功；transient 不能给改过的草稿发新许可；未改动且已有成功状态的可以沿用。
+- 保存门槛及结果复用由[连接改动规则](2026-10-18-provider-connection-save.md)维护；诊断状态不代替当前表单的连接验证。
 - 保存后不自动测试。写前写后地址、API、Key、headers 或模型集合发生变化时清除过期诊断；只改名称或数值元数据时保留。草稿测通不等于盘上另一份配置已认证；测试应答后重读宿主配置，只有有效地址、API、Key 仍与实际探针一致才更新存储的诊断。config 类失败只在认证当前已存配置时落盘；transient 保留旧的成功、只清过期失败。
 - 连接指纹不包含模型名称、容量、推理 / 图片开关和 compat，不能用它判断整份表单是否有改动；dirty 判断按打开时的持久配置与完整草稿比较。
 
@@ -46,6 +46,8 @@ Status: implemented
 - 模型调序只是手机进程内的展示顺序，编辑和删除映射回原索引，提交仍按原顺序，不持久化到 `models.json`。
 
 ## 考虑过的方案
+
+**整表至少一个模型测通才允许保存。** 会阻止未测过的既有配置做普通编辑，也不能证明另一条受改模型可用；保存规则由[连接改动决定](2026-10-18-provider-connection-save.md)部分取代。
 
 **保存时自动追加 `providerId/*`。** “增”看着正常，“删”时暴露残留；也会在用户不知情时扩大启用范围。
 

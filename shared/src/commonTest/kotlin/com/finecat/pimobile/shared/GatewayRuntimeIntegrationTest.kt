@@ -250,6 +250,47 @@ class GatewayRuntimeIntegrationTest {
     }
 
     @Test
+    fun providerProbeTimeoutThenRetryCannotConsumeLateSuccessOrError() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport, requestTimeoutMilliseconds = 1_000)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        connectHello(transport, runtime, """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["provider-test","provider-test-id-v1","sessions"]}""")
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        fun request(id: String) = GatewayRequests.providerTest(model = "m", providerTestId = id)
+        assertTrue(runtime.sendRequest(request("old")))
+        runCurrent()
+        advanceTimeBy(1_001)
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.RequestTimedOut>().any { it.correlationId == "old" })
+        assertEquals(1, transport.connectionSpecs.size, "探针超时不打断其他业务连接")
+        assertTrue(runtime.sendRequest(request("new")))
+        transport.receive("""{"kind":"provider-test-result","id":"p","providerTestId":"old","ok":true}""")
+        transport.receive("""{"kind":"error","requestType":"provider-test","providerTestId":"old","code":"bad-request"}""")
+        runCurrent()
+        assertFalse(events.filterIsInstance<GatewayRuntimeEvent.Frame>().any { it.frame.kind == "provider-test-result" })
+        assertFalse(runtime.sendRequest(request("busy")))
+        transport.receive("""{"kind":"provider-test-result","id":"p","providerTestId":"new","ok":false,"code":"auth-rejected"}""")
+        runCurrent()
+        val accepted = events.filterIsInstance<GatewayRuntimeEvent.Frame>().single { it.frame.kind == "provider-test-result" }.frame
+        assertEquals("new", accepted.providerTestId)
+        assertEquals(false, accepted.ok)
+        transport.receive("""{"kind":"provider-test-result","id":"p","providerTestId":"new","ok":true}""")
+        runCurrent()
+        assertEquals(1, events.filterIsInstance<GatewayRuntimeEvent.Frame>().count { it.frame.kind == "provider-test-result" })
+        assertTrue(runtime.sendRequest(request("next")))
+        transport.receive("""{"kind":"error","requestType":"provider-test","providerTestId":"next","code":"bad-request"}""")
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.RequestRejected>().any { it.correlationId == "next" })
+        assertTrue(runtime.sendRequest(request("missing")))
+        transport.receive("""{"kind":"provider-test-result","id":"p","ok":true}""")
+        runCurrent()
+        assertFalse(runtime.sendRequest(request("still-busy")))
+        assertEquals(1, events.filterIsInstance<GatewayRuntimeEvent.Frame>().count { it.frame.kind == "provider-test-result" })
+    }
+
+    @Test
     fun scopeSaveDoesNotConsumeLateSuccessOrErrorForAnotherRequest() = runTest {
         val transport = FakeTransport()
         val runtime = newRuntime(transport)

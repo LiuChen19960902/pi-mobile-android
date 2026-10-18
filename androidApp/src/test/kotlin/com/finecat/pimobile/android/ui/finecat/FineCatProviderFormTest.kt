@@ -267,9 +267,8 @@ class FineCatProviderFormTest {
         assertEquals(listOf("one", "two", "three"), parsed.rows.map { it.id })
         assertTrue(parsed.rows.all { it.contextWindow == 128000L && it.maxTokens == 16384L })
         requireValidProviderUpsert("new-provider", "https://relay.example/v1", "synthetic-key", parsed.rows)
-        val fingerprint = FineCatProviderForm.fingerprint("https://relay.example/v1", "synthetic-key", pulled.rows)
-        assertFalse(FineCatProviderForm.canSave(null, fingerprint, "old", false))
-        assertTrue(FineCatProviderForm.canSave(fingerprint, fingerprint, "old", false))
+        val required = FineCatProviderForm.requiredTestGroups(null, "new-provider", "https://relay.example/v1", "synthetic-key", pulled.rows)
+        assertEquals(listOf(pulled.rows), required)
     }
 
     @Test
@@ -390,18 +389,6 @@ class FineCatProviderFormTest {
     }
 
     @Test
-    fun transientBatchFailureCannotGrantFineCatSave() {
-        val failure = com.finecat.pimobile.android.AndroidSharedStateHolder.ProviderTestOutcome(
-            false, "超时", failureKind = "transient",
-        )
-        val tested = FineCatProviderForm.testedFingerprintOnResult(null, "fp", outcomeAllowsSave = failure.ok)
-        assertNull(tested)
-        assertFalseCanSave(tested, "fp")
-    }
-
-    // ---- 测试指纹：表单变化失效、在途编辑不被洗白 ----
-
-    @Test
     fun fingerprintCoversProtocolAndModelIds() {
         val rows = listOf(ProviderModelDraft(id = "m1", api = "openai-completions"))
         val base = FineCatProviderForm.fingerprint("https://a/v1", "sk-1", rows)
@@ -420,105 +407,6 @@ class FineCatProviderFormTest {
                 listOf(ProviderModelDraft(id = "m1", api = "openai-completions", name = "别名", contextWindow = "128K")),
             ),
         )
-    }
-
-    /** 结论只绑发起时那份表单：在途改了字段，旧结论不会变成新配置的通行证。 */
-    @Test
-    fun inFlightEditDoesNotLaunderResult() {
-        val before = FineCatProviderForm.fingerprint("https://a/v1", "sk-1", listOf(ProviderModelDraft(id = "m1")))
-        val after = FineCatProviderForm.fingerprint("https://a/v1", "sk-1", listOf(ProviderModelDraft(id = "m2")))
-
-        var tested = FineCatProviderForm.testedFingerprintOnResult(null, before, outcomeAllowsSave = true)
-        assertEquals(before, tested)
-        // 表单变了 → 旧结论作废
-        tested = FineCatProviderForm.testedFingerprintAfterEdit(tested, after)
-        assertNull(tested)
-        assertFalseCanSave(tested, after)
-    }
-
-    @Test
-    fun failedTestDoesNotGrantSave() {
-        val fp = FineCatProviderForm.fingerprint("https://a/v1", "sk-1", listOf(ProviderModelDraft(id = "m1")))
-        val tested = FineCatProviderForm.testedFingerprintOnResult(null, fp, outcomeAllowsSave = false)
-        assertNull(tested)
-        assertFalseCanSave(tested, fp)
-    }
-
-    private fun assertFalseCanSave(tested: String?, fingerprint: String) {
-        assertTrue(
-            "未测过的表单不能保存",
-            !FineCatProviderForm.canSave(tested, fingerprint, "initial-other", existingStatusOk = false),
-        )
-    }
-
-    /** 既有 provider 一字未改且上次网关侧测通过：沿旧语义放行，不逼用户重测。 */
-    @Test
-    fun unchangedExistingProviderWithOkStatusMaySave() {
-        val fp = FineCatProviderForm.fingerprint("https://a/v1", "", listOf(ProviderModelDraft(id = "m1")))
-        assertTrue(
-            FineCatProviderForm.canSave(
-                testedFingerprint = null,
-                fingerprint = fp,
-                initialFingerprint = fp,
-                existingStatusOk = true,
-            ),
-        )
-        // 但没测过的既有 provider（status 非 ok）仍被拦
-        assertTrue(
-            !FineCatProviderForm.canSave(null, fp, fp, existingStatusOk = false),
-        )
-    }
-
-    @Test
-    fun testedFingerprintSurvivesWhenFormUnchanged() {
-        val fp = FineCatProviderForm.fingerprint("https://a/v1", "sk-1", listOf(ProviderModelDraft(id = "m1")))
-        assertEquals(fp, FineCatProviderForm.testedFingerprintAfterEdit(fp, fp))
-        assertTrue(FineCatProviderForm.canSave(fp, fp, "other", existingStatusOk = false))
-    }
-
-    /**
-     * 没有模型可测 = 门槛必不过，保存被抻住（与旧 UI 一致：测试按钮本身就依赖
-     * “至少一个模型 id”）。不拿“只凭据”当开后门：要存就先给一个能测的模型。
-     */
-    @Test
-    fun formWithoutTestableModelCannotBypassGate() {
-        assertTrue(
-            !FineCatProviderForm.canSave(
-                testedFingerprint = null,
-                fingerprint = "fp",
-                initialFingerprint = "other",
-                existingStatusOk = false,
-            ),
-        )
-        assertNull(FineCatProviderForm.firstValidModel(listOf(ProviderModelDraft(id = ""))))
-    }
-
-    /**
-     * “把已有模型全删”不另加产品限制（第一轮未经授权新添的规矩已撑回）：解析本身不拦，
-     * 能不能发由既有测试门槛说——没模型可测 = 门槛不过，原型也是同样口径。
-     */
-    @Test
-    fun wipingAllModelsHasNoExtraRuleAndIsHeldByTheGate() {
-        val existing = provider(models = listOf(GatewayProviderModel(id = "m1"), GatewayProviderModel(id = "m2")))
-        assertNull(FineCatProviderForm.parseModels(emptyList(), existing).error)
-        // 删模型会动指纹（指纹含模型 id）→ 既有门槛拦住，不会静默下发空 models
-        val wipedFingerprint = FineCatProviderForm.fingerprint("https://a/v1", "", emptyList())
-        val initial = FineCatProviderForm.fingerprint(
-            "https://a/v1",
-            "",
-            listOf(ProviderModelDraft(id = "m1"), ProviderModelDraft(id = "m2")),
-        )
-        assertNotEquals(wipedFingerprint, initial)
-        assertTrue(
-            !FineCatProviderForm.canSave(
-                testedFingerprint = null,
-                fingerprint = wipedFingerprint,
-                initialFingerprint = initial,
-                existingStatusOk = true,
-            ),
-        )
-        // 没模型可测：UI 拿到的就是 firstValidModel == null，提示写清下一步
-        assertNull(FineCatProviderForm.firstValidModel(emptyList()))
     }
 
     // ---- 归属与模型选择 ----

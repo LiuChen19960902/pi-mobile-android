@@ -15,6 +15,7 @@ import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasTestTag
@@ -45,6 +46,8 @@ import com.finecat.pimobile.android.waitUntil
 import com.finecat.pimobile.shared.domain.ModelNumberParsing
 import java.io.File
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -496,13 +499,13 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.providerTest").performClick()
         awaitProviderFrame("provider-test", 1, "批次首模型")
         assertEquals("a", transport.payloadsOfType("provider-test").last().getValue("model").jsonPrimitive.content)
-        transport.receive("""{"kind":"provider-test-result","id":"batch-p","ok":false,"error":"model missing","failureKind":"config","httpStatus":402}""")
+        transport.receive("""{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","id":"batch-p","ok":false,"error":"model missing","failureKind":"config","httpStatus":402}""")
         awaitProviderFrame("provider-test", 2, "批次第二模型")
         assertEquals("b", transport.payloadsOfType("provider-test").last().getValue("model").jsonPrimitive.content)
         assertTrue(holder.providerTestIsLoading)
         waitUntilTagPresent("finecat.providerTestProgress")
         compose.onNodeWithTag("finecat.providerTestProgress").assertIsDisplayed()
-        transport.receive("""{"kind":"provider-test-result","id":"batch-p","ok":true,"latencyMs":12}""")
+        transport.receive("""{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","id":"batch-p","ok":true,"latencyMs":12}""")
         compose.waitUntil(5_000) { !holder.providerTestIsLoading }
         waitUntilTagPresent("finecat.providerTestResult")
         compose.onNodeWithTag("finecat.providerTestResult").assertIsDisplayed()
@@ -514,9 +517,9 @@ class FineCatProviderDirectEntryDeviceTest {
         assertTrue("默认详情收起", compose.onAllNodesWithTag("finecat.providerTestAttempt.0").fetchSemanticsNodes().isEmpty())
         compose.onNodeWithTag("finecat.providerTestResult").performClick()
         scrollToInForm("finecat.providerTestAttempt.0")
-        compose.onNodeWithTag("finecat.providerTestAttempt.0").assertTextContains("model missing", substring = true)
+        compose.onNodeWithTag("finecat.providerTestAttempt.0").assert(hasAnyDescendant(hasText("上游要求付费", substring = true)))
         scrollToInForm("finecat.providerTestDetail")
-        compose.onNodeWithTag("finecat.providerTestDetail").assertTextContains("连接正常", substring = true)
+        compose.onNodeWithTag("finecat.providerTestDetail").assert(hasAnyDescendant(hasText("连接正常", substring = true)))
         scrollToInForm("finecat.providerTestResult")
         compose.onNodeWithTag("finecat.providerTestResult").performClick()
         assertTrue("详情仍可再次收起", compose.onAllNodesWithTag("finecat.providerTestDetail").fetchSemanticsNodes().isEmpty())
@@ -533,7 +536,7 @@ class FineCatProviderDirectEntryDeviceTest {
     fun outsideSave_waitsOwnReceipt_failureKeepsDraft_andTestGateStillApplies() {
         connectFakeGateway()
         setContentFromRealRoot()
-        transport.receive("""{"kind":"providers","providers":[{"id":"$PROVIDER_A_ID","name":"$PROVIDER_A_NAME","baseUrl":"https://outside.example/v1","apiKeySet":true,"models":[{"id":"m","api":"openai-completions"}],"status":{"ok":true}}]}""")
+        transport.receive("""{"kind":"providers","providers":[{"id":"$PROVIDER_A_ID","name":"$PROVIDER_A_NAME","baseUrl":"https://outside.example/v1","apiKeySet":true,"models":[{"id":"m","api":"openai-completions"}],"status":{"ok":false}}]}""")
         runBlocking { waitUntil { holder.providers.any { it.id == PROVIDER_A_ID } } }
         openSettingsViaRealEntry()
         openEditFormFor(PROVIDER_A_ID)
@@ -562,6 +565,133 @@ class FineCatProviderDirectEntryDeviceTest {
     }
 
     @Test
+    fun ordinaryModelEditWithoutPastTest_savesWithoutProbe() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        runBlocking { waitUntil { holder.providers.size == 2 } }
+        openSettingsViaRealEntry()
+        openEditFormFor(PROVIDER_A_ID)
+        editModelField("finecat.modelContext", "500K")
+        toggleModelSwitch("finecat.modelReasoning")
+        saveAndAwaitPut(1)
+        assertTrue("普通编辑不能暗中发模型请求", transport.payloadsOfType("provider-test").isEmpty())
+        val model = transport.payloadsOfType("provider-put").last().getValue("models").jsonArray.single().jsonObject
+        assertEquals("500000", model.getValue("contextWindow").jsonPrimitive.content)
+        assertEquals("true", model.getValue("reasoning").jsonPrimitive.content)
+    }
+
+    @Test
+    fun addedModel_usesItsOwnDetailProbe_beforeProviderSave() {
+        connectFakeGateway()
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        runBlocking { waitUntil { holder.providers.size == 2 } }
+        openSettingsViaRealEntry()
+        openEditFormFor(PROVIDER_A_ID)
+        scrollToInForm("finecat.addModel")
+        compose.onNodeWithTag("finecat.addModel").performClick()
+        waitUntilTagPresent("finecat.modelDetail")
+        compose.onNodeWithTag("finecat.modelId").performTextInput("new-model")
+        compose.onNodeWithTag("finecat.sheetBack").performClick()
+        waitUntilTagGone("finecat.modelDetail")
+        compose.onNodeWithText("保存").performClick()
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请先测试 new-model", substring = true)
+        assertTrue(transport.payloadsOfType("provider-put").isEmpty())
+        scrollToInForm("finecat.modelRow.1")
+        compose.onNodeWithTag("finecat.modelRow.1").performClick()
+        waitUntilTagPresent("finecat.modelDetail")
+        scrollToInForm("finecat.modelTest", hostTag = "finecat.modelDetail")
+        compose.onNodeWithTag("finecat.modelTest").performClick()
+        awaitProviderFrame("provider-test", 1, "模型详情测试")
+        val request = transport.payloadsOfType("provider-test").single()
+        assertEquals("new-model", request.getValue("model").jsonPrimitive.content)
+        assertEquals("openai-completions", request.getValue("api").jsonPrimitive.content)
+        transport.receive("""{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","id":"$PROVIDER_A_ID","ok":true,"httpStatus":200,"latencyMs":9}""")
+        compose.waitUntil(5_000) { !holder.providerTestIsLoading }
+        compose.onNodeWithTag("finecat.sheetBack").performClick()
+        waitUntilTagGone("finecat.modelDetail")
+        saveAndAwaitPut(1)
+        assertEquals(1, transport.payloadsOfType("provider-test").size)
+    }
+
+    @Test
+    fun oldGateway_cannotTestConnection_butOrdinaryEditCanSave() {
+        connectFakeGateway(helloFrame = HELLO_CONNECTED_FRAME.replace("\"provider-test-id-v1\",", ""))
+        setContentFromRealRoot()
+        transport.receive(PROVIDERS_AB_FRAME)
+        runBlocking { waitUntil { holder.providers.size == 2 } }
+        openSettingsViaRealEntry()
+        openEditFormFor(PROVIDER_A_ID)
+        scrollToInForm("finecat.formBaseUrl")
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextClearance()
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://changed.example/v1")
+        compose.onNodeWithText("保存").performClick()
+        waitUntilTagPresent("finecat.formError")
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请更新网关后测试连接", substring = true)
+        assertTrue(transport.payloadsOfType("provider-put").isEmpty())
+        // 公共地址留空保留宿主原值，再改普通字段仍能保存。
+        scrollToInForm("finecat.formBaseUrl")
+        compose.onNodeWithTag("finecat.formBaseUrl").performTextClearance()
+        editModelField("finecat.modelContext", "500K")
+        saveAndAwaitPut(1)
+        assertTrue(transport.payloadsOfType("provider-test").isEmpty())
+    }
+
+    @Test
+    fun expiredProbe_cannotCertifyRetriedConnectionInRealRoot() {
+        connectFakeGateway(requestTimeoutMillis = 5_000)
+        // 只让被测探针超时；设置页自动读请求正常应答，避免无关 lane 先回收连接。
+        val readReplies = mapOf(
+            "sessions" to """{"kind":"sessions","items":[]}""",
+            "models" to """{"kind":"models","models":[]}""",
+            "providers" to PROVIDERS_AB_FRAME,
+        )
+        val responder = graph.gatewayScope.launch {
+            val answered = mutableMapOf<String, Int>()
+            while (true) {
+                readReplies.forEach { (type, frame) ->
+                    val count = transport.payloadsOfType(type).size
+                    if (count > answered.getOrDefault(type, 0)) {
+                        transport.receive(frame)
+                        answered[type] = count
+                    }
+                }
+                delay(20)
+            }
+        }
+        try {
+            setContentFromRealRoot()
+            transport.receive(PROVIDERS_AB_FRAME)
+            runBlocking { waitUntil { holder.providers.size == 2 } }
+            openSettingsViaRealEntry()
+            openEditFormFor(PROVIDER_A_ID)
+            scrollToInForm("finecat.providerTest")
+            compose.onNodeWithTag("finecat.providerTest").performClick()
+            awaitProviderFrame("provider-test", 1, "首轮测试")
+            val expiredToken = latestProbeToken()
+            compose.waitUntil(8_000) { !holder.providerTestIsLoading }
+            scrollToInForm("finecat.formBaseUrl")
+            compose.onNodeWithTag("finecat.formBaseUrl").performTextClearance()
+            compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://changed.example/v1")
+            scrollToInForm("finecat.providerTest")
+            compose.onNodeWithTag("finecat.providerTest").performClick()
+            awaitProviderFrame("provider-test", 2, "超时后重试")
+            val retryToken = latestProbeToken()
+            assertFalse(expiredToken == retryToken)
+            transport.receive("""{"kind":"provider-test-result","providerTestId":"$expiredToken","id":"$PROVIDER_A_ID","ok":true}""")
+            compose.waitForIdle()
+            assertTrue(holder.providerTestIsLoading)
+            transport.receive("""{"kind":"provider-test-result","providerTestId":"$retryToken","id":"$PROVIDER_A_ID","ok":false,"code":"auth-rejected","httpStatus":401}""")
+            compose.waitUntil(5_000) { !holder.providerTestIsLoading }
+            compose.onNodeWithText("保存").performClick()
+            waitUntilTagPresent("finecat.formError")
+            assertTrue("旧成功不能授权重试的新地址", transport.payloadsOfType("provider-put").isEmpty())
+        } finally { responder.cancel() }
+    }
+
+    @Test
     fun batchTest_inFlightEditDoesNotGrantNewDraftSave() {
         connectFakeGateway()
         setContentFromRealRoot()
@@ -575,10 +705,10 @@ class FineCatProviderDirectEntryDeviceTest {
         scrollToInForm("finecat.formBaseUrl")
         compose.onNodeWithTag("finecat.formBaseUrl").performTextClearance()
         compose.onNodeWithTag("finecat.formBaseUrl").performTextInput("https://changed.example/v1")
-        transport.receive("""{"kind":"provider-test-result","id":"$PROVIDER_A_ID","ok":true}""")
+        transport.receive("""{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","id":"$PROVIDER_A_ID","ok":true}""")
         compose.waitUntil(5_000) { !holder.providerTestIsLoading }
         scrollToInForm("finecat.providerTestResult")
-        compose.onNodeWithTag("finecat.providerTestResult").assertTextContains("表单已更改", substring = true)
+        compose.onNodeWithTag("finecat.providerTestResult").assertTextContains("连接配置已更改", substring = true)
         compose.onNodeWithText("保存").performClick()
         // submit将validateForSave的门槛错误写入localError，故还应出现formError。
         waitUntilTagPresent("finecat.formError")
@@ -734,7 +864,7 @@ class FineCatProviderDirectEntryDeviceTest {
     // ------------------------------------------------------------------
     // 条件 3：保存等待真实回执（发出后不收卡）；成功回读=提交值；失败输入
     // 不丢；key 留空=保留（put 不带 apiKey）；测试门槛保持（未测试时保存被
-    // 挡，测试通过且表单未变才放行）。
+    // 挡，连接字段改动须测通，普通参数修改可直接保存）。
     // ------------------------------------------------------------------
     @Test
     fun save_waitsRealReceipt_successReadback_failureKeepsInput_keyOmittedWhenBlank() {
@@ -769,7 +899,7 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithText("保存").performClick()
         compose.waitForIdle()
         waitUntilTagPresent("finecat.formError")
-        compose.onNodeWithTag("finecat.formError").assertTextContains("至少一个模型测试通过", substring = true)
+        compose.onNodeWithTag("finecat.formError").assertTextContains("请先测试 f01-save-model", substring = true)
         assertTrue("门槛挡回时不得发 provider-put", transport.payloadsOfType("provider-put").isEmpty())
 
         // 测试连接：真实请求帧 + 真实应答帧
@@ -779,9 +909,12 @@ class FineCatProviderDirectEntryDeviceTest {
         awaitProviderFrame("provider-test", 1, "点测试连接后")
         val testReq = transport.payloadsOfType("provider-test").last()
         assertEquals(newId, testReq.getValue("id").jsonPrimitive.content)
-        transport.receive("""{"kind":"provider-test-result","ok":true,"latencyMs":12,"id":"$newId"}""")
+        transport.receive("""{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","ok":true,"latencyMs":12,"id":"$newId"}""")
         waitUntilTagPresent("finecat.providerTestResult")
 
+        // 测通后改普通参数不应撤销许可，也不应偷偷重测。
+        editModelField("finecat.modelContext", "500K")
+        assertEquals(1, transport.payloadsOfType("provider-test").size)
         // 保存：发出后不收卡，等自己的终态
         compose.onNodeWithText("保存").performClick()
         awaitProviderFrame("provider-put", 1, "点保存后")
@@ -813,7 +946,7 @@ class FineCatProviderDirectEntryDeviceTest {
         // 重试：成功回执才收卡，回读=提交值
         compose.onNodeWithText("保存").performClick()
         awaitProviderFrame("provider-put", 2, "失败重试后")
-        transport.receive(providerSavedFrame(newId, "F01 保存样例"))
+        transport.receive(savedFrameEchoingPut(1))
         waitUntilEditFormGoneAfterSave("新建保存，失败回执后重试")
         waitUntilTagPresent("finecat.settingsScreen")
         runBlocking { waitUntil { holder.providers.any { it.id == newId } } }
@@ -831,7 +964,7 @@ class FineCatProviderDirectEntryDeviceTest {
         val put2 = transport.payloadsOfType("provider-put").last()
         assertEquals(newId, put2.getValue("id").jsonPrimitive.content)
         assertTrue("已存 key 留空保留：编辑保存也不带 apiKey", "apiKey" !in put2)
-        transport.receive(providerSavedFrame(newId, "F01 保存样例改"))
+        transport.receive(savedFrameEchoingPut(2))
         waitUntilEditFormGoneAfterSave("编辑已存 provider，key 留空改名保存")
         runBlocking {
             waitUntil { holder.providers.firstOrNull { it.id == newId }?.name == "F01 保存样例改" }
@@ -1007,7 +1140,7 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.providerTest").performClick()
         awaitProviderFrame("provider-test", 1, "点测试连接后")
         transport.receive(
-            """{"kind":"provider-test-result","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
+            """{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
         )
         waitUntilTagPresent("finecat.providerTestResult")
 
@@ -1094,7 +1227,7 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.providerTest").performClick()
         awaitProviderFrame("provider-test", 1, "点测试连接后")
         transport.receive(
-            """{"kind":"provider-test-result","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
+            """{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
         )
         waitUntilTagPresent("finecat.providerTestResult")
 
@@ -1570,7 +1703,7 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.providerTest").performClick()
         awaitProviderFrame("provider-test", 1, "点测试连接后")
         transport.receive(
-            """{"kind":"provider-test-result","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
+            """{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
         )
         waitUntilTagPresent("finecat.providerTestResult")
         // 连接测试结论会触发读刷新；先回掉，否则第一次保存的超时会被它们抢先。
@@ -1738,7 +1871,7 @@ class FineCatProviderDirectEntryDeviceTest {
         compose.onNodeWithTag("finecat.providerTest").performClick()
         awaitProviderFrame("provider-test", 1, "点测试连接后")
         transport.receive(
-            """{"kind":"provider-test-result","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
+            """{"kind":"provider-test-result","providerTestId":"${latestProbeToken()}","ok":true,"latencyMs":12,"id":"$NEW_SAVE_ID"}""",
         )
         waitUntilTagPresent("finecat.providerTestResult")
 
@@ -2054,6 +2187,9 @@ class FineCatProviderDirectEntryDeviceTest {
         }
     }
 
+    private fun latestProbeToken(): String = transport.payloadsOfType("provider-test").last()
+        .getValue("providerTestId").jsonPrimitive.content
+
     /**
      * 接上假网关。[requestTimeoutMillis] 非空时覆盖运行时请求超时，用于让「请求超时」
      * 这条终态在用例里可及时发生（生产默认 30s，见 GatewayRuntime 的
@@ -2159,9 +2295,9 @@ class FineCatProviderDirectEntryDeviceTest {
         /** 建连应答（重连时复用同一份）。 */
         const val HELLO_CONNECTED_FRAME =
             """{"kind":"hello","connection":{"state":"connected"},"sessions":[],""" +
-                """"contextUsage":null,"model":null}"""
+                """"contextUsage":null,"model":null,"capabilities":["providers","provider-put","provider-delete","provider-test","provider-test-id-v1","provider-models","models","sessions"]}"""
 
-        /** 保存成功应答：带 status.ok=true（重开编辑时改名不触发重测门槛，同旧 UI 口径）。 */
+        /** 保存成功应答；普通编辑不以历史诊断状态作为保存许可。 */
         fun providerSavedFrame(id: String, name: String): String =
             """{"kind":"provider-saved","admitted":true,"refreshed":true,"provider":{"id":"$id",""" +
                 """"name":"$name","baseUrl":"https://f01-save.example/v1","apiKeySet":true,""" +
