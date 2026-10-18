@@ -250,6 +250,57 @@ class FineCatSettingsF08DeviceTest {
     }
 
     // ------------------------------------------------------------------
+    // 1b. 一级设置页的系统返回（手势内滑/返回键）与左上角箭头同源：关设置页、
+    //     回原页，而不是落到 Activity 默认 finish 直接退出应用。
+    // ------------------------------------------------------------------
+    @Test
+    fun s11_settings_systemBack_closesPageLikeHeaderBack() {
+        connectAndOpenSettings(seedEntries = true)
+        waitUntilTagPresent("finecat.settingsScreen")
+
+        // 系统返回：关闭设置页，回到首页（进设置前 selectedSessionId == null）。
+        pressBackSystem()
+        waitUntilTagGone("finecat.settingsScreen")
+        compose.onNodeWithTag("finecat.menu").assertExists()
+        assertFalse("设置页系统返回不得结束 Activity", compose.activity.isFinishing)
+
+        // 重进设置页，用左上角箭头关闭：终态必须与上面一致。
+        compose.onNodeWithTag("finecat.menu").performClick()
+        waitUntilTagPresent("finecat.drawerSearch")
+        compose.onNodeWithTag("finecat.drawerSettings").performClick()
+        waitUntilTagPresent("finecat.settingsScreen")
+        compose.onNodeWithTag("finecat.settingsBack").performClick()
+        waitUntilTagGone("finecat.settingsScreen")
+        compose.onNodeWithTag("finecat.menu").assertExists()
+        assertFalse("箭头返回同样不应结束 Activity", compose.activity.isFinishing)
+    }
+
+    // ------------------------------------------------------------------
+    // 1c. 设置页的返回不能抢走更上层浮层：二级 sheet 打开时先关 sheet，
+    //     设置页仍在；再返回才关设置页。
+    // ------------------------------------------------------------------
+    @Test
+    fun s11_settings_systemBack_closesInnerSheetFirst() {
+        connectAndOpenSettings(seedEntries = true)
+        val entriesBefore = holder!!.endpointCandidates.toList()
+
+        compose.onNodeWithTag("finecat.gwAddress").performClick()
+        waitUntilTagPresent("finecat.gatewayEntriesSheet")
+        pressBackSystem()
+        waitUntilTagGone("finecat.gatewayEntriesSheet")
+        // 一级返回先关二级 sheet，设置页与 Activity 都不受影响。
+        compose.onNodeWithTag("finecat.settingsScreen").assertExists()
+        assertFalse("关闭二级 sheet 不应结束 Activity", compose.activity.isFinishing)
+        assertEquals("返回不应改写入口列表", entriesBefore, holder!!.endpointCandidates.toList())
+
+        // 再返回才关设置页回首页。
+        pressBackSystem()
+        waitUntilTagGone("finecat.settingsScreen")
+        compose.onNodeWithTag("finecat.menu").assertExists()
+        assertFalse("关闭设置页不应结束 Activity", compose.activity.isFinishing)
+    }
+
+    // ------------------------------------------------------------------
     // 2. 入口增/删/上移：顺序严格等于操作序列；真实入库后清空草稿
     // ------------------------------------------------------------------
     @Test
