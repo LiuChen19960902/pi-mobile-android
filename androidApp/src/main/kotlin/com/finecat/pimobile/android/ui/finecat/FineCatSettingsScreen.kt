@@ -2,6 +2,7 @@ package com.finecat.pimobile.android.ui.finecat
 
 import com.finecat.pimobile.shared.gateway.GatewayErrorText
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -95,6 +96,10 @@ internal fun FineCatSettingsScreen(
     LaunchedEffect(connection) {
         if (connected && stateHolder.supportsRequest("providers")) stateHolder.loadProviders()
     }
+    // 整页覆盖层必须自己接系统返回：手势内滑与返回键跟左上角箭头同源关本页。
+    // 不接则没有任何 BackHandler 消费，落到 Activity 默认 finish 直接退到桌面（F08）。
+    // 声明位置在内部两个 sheet 之前，保证它们后注册、返回时先关更上层的 sheet。
+    BackHandler(onBack = onBack)
     var entriesOpen by remember { mutableStateOf(false) }
     var scopeOpen by remember { mutableStateOf(false) }
     Column(

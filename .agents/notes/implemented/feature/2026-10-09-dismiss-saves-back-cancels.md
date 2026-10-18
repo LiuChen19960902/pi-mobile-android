@@ -9,6 +9,7 @@ Status: implemented
 ## 决定
 
 - 普通选择和编辑类卡片：点外部 = 应用（复用原校验与提交），返回 = 取消。配对、删除、恢复默认仍要求明确操作。已即时生效的选择（例如模型选择）未编辑时外部点击只关闭，不重复写。
+- 设置整页作为覆盖层，使用 `BackHandler(onBack = onBack)` 复用标题箭头的关闭逻辑；在内部弹卡之前注册，让后组合的弹卡先处理返回。关闭页面只改变设置页可见性，保留底层首页或会话。
 - `FcSheet` 给遮罩单独的 `onOutsideClick`，返回继续取消；卡片内的留白也要接收触控，否则点击漏到遮罩上触发保存。focusable Popup 同样区分外部应用与返回放弃。
 - AlertDialog 开启外部保存时禁用内置返回关闭，在 Dialog 内容中给它自己的 `ComponentDialog` dispatcher 挂取消回调；挂在 Activity dispatcher 上不生效。API 33+ 的 Popup 返回手势不走 KeyEvent，需要独立 dispatcher 回调并在 attach / detach / dispose 时清理，最新回调用 `rememberUpdatedState`。
 - 外部保存要等真实结果：Provider 按 token 与回显指纹，模型范围按 UUID，改名复用 name 单发 lane 并匹配 sessionId 与名称。改名回包名称错误或缺失时 holder 立即清 pending 并回到“未确认”；pending 非空时拒绝第二次改名。签名两字段一次 `updateFields` 落盘。
