@@ -1087,6 +1087,8 @@ class GatewayRuntime(
     }
 
     private fun responseCorrelationMatches(request: GatewayRequest, frame: GatewayFrame): Boolean = when (request.requestType) {
+        "worktree-list" -> frame.queryId == request.correlationId && frame.sessionId == request.targetSessionId
+        "worktree-create", "worktree-continue", "worktree-status", "worktree-trust" -> frame.operationId == request.correlationId
         "entry-copy", "label-put" -> frame.entryId == request.correlationId && frame.sessionId == request.targetSessionId
         "dequeue" -> frame.queueRequestId == request.correlationId && frame.sessionId == request.targetSessionId &&
             frame.queued != null && frame.queuedMessages != null && frame.isStreaming != null && frame.isCompacting != null
@@ -1097,9 +1099,11 @@ class GatewayRuntime(
     }
 
     private fun responseCorrelation(frame: GatewayFrame): String? =
-        frame.queueRequestId ?: frame.queryId ?: frame.scopeRequestId ?: frame.providerTestId
+        frame.operationId ?: frame.queueRequestId ?: frame.queryId ?: frame.scopeRequestId ?: frame.providerTestId
 
     private fun explicitResponseCorrelation(request: GatewayRequest, frame: GatewayFrame): String? = when (request.requestType) {
+        "worktree-list" -> frame.queryId
+        "worktree-create", "worktree-continue", "worktree-status", "worktree-trust" -> frame.operationId
         "entry-copy", "label-put" -> frame.entryId
         "dequeue" -> frame.queueRequestId
         "model-scope-put" -> frame.scopeRequestId

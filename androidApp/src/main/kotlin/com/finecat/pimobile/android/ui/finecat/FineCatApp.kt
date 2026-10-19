@@ -276,6 +276,11 @@ private fun FineCatAppContent(
         val isStreaming = sessionState?.isStreaming == true
         val connected = stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED
         val showHome = snapshot.selectedSessionId == null
+        val displayedCwd = if (showHome) stateHolder.fineCatNewSessionDirectoryPath else stateHolder.currentSessionDirectory
+        LaunchedEffect(displayedCwd, snapshot.selectedSessionId, connected, stateHolder.supportsWorktrees) {
+            stateHolder.refreshWorktreeLocation(displayedCwd, snapshot.selectedSessionId)
+        }
+
         val colors = LocalFineCatColors.current
         // 复制全文（原型 .icopy）：与旧 ConversationScreen 同一口径，写系统剪贴板。
         val clipboard = LocalClipboardManager.current
@@ -367,6 +372,7 @@ private fun FineCatAppContent(
         LaunchedEffect(snapshot.selectedSessionId) { modelSheetOpen = false }
         BackHandler(enabled = contextAnchor != null) { contextAnchor = null }
         var homeDirSheet by remember { mutableStateOf(false) }
+        var directoryForSession by remember { mutableStateOf(false) }
         var drawerOpen by remember { mutableStateOf(false) }
         var gatewaySheetOpen by remember { mutableStateOf(false) }
         // F01 Provider 直达（原型 pv-sheet/pv-new app.js:841-846）：记要编辑的 provider id
@@ -1203,13 +1209,22 @@ private fun FineCatAppContent(
                     ),
                     homeStyle = showHome,
                     showDirectory = true,
-                    directory = if (showHome) stateHolder.fineCatNewSessionDirectoryPath else selectedSession?.cwd,
-                    onDirectoryClick = if (showHome) {
-                        {
-                            stateHolder.beginDirectoryBrowsing(stateHolder.fineCatNewSessionDirectoryPath ?: "/")
+                    directory = displayedCwd,
+                    directoryBranch = stateHolder.worktreeLocation?.takeIf { stateHolder.supportsWorktrees && it.cwd == displayedCwd && it.repoRoot != null }?.let { location ->
+                        location.branch ?: location.worktrees.orEmpty().filter { displayedCwd == it.path || displayedCwd?.startsWith(it.path + "/") == true }
+                            .maxByOrNull { it.path.length }?.commit
+                    },
+                    onDirectoryClick = {
+                        keyboardController?.hide()
+                        focusManager.clearFocus(force = true)
+                        if (stateHolder.supportsWorktrees && displayedCwd != null && stateHolder.worktreeLocation?.cwd == displayedCwd && stateHolder.worktreeLocation?.repoRoot != null) {
+                            stateHolder.openWorktree(displayedCwd)
+                        } else {
+                            directoryForSession = !showHome
+                            stateHolder.beginDirectoryBrowsing(displayedCwd ?: "/")
                             homeDirSheet = true
                         }
-                    } else null,
+                    },
                     onTextChange = { stateHolder.messageDraft = it },
                     running = isStreaming || sessionState?.isCompacting == true,
                     // 流式中带草稿点发送 = 吸附待派发（门面 capturePendingDispatch）；
@@ -1296,8 +1311,32 @@ private fun FineCatAppContent(
                 )
             }
             // P8 home 工作目录 sheet（WorkspaceDirectoryUi 真源）
+            FcSheetHost(visible = stateHolder.worktreeUi.open) {
+                FineCatWorktreeSheet(stateHolder) {
+                    keyboardController?.hide()
+                    focusManager.clearFocus(force = true)
+                    stateHolder.closeWorktree()
+                    directoryForSession = !showHome
+                    stateHolder.beginDirectoryBrowsing(displayedCwd ?: "/")
+                    homeDirSheet = true
+                }
+            }
             FcSheetHost(visible = homeDirSheet) {
-                FineCatDirectorySheet(stateHolder = stateHolder, onDismiss = { homeDirSheet = false })
+                FineCatDirectorySheet(stateHolder = stateHolder, onDismiss = { homeDirSheet = false },
+                    sessionMode = directoryForSession, initialPath = displayedCwd,
+                    continueBlockedReason = if (directoryForSession) stateHolder.worktreeBlockReason() else null,
+                    onContinue = if (stateHolder.supportsWorktrees && directoryForSession) {
+                        { path -> homeDirSheet = false; stateHolder.continueInDirectory(path) }
+                    } else null,
+                    onNewSession = { path -> homeDirSheet = false; stateHolder.newSessionInWorkspace(path) },
+                    onSelectHome = if (stateHolder.supportsWorktrees) {
+                        { path ->
+                            homeDirSheet = false
+                            if (path == "/") stateHolder.selectFineCatDirectory(null)
+                            else stateHolder.newSessionInWorkspace(path)
+                        }
+                    } else null,
+                )
             }
             // P9 设置整页（原型 screenSettings：居中标题 + 返回箭头 + .sec-label 卡片组）。
             // 取代旧的网关底部弹卡；Provider 表单仍留在 sheet 上（二级操作）。

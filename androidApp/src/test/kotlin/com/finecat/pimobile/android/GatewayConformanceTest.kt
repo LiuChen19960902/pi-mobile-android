@@ -68,6 +68,62 @@ import org.junit.Test
 class GatewayConformanceTest {
 
     @Test
+    fun worktreeListsCreatesAndContinuesThroughProductionProtocol() = runBlocking {
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        val fixture = startFixtureProcess()
+        try {
+            val cwd = File(fixture.info.fixtureCwd)
+            fun git(vararg args: String) {
+                val process = ProcessBuilder(listOf("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false") + args)
+                    .directory(cwd).redirectErrorStream(true).apply {
+                        environment()["GIT_CONFIG_GLOBAL"] = "/dev/null"
+                        environment()["GIT_CONFIG_SYSTEM"] = "/dev/null"
+                    }.start()
+                val text = process.inputStream.bufferedReader().readText()
+                assertTrue("git未及时结束", process.waitFor(15, java.util.concurrent.TimeUnit.SECONDS))
+                assertEquals(text, 0, process.exitValue())
+            }
+            git("init", "-b", "main")
+            cwd.resolve("README.md").writeText("Synthetic worktree fixture")
+            git("add", "README.md")
+            git("-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit", "-m", "seed")
+            val runtime = buildRuntime()
+            connectProjection(runtime, frames)
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue("worktree-v1" in runtime.state.value.capabilities)
+            assertTrue(runtime.sendRequest(GatewayRequests.worktreeList("list-test", sessionId = fixture.info.fixtureSessionId)))
+            val listing = awaitFrame(frames) { it.frame.kind == "worktree-list" }.frame
+            assertEquals("list-test", listing.queryId)
+            assertEquals(cwd.canonicalPath, listing.cwd)
+            assertEquals(1, listing.worktrees?.size)
+            assertEquals("main", listing.worktrees?.single()?.branch)
+            val target = cwd.resolve("linked-worktree-target").absolutePath
+            val createId = UUID.randomUUID().toString()
+            assertTrue(runtime.sendRequest(GatewayRequests.worktreeCreate(createId, cwd.absolutePath, "fix/mobile", "HEAD", target)))
+            val created = awaitFrame(frames) { it.frame.operationId == createId }.frame
+            assertEquals("succeeded", created.status)
+            val continueId = UUID.randomUUID().toString()
+            assertTrue(runtime.sendRequest(GatewayRequests.worktreeContinue(continueId, fixture.info.fixtureSessionId, target)))
+            val continued = awaitFrame(frames) { it.frame.operationId == continueId }.frame
+            assertEquals("succeeded", continued.status)
+            assertEquals(fixture.info.fixtureSessionId, continued.sessionId)
+            assertEquals(continueId, continued.targetSessionId)
+            assertEquals(File(target).canonicalPath, continued.cwd)
+            frames.clear()
+            assertTrue(runtime.sendRequest(GatewayRequests.worktreeStatus(continueId)))
+            val confirmed = awaitFrame(frames) { it.frame.operationId == continueId }.frame
+            assertEquals(continued.targetSessionId, confirmed.targetSessionId)
+            assertEquals("succeeded", confirmed.status)
+            assertNoErrorFrames(frames, runtime)
+        } finally {
+            fixture.process.destroy()
+            fixture.process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
     fun providerProbeCarriesSafeDiagnosticsAndRequiresModelResponse() = runBlocking {
         // 真实 HTTP → 网关探针/router → Kotlin 解码，完全回环，不访问真实上游。
         val calls = java.util.concurrent.atomic.AtomicInteger()

@@ -50,6 +50,8 @@ import com.finecat.pimobile.shared.protocol.GatewayImageAttachment
 import com.finecat.pimobile.shared.protocol.GatewayWireDecoder
 import com.finecat.pimobile.shared.protocol.PiEventNormalizer
 import com.finecat.pimobile.shared.protocol.SessionEvent
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.UUID
 import java.util.TimeZone
 import kotlinx.coroutines.CompletableDeferred
@@ -186,6 +188,22 @@ class AndroidSharedStateHolder(
         }
     }
     /** 新建会话使用的目录选择（替代旧 workspace 选择），null 时回退最近会话 cwd。 */
+    internal var worktreeUi by mutableStateOf(WorktreeUiState())
+        private set
+    internal var worktreeLocation: GatewayFrame? by mutableStateOf(null)
+        private set
+    private var worktreeRestored = false
+    private var activeWorktreeQuery: String? = null
+    private var worktreeQuerySessionId: String? = null
+    private var worktreeQueryCwd: String? = null
+    private var worktreeSessionsLoadJob: Job? = null
+    private var activeWorktreeSessionsLoad: String? = null
+    private val continuedSessionCwds = mutableMapOf<String, String>()
+    internal val supportsWorktrees: Boolean get() = "worktree-v1" in gatewayState.capabilities
+    internal val currentSessionDirectory: String? get() = snapshot.selectedSessionId?.let { id ->
+        continuedSessionCwds[id] ?: snapshot.sessions.firstOrNull { it.id == id }?.cwd
+    }
+
     var selectedDirectoryPath: String? by mutableStateOf(null)
         private set
     /**
@@ -507,6 +525,17 @@ class AndroidSharedStateHolder(
                             endpointCandidates = value.endpointCandidates
                             heroTitle = value.heroTitle
                             heroTagline = value.heroTagline
+                            if (!worktreeRestored) {
+                                worktreeRestored = true
+                                runCatching { appGraph.credentialStore.loadToken() }.getOrNull()?.let { token ->
+                                    restoreWorktreePending(value.worktreePendingJson, worktreeHostKey(token))?.let { restored ->
+                                        if (worktreeUi.operationId == null) {
+                                            worktreeUi = restored
+                                            if (supportsWorktrees && gatewayState.connection == GatewayConnectionState.CONNECTED) recheckWorktree()
+                                        }
+                                    }
+                                }
+                            }
                             appearanceMode = value.appearanceMode
                             pinnedSessionIds = value.pinnedSessionIds
                             if (!hiddenSessionsLoaded) {
@@ -526,6 +555,7 @@ class AndroidSharedStateHolder(
                             gatewayState = state
                             if (state.connection != GatewayConnectionState.CONNECTED) {
                                 inputAssist.reset()
+                                finishWorktreeSessions("未连接网关")
                                 finishPing("未连接")
                                 catalogProviders = emptyList()
                                 catalogError = null
@@ -594,6 +624,7 @@ class AndroidSharedStateHolder(
                                     withContext(Dispatchers.Main.immediate) {
                                         gatewayState = appGraph.gatewayRuntime.state.value
                                         inputAssist.reset()
+                                        if (worktreeUi.phase == WorktreePhase.CONFIRM && supportsWorktrees) recheckWorktree()
                                         refreshInputResources()
                                         if (supportsRequest("providers")) loadProviders()
                                         refreshModelCatalog()
@@ -637,6 +668,7 @@ class AndroidSharedStateHolder(
                                     if (event.requestType == "compact") {
                                         finishManualCompactRequest(event.requestType, event.targetSessionId, "压缩请求未确认，请重连后核对")
                                     }
+                                    finishWorktreeRequest(event.requestType, event.correlationId, unconfirmed = true)
                                     handleWorkspaceRequestCancelled(event)
                                     finishModelCatalogFailure(event.requestType, "模型加载已中断，请重试")
                                     inputAssist.fail(event.requestType, event.correlationId, "加载已中断")
@@ -693,6 +725,7 @@ class AndroidSharedStateHolder(
                                 }
                             }
                             is GatewayRuntimeEvent.RequestTimedOut -> {
+                                withContext(Dispatchers.Main.immediate) { finishWorktreeRequest(event.requestType, event.correlationId, unconfirmed = true) }
                                 withContext(Dispatchers.Main.immediate) {
                                     finishBranchDraftRequest(event.requestType, event.targetSessionId)
                                     if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
@@ -751,6 +784,10 @@ class AndroidSharedStateHolder(
                             }
                             is GatewayRuntimeEvent.RequestRejected -> {
                                 withContext(Dispatchers.Main.immediate) {
+                                    if (event.requestType.startsWith("worktree-")) {
+                                        rejectWorktreeRequest(event.requestType, event.correlationId, event.reason)
+                                        return@withContext
+                                    }
                                     finishBranchDraftRequest(event.requestType, event.targetSessionId)
                                     if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
                                     if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
@@ -1027,6 +1064,416 @@ class AndroidSharedStateHolder(
                     appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
                 }
             }
+        }
+    }
+
+    internal fun worktreeBlockReason(): String? {
+        val id = snapshot.selectedSessionId ?: return null
+        val state = snapshot.sessionStates[id]
+        if (state?.isCompacting == true || id in compactPendingSessions) return "上下文压缩中，暂不能 Fork 会话"
+        if (state?.isStreaming == true || selectedSessionStopping() || selectedSessionRecalling()) return "任务进行中，暂不能 Fork 会话"
+        if (sendInFlight || dispatchInFlight != null || pendingComposerSends.isNotEmpty()) return "消息正在提交，暂不能 Fork 会话"
+        if (state?.queuedMessages?.isEmpty == false || pendingDispatch != null) return "先处理待发消息，再 Fork 会话"
+        return null
+    }
+
+    internal fun refreshWorktreeLocation(cwd: String?, sessionId: String? = snapshot.selectedSessionId) {
+        if (!supportsWorktrees || cwd == null || gatewayState.connection != GatewayConnectionState.CONNECTED) return
+        val id = UUID.randomUUID().toString()
+        activeWorktreeQuery = id
+        worktreeQuerySessionId = sessionId
+        worktreeQueryCwd = cwd
+        if (worktreeUi.open) worktreeUi = worktreeUi.copy(loading = true, error = null)
+        sendWorktreeRequest(GatewayRequests.worktreeList(id, cwd = cwd.takeIf { sessionId == null }, sessionId = sessionId))
+    }
+
+    internal fun openWorktree(cwd: String) {
+        if (!supportsWorktrees) return
+        val previous = worktreeUi
+        if (previous.operationId != null && previous.phase in setOf(WorktreePhase.CONFIRM, WorktreePhase.SWITCH_FAILED,
+                WorktreePhase.TARGET_GONE, WorktreePhase.CREATE_FAILED, WorktreePhase.TRUST) && previous.sourceSessionId == snapshot.selectedSessionId) {
+            worktreeUi = previous.copy(open = true)
+            return
+        }
+        worktreeUi = WorktreeUiState(open = true, sourceSessionId = snapshot.selectedSessionId, sourceCwd = cwd,
+            navigationEpoch = composerNavigationEpoch, mode = if (snapshot.selectedSessionId == null) WorktreeMode.NEW else WorktreeMode.CONTINUE,
+            listing = worktreeLocation?.takeIf { it.cwd == cwd }, loading = true)
+        refreshWorktreeLocation(cwd)
+    }
+
+    internal fun closeWorktree() {
+        if (worktreeUi.phase in setOf(WorktreePhase.CREATING, WorktreePhase.SWITCHING)) return
+        cancelWorktreeSessionsLoad()
+        // 关闭待确认卡表示留在原处；仍可查询该操作，但迟到结果不能再搬走此后的编辑。
+        worktreeUi = worktreeUi.copy(open = false,
+            navigationEpoch = if (worktreeUi.phase == WorktreePhase.CONFIRM) -1L else worktreeUi.navigationEpoch)
+    }
+
+    internal fun worktreeNewMode(newConversation: Boolean) {
+        worktreeMode(if (newConversation) WorktreeMode.NEW else WorktreeMode.CONTINUE)
+    }
+
+    internal fun worktreeMode(mode: WorktreeMode) {
+        if (worktreeUi.sourceSessionId == null && mode == WorktreeMode.CONTINUE) return
+        if (worktreeUi.phase != WorktreePhase.LIST) return
+        worktreeUi = worktreeUi.copy(mode = mode, error = null)
+    }
+
+    internal val worktreeSessions: List<com.finecat.pimobile.shared.domain.SessionSummary>
+        get() = snapshot.sessions.filter { session ->
+            session.id in worktreeUi.sessionIds && session.id !in hiddenSessionIds &&
+                session.cwd !in hiddenDirectoryPaths && session.cwd?.startsWith('/') == true && session.cwd?.trimEnd('/') == worktreeUi.targetPath?.trimEnd('/')
+        }.sortedByDescending { it.lastActivityEpochSeconds }
+
+    internal fun browseWorktreeSessions(path: String) {
+        worktreeUi = worktreeUi.copy(phase = WorktreePhase.SESSIONS, targetPath = path,
+            operationId = null, action = null, selectedExistingSessionId = null, sessionIds = emptySet(), error = null)
+        refreshWorktreeSessions()
+    }
+
+    internal fun refreshWorktreeSessions() {
+        if (worktreeUi.phase != WorktreePhase.SESSIONS) return
+        cancelWorktreeSessionsLoad()
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            finishWorktreeSessions("未连接网关")
+            return
+        }
+        worktreeUi = worktreeUi.copy(sessionsLoading = true, sessionsError = null, sessionIds = emptySet(), error = null)
+        val appGraph = graph ?: return
+        val loadId = UUID.randomUUID().toString()
+        activeWorktreeSessionsLoad = loadId
+        val epoch = gatewayUiEpoch
+        worktreeSessionsLoadJob = scope?.launch {
+            val sent = try { appGraph.gatewayRuntime.requestSessions() }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { false }
+            if (sent) delay(15_000)
+            if (epoch == gatewayUiEpoch && activeWorktreeSessionsLoad == loadId &&
+                worktreeUi.open && worktreeUi.phase == WorktreePhase.SESSIONS && worktreeUi.sessionsLoading) {
+                finishWorktreeSessions(if (sent) "会话加载超时，请重试" else "会话加载失败，请重试")
+            }
+        }
+    }
+
+    private fun cancelWorktreeSessionsLoad() {
+        activeWorktreeSessionsLoad = null
+        worktreeSessionsLoadJob?.cancel()
+        worktreeSessionsLoadJob = null
+    }
+
+    private fun finishWorktreeSessions(error: String) {
+        if (worktreeUi.phase == WorktreePhase.SESSIONS) {
+            cancelWorktreeSessionsLoad()
+            worktreeUi = worktreeUi.copy(sessionsLoading = false, sessionsError = error, sessionIds = emptySet())
+        }
+    }
+
+    internal fun worktreeSessionListBack() {
+        cancelWorktreeSessionsLoad()
+        worktreeUi = worktreeUi.copy(phase = WorktreePhase.LIST, targetPath = null, sessionIds = emptySet(),
+            sessionsLoading = false, sessionsError = null, selectedExistingSessionId = null, error = null)
+    }
+
+    internal fun openWorktreeSession(sessionId: String) {
+        val ui = worktreeUi
+        if (!ui.open || ui.phase != WorktreePhase.SESSIONS || ui.sessionsLoading || ui.sessionsError != null) return
+        if (ui.sourceSessionId != snapshot.selectedSessionId || ui.navigationEpoch != composerNavigationEpoch) {
+            worktreeUi = ui.copy(error = "当前会话已变化，请重新打开工作区")
+            return
+        }
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED) { finishWorktreeSessions("未连接网关"); return }
+        if (worktreeSessions.none { it.id == sessionId }) {
+            worktreeUi = ui.copy(error = "会话已失效，请刷新列表")
+            return
+        }
+        val path = ui.targetPath ?: return
+        val id = UUID.randomUUID().toString()
+        worktreeUi = ui.copy(phase = WorktreePhase.SWITCHING, action = "open", operationId = id,
+            selectedExistingSessionId = sessionId, targetPath = path, error = null)
+        sendWorktreeRequest(GatewayRequests.worktreeTrust(id, path))
+    }
+
+    internal fun worktreeForm(open: Boolean) {
+        clearPersistedWorktree(worktreeUi.operationId)
+        worktreeUi = worktreeUi.copy(phase = if (open) WorktreePhase.FORM else WorktreePhase.LIST, error = null,
+            operationId = null, action = null,
+            mode = if (open && worktreeUi.mode == WorktreeMode.EXISTING) WorktreeMode.NEW else worktreeUi.mode)
+    }
+
+    internal fun chooseWorktree(path: String, trustVerified: Boolean = false) {
+        if (!supportsWorktrees || gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            worktreeUi = worktreeUi.copy(error = "未连接网关")
+            return
+        }
+        val ui = worktreeUi
+        if (ui.mode == WorktreeMode.EXISTING) { browseWorktreeSessions(path); return }
+        if (!trustVerified && (ui.sourceSessionId == null || !ui.continueConversation)) {
+            val id = UUID.randomUUID().toString()
+            worktreeUi = ui.copy(phase = WorktreePhase.SWITCHING, operationId = id, action = "select", targetPath = path)
+            sendWorktreeRequest(GatewayRequests.worktreeTrust(id, path))
+            return
+        }
+        if (ui.sourceSessionId == null) {
+            selectFineCatDirectory(path)
+            worktreeUi = ui.copy(open = false)
+        } else if (!ui.continueConversation) {
+            prepareNewSession(path)
+            worktreeUi = ui.copy(open = false)
+        } else continueInDirectory(path)
+    }
+
+    internal fun newSessionInWorkspace(path: String) {
+        if (!supportsWorktrees) { prepareNewSession(path); return }
+        worktreeUi = WorktreeUiState(open = true, sourceSessionId = snapshot.selectedSessionId,
+            sourceCwd = currentSessionDirectory ?: fineCatNewSessionDirectoryPath.orEmpty(), navigationEpoch = composerNavigationEpoch,
+            mode = WorktreeMode.NEW)
+        chooseWorktree(path)
+    }
+
+    internal fun continueInDirectory(path: String, trustProject: Boolean = false, retry: Boolean = false) {
+        if (!supportsWorktrees || gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            showTransientNotice("未连接网关")
+            return
+        }
+        val source = snapshot.selectedSessionId ?: return
+        if (!worktreeUi.open || worktreeUi.sourceSessionId != source) {
+            worktreeUi = WorktreeUiState(open = true, sourceSessionId = source,
+                sourceCwd = currentSessionDirectory.orEmpty(), navigationEpoch = composerNavigationEpoch)
+        }
+        worktreeBlockReason()?.let { worktreeUi = worktreeUi.copy(error = it); return }
+        val id = if (trustProject || retry) worktreeUi.operationId ?: UUID.randomUUID().toString() else UUID.randomUUID().toString()
+        worktreeUi = worktreeUi.copy(open = true, phase = WorktreePhase.SWITCHING, operationId = id,
+            action = "continue", targetPath = path, error = null)
+        sendWorktreeRequest(GatewayRequests.worktreeContinue(id, source, path, trustProject, retry))
+    }
+
+    internal fun createWorktree(branch: String, base: String, path: String, onlyCreate: Boolean) {
+        if (!supportsWorktrees || gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            worktreeUi = worktreeUi.copy(error = "未连接网关")
+            return
+        }
+        val ui = worktreeUi
+        if (branch.isBlank() || base.isBlank() || path.isBlank()) return
+        if (!onlyCreate && ui.sourceSessionId != null && ui.continueConversation) {
+            worktreeBlockReason()?.let { worktreeUi = ui.copy(error = it); return }
+        }
+        val id = UUID.randomUUID().toString()
+        worktreeUi = ui.copy(phase = WorktreePhase.CREATING, operationId = id, action = "create", targetPath = path,
+            continueAfterCreate = !onlyCreate, createdPath = null, error = null,
+            createBranch = branch, createBase = base, createPath = path)
+        sendWorktreeRequest(GatewayRequests.worktreeCreate(id, ui.sourceCwd, branch, base, path))
+    }
+
+    internal fun recheckWorktree() {
+        val id = worktreeUi.operationId ?: return
+        worktreeUi = worktreeUi.copy(phase = WorktreePhase.CONFIRM, error = null)
+        sendWorktreeRequest(GatewayRequests.worktreeStatus(id))
+    }
+
+    internal fun retryWorktreeContinue(trustProject: Boolean = false) {
+        val ui = worktreeUi
+        val path = ui.targetPath ?: ui.createdPath ?: return
+        if (ui.sourceSessionId != snapshot.selectedSessionId || ui.navigationEpoch != composerNavigationEpoch) {
+            worktreeUi = ui.copy(error = "当前会话已变化，请重新打开工作区")
+            return
+        }
+        continueInDirectory(path, trustProject, retry = true)
+    }
+
+    internal fun confirmWorktreeTrust() {
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            worktreeUi = worktreeUi.copy(error = "未连接网关")
+            return
+        }
+        val ui = worktreeUi
+        if (ui.action !in setOf("select", "open")) { retryWorktreeContinue(trustProject = true); return }
+        val id = ui.operationId ?: return
+        val path = ui.targetPath ?: return
+        worktreeUi = ui.copy(phase = WorktreePhase.SWITCHING, error = null)
+        sendWorktreeRequest(GatewayRequests.worktreeTrust(id, path, trustProject = true))
+    }
+
+    private fun worktreeHostKey(token: String): String = java.security.MessageDigest.getInstance("SHA-256")
+        .digest(token.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    private fun clearPersistedWorktree(id: String?) {
+        val appGraph = graph ?: return
+        appGraph.gatewayScope.launch {
+            runCatching { appGraph.preferences.updateFields { current ->
+                val savedId = runCatching { kotlinx.serialization.json.Json.parseToJsonElement(current.worktreePendingJson.orEmpty())
+                    .jsonObject["operationId"]?.jsonPrimitive?.content }.getOrNull()
+                if (savedId == id) current.copy(worktreePendingJson = null) else current
+            } }
+        }
+    }
+
+    private fun sendWorktreeRequest(request: com.finecat.pimobile.shared.gateway.GatewayRequest) {
+        val appGraph = graph ?: return
+        val epoch = gatewayUiEpoch
+        val uiAtSend = worktreeUi
+        appGraph.gatewayScope.launch {
+          try {
+            if (request.requestType in setOf("worktree-create", "worktree-continue")) {
+                val token = appGraph.credentialStore.loadToken()
+                if (token == null || epoch != gatewayUiEpoch) {
+                    withContext(Dispatchers.Main.immediate) { finishWorktreeRequest(request.requestType, request.correlationId, false) }
+                    return@launch
+                }
+                appGraph.preferences.updateFields { it.copy(worktreePendingJson = worktreePendingJson(uiAtSend, worktreeHostKey(token))) }
+            }
+            if (epoch != gatewayUiEpoch) return@launch
+            val sent = appGraph.gatewayRuntime.sendRequest(request)
+            if (!sent) withContext(Dispatchers.Main.immediate) {
+                if (epoch == gatewayUiEpoch) finishWorktreeRequest(request.requestType, request.correlationId, unconfirmed = false)
+            }
+          } catch (cancelled: CancellationException) { throw cancelled }
+          catch (_: Exception) {
+            withContext(Dispatchers.Main.immediate) {
+                if (epoch == gatewayUiEpoch) finishWorktreeRequest(request.requestType, request.correlationId, false)
+            }
+          }
+        }
+    }
+
+    internal fun rejectWorktreeRequest(type: String, id: String?, code: String) {
+        if (type == "worktree-list" && id == activeWorktreeQuery) {
+            worktreeUi = worktreeUi.copy(loading = false, error = worktreeErrorText(code))
+            return
+        }
+        if (id != worktreeUi.operationId || id == null) return
+        if (worktreeUi.action == "open" && code != "worktree-trust-required") {
+            worktreeUi = worktreeUi.copy(phase = WorktreePhase.SESSIONS, operationId = null, action = null,
+                selectedExistingSessionId = null, error = if (code == "worktree-target-unavailable") "目标目录已失效" else "打开失败，请重试")
+            return
+        }
+        worktreeUi = worktreeUi.copy(phase = when (code) {
+            "worktree-trust-required" -> WorktreePhase.TRUST
+            "worktree-target-unavailable" -> WorktreePhase.TARGET_GONE
+            "worktree-result-unknown", "worktree-operation-not-found", "invalid-worktree-response" -> WorktreePhase.CONFIRM
+            else -> if (worktreeUi.action == "open") WorktreePhase.SESSIONS else if (worktreeUi.action == "select") WorktreePhase.LIST else
+                if (worktreeUi.action == "create") WorktreePhase.CREATE_FAILED else WorktreePhase.SWITCH_FAILED
+        }, error = worktreeErrorText(code))
+    }
+
+    private fun finishWorktreeRequest(type: String, id: String?, unconfirmed: Boolean) {
+        if (type == "worktree-list" && id == activeWorktreeQuery) {
+            worktreeUi = worktreeUi.copy(loading = false, error = "工作区加载失败，请重试")
+        } else if (type.startsWith("worktree-") && id == worktreeUi.operationId) {
+            if (type == "worktree-status") {
+                worktreeUi = worktreeUi.copy(phase = WorktreePhase.CONFIRM, error = "请连接网关后重新查询")
+                return
+            }
+            if (worktreeUi.action == "open") {
+                worktreeUi = worktreeUi.copy(phase = WorktreePhase.SESSIONS, operationId = null, action = null,
+                    selectedExistingSessionId = null, error = "打开未完成，请重试")
+                return
+            }
+            if (worktreeUi.action == "select") {
+                worktreeUi = worktreeUi.copy(phase = WorktreePhase.LIST, error = "确认未完成，请重试")
+                return
+            }
+            worktreeUi = worktreeUi.copy(phase = if (unconfirmed) WorktreePhase.CONFIRM else
+                if (worktreeUi.action == "create") WorktreePhase.CREATE_FAILED else WorktreePhase.SWITCH_FAILED,
+                error = if (unconfirmed) "正在确认操作结果" else "请求未发出，请重试")
+        }
+    }
+
+    internal fun receiveWorktreeFrame(frame: GatewayFrame) {
+        if (frame.kind == "sessions" && worktreeUi.phase == WorktreePhase.SESSIONS) {
+            val items = frame.items
+            if (items == null || items.any { it["id"]?.stringValue.isNullOrBlank() }) {
+                finishWorktreeSessions("会话列表不完整，请重试")
+                return
+            }
+            cancelWorktreeSessionsLoad()
+            worktreeUi = worktreeUi.copy(sessionsLoading = false, sessionsError = null,
+                sessionIds = items.filter { it["cwd"]?.stringValue?.startsWith('/') == true &&
+                    it["cwd"]?.stringValue?.trimEnd('/') == worktreeUi.targetPath?.trimEnd('/') }
+                    .mapTo(mutableSetOf()) { requireNotNull(it["id"]?.stringValue) })
+            return
+        }
+        if (frame.kind == "worktree-list" && frame.queryId == activeWorktreeQuery) {
+            if (worktreeQuerySessionId != snapshot.selectedSessionId ||
+                (worktreeQuerySessionId == null && worktreeQueryCwd != fineCatNewSessionDirectoryPath)) return
+            worktreeLocation = frame
+            if (worktreeUi.open) worktreeUi = worktreeUi.copy(listing = frame, loading = false, error = null)
+            return
+        }
+        if (frame.kind == "error" && frame.requestType == "worktree-list" && frame.queryId == activeWorktreeQuery) {
+            worktreeUi = worktreeUi.copy(loading = false, error = worktreeErrorText(frame.code))
+            return
+        }
+        val ui = worktreeUi
+        if (frame.operationId == null || frame.operationId != ui.operationId) return
+        if (frame.kind == "error" && frame.requestType?.startsWith("worktree-") == true) {
+            rejectWorktreeRequest(frame.requestType.orEmpty(), frame.operationId, frame.code.orEmpty())
+            return
+        }
+        if (frame.kind == "worktree-trust" && ui.action == "open") {
+            if (frame.cwd?.startsWith('/') != true || frame.cwd?.trimEnd('/') != ui.targetPath?.trimEnd('/')) { rejectWorktreeRequest("worktree-trust", ui.operationId, "invalid-worktree-response"); return }
+            val target = ui.selectedExistingSessionId
+            worktreeUi = ui.copy(phase = WorktreePhase.SESSIONS, operationId = null)
+            if (!ui.open || ui.sourceSessionId != snapshot.selectedSessionId || ui.navigationEpoch != composerNavigationEpoch) {
+                worktreeUi = worktreeUi.copy(open = false)
+                return
+            }
+            if (target == null || worktreeSessions.none { it.id == target }) {
+                worktreeUi = worktreeUi.copy(error = "会话已失效，请刷新列表")
+                return
+            }
+            // 打开已有会话走普通导航：源稿留在源槽，目标恢复自己的稿，不迁移或合并历史。
+            selectSession(target)
+            worktreeUi = worktreeUi.copy(open = false, action = null, selectedExistingSessionId = null)
+            return
+        }
+        if (frame.kind == "worktree-trust" && ui.action == "select") {
+            val path = frame.cwd ?: return
+            worktreeUi = ui.copy(phase = WorktreePhase.LIST, operationId = null)
+            if (ui.sourceSessionId == snapshot.selectedSessionId && ui.navigationEpoch == composerNavigationEpoch) {
+                chooseWorktree(path, trustVerified = true)
+            } else worktreeUi = worktreeUi.copy(open = false)
+            return
+        }
+        if (frame.kind != "worktree-operation") return
+        when (frame.status) {
+            "pending", "unknown" -> worktreeUi = ui.copy(phase = WorktreePhase.CONFIRM, error = "正在确认操作结果")
+            "failed" -> worktreeUi = ui.copy(phase = if (ui.action == "create") WorktreePhase.CREATE_FAILED else
+                if (frame.code == "worktree-target-unavailable") WorktreePhase.TARGET_GONE else WorktreePhase.SWITCH_FAILED,
+                error = worktreeErrorText(frame.code))
+            "succeeded" -> {
+                if (frame.action != ui.action) { rejectWorktreeRequest("worktree-status", frame.operationId, "invalid-worktree-response"); return }
+                if (frame.action == "create") {
+                    val path = (frame.worktree?.path ?: frame.cwd)?.takeIf { it.startsWith('/') }
+                    if (path == null) { rejectWorktreeRequest("worktree-status", frame.operationId, "invalid-worktree-response"); return }
+                    clearPersistedWorktree(ui.operationId)
+                    worktreeUi = ui.copy(createdPath = path, phase = WorktreePhase.LIST, operationId = null, loading = false)
+                    if (ui.sourceSessionId != snapshot.selectedSessionId || ui.navigationEpoch != composerNavigationEpoch) {
+                        worktreeUi = worktreeUi.copy(open = false)
+                        showTransientNotice("工作区已创建")
+                    } else if (ui.continueAfterCreate) chooseWorktree(path) else refreshWorktreeLocation(ui.sourceCwd, ui.sourceSessionId)
+                } else {
+                    val source = ui.sourceSessionId ?: return
+                    val target = frame.targetSessionId?.takeIf(String::isNotBlank)
+                    val path = frame.cwd?.takeIf { it.startsWith('/') }
+                    if (target == null || path == null || frame.sessionId != source) {
+                        rejectWorktreeRequest("worktree-status", frame.operationId, "invalid-worktree-response"); return
+                    }
+                    clearPersistedWorktree(ui.operationId)
+                    continuedSessionCwds[target] = path
+                    if (snapshot.selectedSessionId == source && composerSessionId == source && composerNavigationEpoch == ui.navigationEpoch) {
+                        val draft = currentComposerDraft()
+                        sessionDrafts.remove(source)
+                        sessionDrafts.remove(target)
+                        // selectSession 会保留当前输入；先把同一份编辑状态的归属改到目标，避免源槽再存一次。
+                        showComposerDraft(target, draft)
+                        selectSession(target)
+                        showTransientNotice("已切换工作区")
+                    } else showTransientNotice("工作区已就绪，请从会话列表打开")
+                    worktreeUi = ui.copy(open = false, phase = WorktreePhase.LIST, operationId = null)
+                    graph?.gatewayScope?.launch { graph?.gatewayRuntime?.sendRequest(GatewayRequests.sessions()) }
+                }
+            }
+            else -> rejectWorktreeRequest("worktree-status", frame.operationId, "invalid-worktree-response")
         }
     }
 
@@ -2373,6 +2820,11 @@ class AndroidSharedStateHolder(
     /** 只在收到真正的paired回执后丢弃旧网关派生状态；普通断线保留草稿。 */
     private fun clearPairedGatewayUiState() {
         gatewayUiEpoch += 1
+        cancelWorktreeSessionsLoad()
+        worktreeUi = WorktreeUiState()
+        worktreeLocation = null
+        activeWorktreeQuery = null
+        continuedSessionCwds.clear()
         sessionDrafts.clear()
         imagePreparationJobs.values.forEach { it.cancel() }
         imagePreparationJobs.clear()
@@ -3638,6 +4090,7 @@ class AndroidSharedStateHolder(
     }
 
     fun close() {
+        cancelWorktreeSessionsLoad()
         clearTreeActions()
         streamingSnapshotPublishJob?.cancel()
         projectionActor.close()
@@ -3645,12 +4098,23 @@ class AndroidSharedStateHolder(
         scope?.cancel()
     }
 
+    private val worktreeBlocksComposer: Boolean
+        get() = worktreeUi.sourceSessionId != null && worktreeUi.sourceSessionId == snapshot.selectedSessionId &&
+            (worktreeUi.action == "continue" || (worktreeUi.action == "create" && worktreeUi.continueAfterCreate && worktreeUi.continueConversation)) &&
+            (worktreeUi.phase in setOf(WorktreePhase.CREATING, WorktreePhase.SWITCHING) ||
+                (worktreeUi.phase == WorktreePhase.CONFIRM && worktreeUi.open))
+
     val canSend: Boolean
         get() = gatewayState.connection == GatewayConnectionState.CONNECTED &&
+            !worktreeBlocksComposer &&
             !selectedSessionStopping() && !selectedSessionRecalling() &&
             (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) && !sendInFlight && dispatchInFlight == null && pendingComposerSends.isEmpty()
 
     fun sendComposerDraft(requireDirectory: Boolean = false) {
+        if (worktreeBlocksComposer) {
+            showTransientNotice("工作区切换未确认，草稿已保留")
+            return
+        }
         if (consumeSlashCommand(messageDraft) != SlashCommandOutcome.NOT_A_COMMAND) return
         if (messageDraft.isBlank() && preparedImages.isEmpty() && imagePreparations.isEmpty()) return
         if (requireDirectory && snapshot.selectedSessionId == null && fineCatNewSessionDirectoryPath == null) {
@@ -3862,6 +4326,7 @@ class AndroidSharedStateHolder(
     }
 
     private fun handleWorkspaceFrame(frame: GatewayFrame) {
+        receiveWorktreeFrame(frame)
         if (frame.kind == "models") {
             modelCatalogIsLoading = false
             modelCatalogError = null

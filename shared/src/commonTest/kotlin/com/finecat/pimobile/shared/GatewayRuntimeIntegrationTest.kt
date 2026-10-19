@@ -50,6 +50,32 @@ import kotlin.test.assertTrue
 class GatewayRuntimeIntegrationTest {
     private val dispositionHello = """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["sessions","message","dequeue","prompt-disposition-v1"]}"""
 
+    @Test fun worktreeOperationRepliesAndRejectionsRequireTheExactOperationId() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        connectHello(transport, runtime, """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["worktree-v1","worktree-continue","worktree-status","sessions"]}""")
+        transport.receive("""{"kind":"sessions","items":[]}"""); runCurrent()
+        assertTrue(runtime.sendRequest(GatewayRequests.worktreeContinue("current", "source", "/synthetic/target")))
+        transport.receive("""{"kind":"worktree-operation","operationId":"previous","action":"continue","status":"succeeded","sessionId":"source","targetSessionId":"wrong","cwd":"/synthetic/other"}""")
+        transport.receive("""{"kind":"error","requestType":"worktree-continue","operationId":"previous","sessionId":"source","code":"worktree-busy"}""")
+        runCurrent()
+        assertFalse(events.filterIsInstance<GatewayRuntimeEvent.Frame>().any { it.frame.kind == "worktree-operation" })
+        assertFalse(runtime.sendRequest(GatewayRequests.worktreeContinue("busy", "source", "/synthetic/target")))
+        transport.receive("""{"kind":"error","requestType":"worktree-continue","operationId":"current","sessionId":"source","code":"worktree-trust-required"}""")
+        runCurrent()
+        assertTrue(events.filterIsInstance<GatewayRuntimeEvent.RequestRejected>().any {
+            it.correlationId == "current" && it.reason == "worktree-trust-required"
+        })
+        assertTrue(runtime.sendRequest(GatewayRequests.worktreeStatus("current")))
+        transport.receive("""{"kind":"worktree-operation","operationId":"current","action":"continue","status":"succeeded","sessionId":"source","targetSessionId":"target","cwd":"/synthetic/target"}""")
+        runCurrent()
+        val success = events.filterIsInstance<GatewayRuntimeEvent.Frame>().single { it.frame.kind == "worktree-operation" }.frame
+        assertEquals("target", success.targetSessionId)
+        assertEquals("current", success.operationId)
+    }
+
     @Test
     fun startedAckBeforeStartEventKeepsActualRunAliveInBackground() = runTest {
         val transport = FakeTransport()

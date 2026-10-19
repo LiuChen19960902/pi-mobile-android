@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: LiuChen19960902/pi-mobile-gateway
-          ref: f0a3c802cff15128da3ac76f909918a029165410
+          ref: cfd3884a458a242ab5fe855e410ea9e1c20414a0
           path: pi-mobile-gateway
           ssh-key: ${{ secrets.GATEWAY_CI_SSH_KEY }}
           persist-credentials: false

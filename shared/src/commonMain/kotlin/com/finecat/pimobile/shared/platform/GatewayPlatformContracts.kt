@@ -99,7 +99,9 @@ data class GatewayPreferencesSnapshot(
      */
     val hiddenDirectoryPaths: List<String> = emptyList(),
     /** 手机本地置顶，不修改 Pi 会话文件或全局配置。 */
-    val pinnedSessionIds: List<String> = emptyList()
+    val pinnedSessionIds: List<String> = emptyList(),
+    /** 仅保存工作区操作标识和结果查询信息，不含草稿或凭据。 */
+    val worktreePendingJson: String? = null
 )
 
 /** 仅保存非敏感配置；token 与 device id 不得进入该存储。 */
