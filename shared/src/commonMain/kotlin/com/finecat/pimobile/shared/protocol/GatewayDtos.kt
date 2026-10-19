@@ -53,6 +53,17 @@ data class GatewayFrame(
     val thinkingLevel: String? = null,
     val queuedMessages: JsonValue? = null,
     val contextUsage: GatewayContextUsage? = null,
+    // worktree-v1：写操作以 UUID 关联，源会话与目标会话分别寻址。
+    val operationId: String? = null,
+    val action: String? = null,
+    val status: String? = null,
+    val targetSessionId: String? = null,
+    val repoRoot: String? = null,
+    val branch: String? = null,
+    val suggestDir: String? = null,
+    val dirty: Boolean? = null,
+    val worktrees: List<GatewayWorktree>? = null,
+    val worktree: GatewayWorktree? = null,
     // directories 应答
     val path: String? = null,
     val home: String? = null,
@@ -495,3 +506,14 @@ data class GatewayQueuedMessages(
 )
 
 @Serializable data class GatewayDirectoryItem(val name: String, val path: String, val hidden: Boolean)
+
+@Serializable
+data class GatewayWorktree(
+    val path: String,
+    val branch: String? = null,
+    val commit: String = "",
+    val main: Boolean = false,
+    val missing: Boolean = false,
+) {
+    override fun toString(): String = "GatewayWorktree(path=<redacted>, branch=<redacted>, main=$main, missing=$missing)"
+}

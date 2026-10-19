@@ -263,6 +263,37 @@ object GatewayRequests {
             pingId?.let { put("pingId", it) }
         }
 
+    fun worktreeList(queryId: String, cwd: String? = null, sessionId: String? = null): GatewayRequest = request(
+        "worktree-list", "worktree-list", targetSessionId = sessionId, correlationId = queryId,
+    ) {
+        put("queryId", queryId)
+        cwd?.let { put("cwd", it) }
+        sessionId?.let { put("sessionId", it) }
+    }
+
+    fun worktreeCreate(operationId: String, cwd: String, branch: String, base: String, targetPath: String): GatewayRequest = request(
+        "worktree-create", "worktree-operation", correlationId = operationId, lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY,
+    ) {
+        put("operationId", operationId); put("cwd", cwd); put("branch", branch); put("base", base); put("targetPath", targetPath)
+    }
+
+    fun worktreeContinue(operationId: String, sessionId: String, targetPath: String, trustProject: Boolean = false, retry: Boolean = false): GatewayRequest = request(
+        "worktree-continue", "worktree-operation", targetSessionId = sessionId, correlationId = operationId,
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY,
+    ) {
+        put("operationId", operationId); put("sessionId", sessionId); put("targetPath", targetPath)
+        if (trustProject) put("trustProject", true)
+        if (retry) put("retry", true)
+    }
+
+    fun worktreeTrust(operationId: String, targetPath: String, trustProject: Boolean = false): GatewayRequest = request(
+        "worktree-trust", "worktree-trust", correlationId = operationId, lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY,
+    ) { put("operationId", operationId); put("targetPath", targetPath); if (trustProject) put("trustProject", true) }
+
+    fun worktreeStatus(operationId: String): GatewayRequest = request(
+        "worktree-status", "worktree-operation", correlationId = operationId, lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY,
+    ) { put("operationId", operationId) }
+
     /** 目录浏览（网关自实现能力，与 pi 无关）。 */
     fun directories(path: String? = null): GatewayRequest = request(
         "directories",
