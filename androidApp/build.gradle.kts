@@ -11,7 +11,7 @@ android {
         applicationId = "com.finecat.pimobile.android"
         minSdk = 24
         targetSdk = 36
-        versionCode = 60
+        versionCode = 61
         versionName = "1.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
