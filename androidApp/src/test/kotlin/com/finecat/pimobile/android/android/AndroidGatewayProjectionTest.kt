@@ -11,6 +11,7 @@ import com.finecat.pimobile.shared.protocol.SessionEvent
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -60,7 +61,9 @@ class AndroidGatewayProjectionTest {
         assertEquals(3, items.size)
         assertEquals(2, items.count { it.text == "same" })
         assertTrue(items.filter { it.text == "same" }.all { it.id in ids && it.title == "通知" && !it.isError })
+        assertTrue(items.filter { it.text == "same" }.all { it.kind == ConversationItemKind.NOTICE })
         assertTrue(items.any { it.text == "消息过大，已省略" })
+        assertEquals(ConversationItemKind.SYSTEM, items.single { it.text == "消息过大，已省略" }.kind)
         projection.close()
     }
 
@@ -1459,6 +1462,33 @@ class AndroidGatewayProjectionTest {
         )
         assertEquals("history-adapter-failed", replaceRegression.snapshot().lastError)
         replaceRegression.close()
+    }
+
+    @Test
+    fun extensionStatusPushReachesSnapshotWithoutInventingErrorsOrActivity() {
+        val projection = AndroidGatewayProjection()
+        projection.selectSession("session-status")
+        val state = """{"kind":"state","sessionId":"session-status","isStreaming":true,"isCompacting":false}"""
+        projection.acceptFrame(state, GatewayWireDecoder.decode(state), "session-status")
+
+        // 真实链：wire 文本 + 解码后的帧 + 关联会话一起交给投影。
+        val raw =
+            """{"kind":"extension-status","sessionId":"session-status","statuses":[{"key":"subagents","text":"1 agent running"}]}"""
+        projection.acceptFrame(raw, GatewayWireDecoder.decode(raw), "session-status")
+        val snapshot = projection.snapshot()
+        assertEquals(
+            "1 agent running",
+            snapshot.extensionStatuses.getValue("session-status").single().text
+        )
+        assertNull(snapshot.lastError)
+        // 状态只是显示提示：不改会话忙闲，也不当作任何请求的错误/应答。
+        assertEquals(true, snapshot.sessionStates.getValue("session-status").isStreaming)
+
+        // 空数组清除。
+        val cleared = """{"kind":"extension-status","sessionId":"session-status","statuses":[]}"""
+        projection.acceptFrame(cleared, GatewayWireDecoder.decode(cleared), "session-status")
+        assertTrue(projection.snapshot().extensionStatuses.isEmpty())
+        projection.close()
     }
 
     @Test

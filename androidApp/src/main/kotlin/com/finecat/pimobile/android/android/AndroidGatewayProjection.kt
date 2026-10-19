@@ -470,7 +470,9 @@ internal class AndroidGatewayProjection(
                         val tokens = tokensBefore?.let { (it / 1000).toInt().coerceAtLeast(1) }
                         GatewayEvent(type = "compact/done", text = tokens?.let { "压缩前 ${it}k tokens" })
                     }
-                    null, "custom_message", "wire_oversized" -> PiEventNormalizer.textOf(message.content)
+                    "wire_oversized" -> PiEventNormalizer.textOf(message.content)
+                        .takeIf(String::isNotBlank)?.let { GatewayEvent(type = "notice/omitted", text = it) }
+                    null, "custom_message" -> PiEventNormalizer.textOf(message.content)
                         .takeIf(String::isNotBlank)?.let { GatewayEvent(type = "notice/custom", text = it) }
                     else -> null
                 }

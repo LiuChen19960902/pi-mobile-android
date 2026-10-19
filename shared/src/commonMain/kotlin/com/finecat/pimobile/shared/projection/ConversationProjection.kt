@@ -6,7 +6,7 @@ import com.finecat.pimobile.shared.protocol.SessionEvent
 import kotlinx.serialization.Serializable
 
 @Serializable
-enum class ConversationItemKind { USER, CONTEXT, ASSISTANT, REASONING, TOOL, JSON_TOOL, TOOL_RESULT, STATUS, SYSTEM }
+enum class ConversationItemKind { USER, CONTEXT, ASSISTANT, REASONING, TOOL, JSON_TOOL, TOOL_RESULT, STATUS, SYSTEM, NOTICE }
 
 @Serializable
 data class ConversationProjectionLabels(
@@ -222,8 +222,9 @@ class ConversationProjector(
                 epochSeconds = date,
                 toolCallId = event.callId, parentToolCallId = event.parentCallId
             ), operations)
-            event.type == "notice/custom" && !event.text.isNullOrBlank() -> insert(ConversationItem(
-                id = eventId(record), kind = ConversationItemKind.SYSTEM,
+            (event.type == "notice/custom" || event.type == "notice/omitted") && !event.text.isNullOrBlank() -> insert(ConversationItem(
+                id = eventId(record),
+                kind = if (event.type == "notice/custom") ConversationItemKind.NOTICE else ConversationItemKind.SYSTEM,
                 title = labels.customNotice, text = event.text, epochSeconds = date
             ), operations)
             event.type == "notice/upstream" -> insertUpstreamError(record, event.text, operations, date)

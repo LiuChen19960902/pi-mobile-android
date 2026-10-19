@@ -1528,7 +1528,10 @@ class GatewayRuntime(
             "websocket-failure"
         )
         private val UNCORRELATED_KINDS = setOf(
-            "event", "hello", "paired", "pong"
+            "event", "hello", "paired", "pong",
+            // extension-status 是服务端主动推送的扩展状态全量快照，没有请求关联。
+            // 显式声明无关联，避免以后收紧响应关联时把它误判成 no-active-request。
+            "extension-status"
         )
         private val RESPONSE_KINDS_REQUIRING_ACTIVE_REQUEST = setOf(
             "history", "sent", "subscribed", "unsubscribed", "state", "aborted", "dequeued", "sessions", "model-scope-saved",

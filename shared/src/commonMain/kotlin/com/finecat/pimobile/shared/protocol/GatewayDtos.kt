@@ -133,7 +133,10 @@ data class GatewayFrame(
     // 仅 fetchAttachment 内部消费，帧本体不进 UI 事件队列（避免大 base64 驻留）。
     val imageIndex: Int? = null,
     val mediaType: String? = null,
-    val dataBase64: String? = null
+    val dataBase64: String? = null,
+    // 扩展状态行完整快照（`extension-status` 推送帧，及 subscribed/session-restarted
+    // 应答的可选初始化字段）。空数组 = 清除该会话所有状态。
+    val statuses: List<GatewayStatusEntry>? = null
 ) {
     override fun toString(): String =
         "GatewayFrame(kind=$kind, sessionId=$sessionId, seq=$seq, requestType=$requestType, " +
@@ -141,6 +144,12 @@ data class GatewayFrame(
 }
 
 @Serializable data class GatewayDevice(val id: String, val name: String? = null, val createdAt: Double? = null)
+
+/**
+ * Pi 扩展通过公开 `ctx.ui.setStatus(key, text)` 发布的一条状态行。
+ * 只是显示提示，不表示任务终态（不能推断 isStreaming）。
+ */
+@Serializable data class GatewayStatusEntry(val key: String, val text: String)
 
 @Serializable
 data class GatewayInputCompletion(

@@ -201,6 +201,39 @@ class GatewayConformanceTest {
     }
 
     @Test
+    fun extensionStatusFramesBridgePiSetStatusAcrossRealGatewayAndClient() = runBlocking {
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        val fixture = startFixtureProcess()
+        try {
+            val runtime = buildRuntime()
+            connectProjection(runtime, frames)
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue(
+                "hello.capabilities 必须宣告 extension-status：${runtime.state.value.capabilities}",
+                "extension-status" in runtime.state.value.capabilities
+            )
+
+            // fixture 会话在收到该文本时调用 ctx.ui.setStatus，80ms 后清除。
+            assertTrue(runtime.sendMessage("fixture:status", emptyList(), fixture.info.fixtureSessionId))
+            val live = awaitFrame(frames) {
+                it.frame.kind == "extension-status" &&
+                    it.frame.statuses.orEmpty().any { status -> status.text == "1 agent running" }
+            }
+            assertEquals(fixture.info.fixtureSessionId, live.frame.sessionId)
+            val cleared = awaitFrame(frames) {
+                it.frame.kind == "extension-status" && it.frame.statuses.orEmpty().isEmpty()
+            }
+            assertEquals(fixture.info.fixtureSessionId, cleared.frame.sessionId)
+            assertNoErrorFrames(frames, runtime)
+        } finally {
+            fixture.process.destroy()
+            fixture.process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
     fun inputAssistPreviewAndQuotedFileUseProductionWireAgainstIsolatedGateway() = runBlocking {
         val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
         val fixture = startFixtureProcess()

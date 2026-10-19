@@ -14,6 +14,7 @@ import com.finecat.pimobile.shared.protocol.GatewayQueuedMessages
 import com.finecat.pimobile.shared.protocol.GatewaySessionState
 import com.finecat.pimobile.shared.protocol.GatewayEvent
 import com.finecat.pimobile.shared.protocol.GatewaySessionSummary
+import com.finecat.pimobile.shared.protocol.GatewayStatusEntry
 import com.finecat.pimobile.shared.protocol.GatewayWireDecoder
 import com.finecat.pimobile.shared.protocol.JsonValue
 import com.finecat.pimobile.shared.protocol.SessionEvent
@@ -28,6 +29,8 @@ data class SharedMobileSnapshot(
     val modelCatalog: GatewayModelCatalog? = null,
     /** 每会话的 pi 会话级状态（model/thinkingLevel/contextUsage…），由 state/model-set 帧更新。 */
     val sessionStates: Map<String, GatewaySessionState> = emptyMap(),
+    /** 每会话的扩展状态行（Pi `ctx.ui.setStatus` 快照），只用于显示，不代表任务状态。 */
+    val extensionStatuses: Map<String, List<GatewayStatusEntry>> = emptyMap(),
     val selectedHistoryHasMore: Boolean = false,
     val selectedHistoryEarliestSequence: Int? = null,
     val selectedHistoryIsLoading: Boolean = false,
@@ -58,6 +61,7 @@ class SharedMobileStore(
     private val eventsBySession = mutableMapOf<String, List<SessionEvent>>()
     private var modelCatalog: GatewayModelCatalog? = null
     private val sessionStates = mutableMapOf<String, GatewaySessionState>()
+    private val extensionStatuses = mutableMapOf<String, List<GatewayStatusEntry>>()
     private var lastFrameKind: String? = null
     private var lastError: String? = null
 
@@ -76,6 +80,14 @@ class SharedMobileStore(
             val frame = GatewayWireDecoder.decode(json)
             lastFrameKind = frame.kind
             lastError = null
+            // 扩展状态是完整快照：任何带 statuses 的帧（extension-status 推送、
+            // subscribed/session-restarted 应答）都整表替换该会话的状态行。
+            // 无 sessionId 时无法归属，忽略；extension-status 缺 sessionId 属违规帧。
+            frame.statuses?.let { statuses ->
+                frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
+                    replaceExtensionStatuses(sessionId, statuses)
+                }
+            }
             when (frame.kind) {
                 "sessions" -> {
                     val sessions = frame.items.orEmpty().mapNotNull { item ->
@@ -196,6 +208,7 @@ class SharedMobileStore(
         eventsBySession.clear()
         modelCatalog = null
         sessionStates.clear()
+        extensionStatuses.clear()
         lastFrameKind = null
         lastError = null
         return makeSnapshot()
@@ -268,6 +281,18 @@ class SharedMobileStore(
         return GatewayQueuedMessages(steering = steering, followUp = followUp)
     }
 
+    /** 替换该会话的扩展状态完整列表：丢弃空白文本、按 key 去重（后者覆盖前者、
+     *  位置不变），空列表即清除该会话条目（对齐 Pi 的 setStatus(key, undefined)）。 */
+    private fun replaceExtensionStatuses(sessionId: String, statuses: List<GatewayStatusEntry>) {
+        val entries = mutableMapOf<String, GatewayStatusEntry>()
+        statuses.forEach { entry ->
+            if (entry.key.isBlank() || entry.text.isBlank()) return@forEach
+            entries[entry.key] = entry
+        }
+        if (entries.isEmpty()) extensionStatuses.remove(sessionId)
+        else extensionStatuses[sessionId] = entries.values.toList()
+    }
+
     private fun makeSnapshot(): SharedMobileSnapshot {
         val selected = sessionListState.selectedSessionId
         return SharedMobileSnapshot(
@@ -276,6 +301,7 @@ class SharedMobileStore(
             conversation = selected?.let { ConversationProjector.make(eventsBySession[it].orEmpty()) }.orEmpty(),
             modelCatalog = modelCatalog,
             sessionStates = sessionStates.toMap(),
+            extensionStatuses = extensionStatuses.toMap(),
             lastFrameKind = lastFrameKind,
             lastError = lastError
         )

@@ -22,7 +22,7 @@ class PiContractCompatibilityTest {
             ), "visible-$customType")
             val item = ConversationProjector.make(records).single()
             assertEquals("notice/custom", records.single().event.type)
-            assertEquals(ConversationItemKind.SYSTEM, item.kind)
+            assertEquals(ConversationItemKind.NOTICE, item.kind)
             assertEquals("通知", item.title)
             assertEquals("可见内容", item.text)
             assertFalse(item.isError)

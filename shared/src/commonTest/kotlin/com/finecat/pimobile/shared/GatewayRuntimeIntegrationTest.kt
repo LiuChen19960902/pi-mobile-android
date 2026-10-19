@@ -618,6 +618,28 @@ class GatewayRuntimeIntegrationTest {
     }
 
     @Test
+    fun extensionStatusPushHasNoRequestCorrelationAndStillReachesUiQueue() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect(events::add) }
+        connectHello(transport, runtime,
+            """{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["sessions","subscribe","extension-status"]}""")
+
+        // 服务端主动推送，本地没有在途请求：不能当 unknown-command / no-active-request 拒绝。
+        transport.receive(
+            """{"kind":"extension-status","sessionId":"s1","statuses":[{"key":"subagents","text":"1 agent running"}]}"""
+        )
+        runCurrent()
+        val frame = events.filterIsInstance<GatewayRuntimeEvent.Frame>()
+            .single { it.frame.kind == "extension-status" }
+        assertEquals("1 agent running", frame.frame.statuses?.single()?.text)
+        assertFalse(events.filterIsInstance<GatewayRuntimeEvent.RequestRejected>().any {
+            it.reason == "no-active-request"
+        })
+    }
+
+    @Test
     fun errorFramesPassWireCodeThroughAndReleaseTurnsExactly() = runTest {
         val transport = FakeTransport()
         val runtime = newRuntime(transport)
