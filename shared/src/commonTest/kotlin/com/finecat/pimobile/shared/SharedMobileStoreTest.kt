@@ -396,4 +396,70 @@ class SharedMobileStoreTest {
         store.clearSessionEvents("s1")
         assertEquals(0, store.snapshot().conversation.size)
     }
+
+    @Test
+    fun extensionStatusPushReplacesWholeSessionSnapshotAndNeverTouchesSessionState() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+        store.acceptFrame("""{"kind":"state","sessionId":"android-demo","isStreaming":true,"isCompacting":false}""")
+
+        val first = store.acceptFrame(
+            """{"kind":"extension-status","sessionId":"android-demo","statuses":[{"key":"subagents","text":"1 agent running"},{"key":"review","text":"审查中"}]}"""
+        )
+        assertEquals(
+            listOf("subagents", "review"),
+            first.extensionStatuses.getValue("android-demo").map { it.key }
+        )
+        assertEquals(
+            listOf("1 agent running", "审查中"),
+            first.extensionStatuses.getValue("android-demo").map { it.text }
+        )
+        // 状态只是显示提示：不能用来推断忙闲。
+        assertTrue(first.sessionStates.getValue("android-demo").isStreaming)
+
+        // 完整快照：新帧没带的 key 即消失；重复 key 后者覆盖；空白文本不进入显示。
+        val second = store.acceptFrame(
+            """{"kind":"extension-status","sessionId":"android-demo","statuses":[{"key":"subagents","text":"2 agents running"},{"key":"subagents","text":"3 agents running"},{"key":"blank","text":"   "}]}"""
+        )
+        val entries = second.extensionStatuses.getValue("android-demo")
+        assertEquals(listOf("subagents"), entries.map { it.key })
+        assertEquals("3 agents running", entries.single().text)
+
+        // 空数组清除该会话条目。
+        val cleared = store.acceptFrame("""{"kind":"extension-status","sessionId":"android-demo","statuses":[]}""")
+        assertTrue(cleared.extensionStatuses.isEmpty())
+    }
+
+    @Test
+    fun extensionStatusWithoutSessionIdIsIgnored() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+        val snapshot = store.acceptFrame(
+            """{"kind":"extension-status","statuses":[{"key":"subagents","text":"1 agent running"}]}"""
+        )
+        assertTrue(snapshot.extensionStatuses.isEmpty())
+        assertNull(snapshot.lastError)
+    }
+
+    @Test
+    fun subscribedAndSessionRestartedRepliesInitializeExtensionStatuses() {
+        val store = SharedMobileStore()
+        store.loadManualTestFixture()
+
+        // 切会话/重连后先由 subscribed 应答带上当前快照，不必等下一次 setStatus。
+        val subscribed = store.acceptFrame(
+            """{"kind":"subscribed","sessionId":"android-demo","statuses":[{"key":"subagents","text":"1 agent running"}]}"""
+        )
+        assertEquals("1 agent running", subscribed.extensionStatuses.getValue("android-demo").single().text)
+
+        // session-restarted（重载配置）重建会话后同一字段同样覆盖（而不是累加）。
+        val restarted = store.acceptFrame(
+            """{"kind":"session-restarted","sessionId":"android-demo","isStreaming":false,"isCompacting":false,"statuses":[{"key":"subagents","text":"2 agents running"}]}"""
+        )
+        assertEquals(listOf("2 agents running"), restarted.extensionStatuses.getValue("android-demo").map { it.text })
+        assertTrue(!restarted.sessionStates.getValue("android-demo").isStreaming)
+
+        // reset 清空状态行（换网关/配对重置不残留上一个连接的状态）。
+        assertTrue(store.reset().extensionStatuses.isEmpty())
+    }
 }

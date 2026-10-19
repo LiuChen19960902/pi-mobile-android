@@ -854,6 +854,11 @@ private fun ConversationPage(
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 1.dp)
                 )
             }
+            ExtensionStatusBar(
+                stateHolder = stateHolder,
+                sessionId = sessionId,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.42f)
+            )
             PendingDispatchBar(stateHolder, onDismissInput)
             QueuedMessagesBar(stateHolder, sessionId)
             // 工作区行常驻：未绑定时（含发送预览）仍可选目录，绑定后只读当前 cwd。
@@ -2408,7 +2413,7 @@ private fun ConversationRow(
         )
         ConversationItemKind.ASSISTANT -> AssistantMessage(item, thumbnails, attachmentStates, onRetryAttachment)
         ConversationItemKind.STATUS -> StatusRow(item)
-        ConversationItemKind.SYSTEM -> SystemRow(item)
+        ConversationItemKind.SYSTEM, ConversationItemKind.NOTICE -> SystemRow(item)
         else -> Unit
     }
 }
@@ -2453,6 +2458,7 @@ private fun ConversationProcessRow(
                     when (segment) {
                         is ConversationProcessSegment.Reasoning -> ThinkingRow(segment.item)
                         is ConversationProcessSegment.Context -> ProcessContextDisclosure(segment.item)
+                        is ConversationProcessSegment.Notice -> ProcessContextDisclosure(segment.item)
                         is ConversationProcessSegment.ToolRun ->
                             ProcessToolBundle(segment.id, segment.tools)
                     }

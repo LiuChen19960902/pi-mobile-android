@@ -107,6 +107,7 @@ import com.finecat.pimobile.android.ui.finecat.composer.*
 import com.finecat.pimobile.android.AndroidSharedStateHolder
 import com.finecat.pimobile.android.BuildConfig
 import com.finecat.pimobile.android.ui.ConversationDisplayEntry
+import com.finecat.pimobile.android.ui.ExtensionStatusBar
 import com.finecat.pimobile.android.ui.groupAssistantRounds
 import com.finecat.pimobile.android.ui.HeroCopyEditorDialog
 import com.finecat.pimobile.android.ui.SessionRenameDialog
@@ -1116,6 +1117,12 @@ private fun FineCatAppContent(
                         }
                     }
                 }
+                // 扩展状态行只显示当前会话的提示，不改变忙闲或发送状态。
+                ExtensionStatusBar(
+                    stateHolder = stateHolder,
+                    sessionId = snapshot.selectedSessionId,
+                    color = colors.text3,
+                )
                 // P4b：忙时点发送 → 草稿吸附条（注入本轮 / 排队下轮 / 取回）
                 stateHolder.pendingDispatch?.let { pending ->
                     if (pending.sessionId == snapshot.selectedSessionId) {

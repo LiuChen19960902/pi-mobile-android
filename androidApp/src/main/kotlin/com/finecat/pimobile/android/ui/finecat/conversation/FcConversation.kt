@@ -101,6 +101,7 @@ data class FcStep(
     val completed: Boolean = false,
     val isContext: Boolean = false,
     val toolName: String? = null,
+    val isNotice: Boolean = false,
 )
 
 /** 正在生成的尾部步骤组；列表弹卡跟随此组的真实运行状态更新。 */
@@ -175,6 +176,11 @@ internal fun fineCatSteps(group: ConversationProcessGroup): List<FcStep> = build
             is ConversationProcessSegment.Context -> add(FcStep(
                 id = segment.id, label = "上下文", arg = segment.item.text.take(80),
                 detail = segment.item.text, isContext = true,
+            ))
+            is ConversationProcessSegment.Notice -> add(FcStep(
+                id = segment.id, label = segment.item.title,
+                arg = segment.item.text.take(120), detail = segment.item.text,
+                completed = true, isNotice = true,
             ))
             is ConversationProcessSegment.ToolRun -> segment.tools.forEach { tool ->
                 val call = tool.call
@@ -363,7 +369,7 @@ fun FcTimeSeparator(
 internal fun fineCatStepSummary(step: FcStep): Pair<String, String> {
     fun singleLine(text: String) = text.lineSequence().map(String::trim).filter(String::isNotEmpty).joinToString(" ")
     if (step.isThought) return "思考" to singleLine(step.detail.orEmpty()).take(120)
-    if (step.isContext) return step.label to singleLine(step.arg).take(120)
+    if (step.isContext || step.isNotice) return step.label to singleLine(step.arg).take(120)
     val args = step.command?.let { runCatching { Json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
     fun argument(vararg names: String): String? = names.firstNotNullOfOrNull { name ->
         (args?.get(name) as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotBlank)
@@ -420,7 +426,7 @@ fun FcStepRow(
         modifier = modifier.fillMaxWidth().testTag("finecat.step.${step.id}")
             .semantics {
                 stateDescription = if (expanded) "已展开" else "已折叠"
-                if (!step.isThought && !step.isContext) contentDescription = when {
+                if (!step.isThought && !step.isContext && !step.isNotice) contentDescription = when {
                     step.failed -> "失败"
                     step.completed -> "成功"
                     else -> "等待结果"
@@ -457,6 +463,7 @@ fun FcStepRow(
 private fun FcStepDetail(step: FcStep, modifier: Modifier = Modifier) {
     val colors = LocalFineCatColors.current
     val type = LocalFineCatType.current
+    val useThoughtStyle = step.isThought || step.isNotice
     // 内部先正常滚动，再消耗边缘剩余位移/速度；不把同一手势续接到会话。
     val scrollBoundary = remember {
         object : NestedScrollConnection {
@@ -470,7 +477,7 @@ private fun FcStepDetail(step: FcStep, modifier: Modifier = Modifier) {
     Column(
         modifier.fillMaxWidth()
             .heightIn(max = 240.dp)
-            .then(if (step.isThought) Modifier
+            .then(if (useThoughtStyle) Modifier
                 .clip(RoundedCornerShape(8.dp))
                 .background(colors.surface2)
                 .drawBehind {
@@ -483,21 +490,21 @@ private fun FcStepDetail(step: FcStep, modifier: Modifier = Modifier) {
             .testTag("finecat.stepDetailBody")
             .nestedScroll(scrollBoundary)
             .verticalScroll(rememberScrollState())
-            .then(if (step.isThought) Modifier
+            .then(if (useThoughtStyle) Modifier
                 .padding(start = 12.dp, end = 10.dp, top = 8.dp, bottom = 8.dp)
             else Modifier),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         step.durationText?.let { Text(it, style = type.xs, color = colors.text3) }
-        if (step.isThought || step.isContext) {
+        if (step.isThought || step.isContext || step.isNotice) {
             SelectionContainer(
-                modifier = if (step.isThought) Modifier
+                modifier = if (useThoughtStyle) Modifier
                     .fillMaxWidth()
-                    .testTag("finecat.thoughtDetail")
+                    .testTag(if (step.isNotice) "finecat.noticeDetail" else "finecat.thoughtDetail")
                 else Modifier,
             ) {
                 Text(step.detail.orEmpty(),
-                    style = if (step.isThought) type.xs.copy(lineHeight = type.xs.fontSize * 1.7f) else type.body,
+                    style = if (useThoughtStyle) type.xs.copy(lineHeight = type.xs.fontSize * 1.7f) else type.body,
                     color = colors.text2,
                     modifier = Modifier.testTag("finecat.stepDetailText"))
             }
