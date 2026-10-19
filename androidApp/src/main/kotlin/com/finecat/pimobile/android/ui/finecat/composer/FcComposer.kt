@@ -161,6 +161,7 @@ fun FcComposer(
     onModelBoundsChange: (IntRect) -> Unit = {},
     showDirectory: Boolean = false,
     directory: String? = null,
+    directoryBranch: String? = null,
     onDirectoryClick: (() -> Unit)? = null,
     inputAssist: ComposerInputAssist? = null,
 ) {
@@ -209,7 +210,7 @@ fun FcComposer(
             .onGloballyPositioned { onBoundsChange(it.boundsInWindow()) },
     ) {
         if (showDirectory && inputAssist?.panel == null) {
-            FcComposerDirectory(directory, onDirectoryClick)
+            FcComposerDirectory(directory, onDirectoryClick, directoryBranch)
         }
 
         // 与输入卡同宽，零高度，不占用 dock 的测量高度。
@@ -840,7 +841,7 @@ fun FcShotStrip(
 }
 
 @Composable
-private fun FcComposerDirectory(directory: String?, onDirectoryClick: (() -> Unit)?) {
+private fun FcComposerDirectory(directory: String?, onDirectoryClick: (() -> Unit)?, branch: String?) {
     val colors = LocalFineCatColors.current
             Row(
                 modifier = Modifier
@@ -873,7 +874,15 @@ private fun FcComposerDirectory(directory: String?, onDirectoryClick: (() -> Uni
                             color = colors.text2, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
-                if (onDirectoryClick != null) {
+                if (branch != null) {
+                    Row(Modifier.weight(0.52f, fill = false).background(colors.surface2, RoundedCornerShape(999.dp))
+                        .padding(horizontal = 7.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Icon(FineCatIcons.Branch, null, tint = colors.text3, modifier = Modifier.size(12.dp))
+                        Text(branch, style = LocalFineCatType.current.xs, color = colors.text2, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("finecat.worktreeChip"))
+                    }
+                } else if (onDirectoryClick != null) {
                     Icon(FineCatIcons.Right, null, tint = colors.text3, modifier = Modifier.size(16.dp))
                 }
             }

@@ -58,6 +58,7 @@ class AndroidGatewayPreferences(context: Context) : GatewayPreferences {
         // DataStore 没有有序列表键，按行拼成单字符串保存（顺序即尝试优先级）。
         else preferences[ENDPOINT_CANDIDATES] = candidates.joinToString("\n")
         snapshot.sessionsJson.setOrRemove(preferences, SESSIONS_JSON)
+        snapshot.worktreePendingJson.setOrRemove(preferences, WORKTREE_PENDING)
         snapshot.heroTitle.setOrRemove(preferences, HERO_TITLE)
         snapshot.heroTagline.setOrRemove(preferences, HERO_TAGLINE)
         preferences[APPEARANCE] = snapshot.appearanceMode.ifBlank { "system" }
@@ -80,6 +81,7 @@ class AndroidGatewayPreferences(context: Context) : GatewayPreferences {
                 ?.lineSequence()?.map(String::trim)?.filter(String::isNotEmpty)?.distinct()?.toList()
                 ?: emptyList(),
             sessionsJson = preferences[SESSIONS_JSON],
+            worktreePendingJson = preferences[WORKTREE_PENDING],
             heroTitle = preferences[HERO_TITLE],
             heroTagline = preferences[HERO_TAGLINE],
             appearanceMode = preferences[APPEARANCE] ?: "system",
@@ -107,6 +109,7 @@ class AndroidGatewayPreferences(context: Context) : GatewayPreferences {
         private const val FILE_NAME = "gateway.preferences_pb"
         private val ENDPOINT = stringPreferencesKey("gateway.endpoint")
         private val ENDPOINT_CANDIDATES = stringPreferencesKey("gateway.endpoint_candidates")
+        private val WORKTREE_PENDING = stringPreferencesKey("gateway.worktree_pending")
         private val SESSIONS_JSON = stringPreferencesKey("gateway.sessions_json")
         private val HERO_TITLE = stringPreferencesKey("gateway.hero_title")
         private val HERO_TAGLINE = stringPreferencesKey("gateway.hero_tagline")

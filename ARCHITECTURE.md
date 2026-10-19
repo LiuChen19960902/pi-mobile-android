@@ -37,6 +37,8 @@ Pi 接入以网关实际锁定的 SDK 契约为边界；通用消息/工具语�
 
 Tree的浏览选择与真实active leaf分开。`tree-view-v1`在网关计算筛选/搜索/折叠与前缀；`tree-actions-v1`提供entry全文复制和追加LabelEntry。客户端按会话+entry关联离散动作，导航/改配清理旧发布态；只有明确跳转才调用既有switch-branch。标签钉子只跟随其运行时后代，普通手动跳转钉子保留原行为。协议真源见网关 `PROTOCOL.md` §4.26–4.27。
 
+工作区入口在输入框上方目录条。`worktree-v1` 提供真实 Git 发现/创建、延续会话与结果确认；首页目标和当前会话目录分离。已有会话入口复用全局`sessions`，以本次应答ID与精确cwd筛选，选择后经项目信任检查走普通会话导航；源稿和目标稿分别保存。网关以 Pi 公开 API 在目标建立独立上下文，手机在权威结果后切换订阅并迁移草稿。重试、活动分支持久化与项目信任的依据见[工作区记录](.agents/notes/implemented/feature/2026-10-18-mobile-worktree-actions.md)。
+
 ## 2. 一条消息的生命周期
 
 1. Compose 事件 → `AndroidSharedStateHolder` 的语义化方法 → `GatewayRuntime.sendMessage(...)`

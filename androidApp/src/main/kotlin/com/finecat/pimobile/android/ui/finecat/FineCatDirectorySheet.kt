@@ -39,21 +39,31 @@ internal fun FineCatDirectorySheet(
     stateHolder: AndroidSharedStateHolder,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
+    sessionMode: Boolean = false,
+    initialPath: String? = null,
+    continueBlockedReason: String? = null,
+    onContinue: ((String) -> Unit)? = null,
+    onNewSession: ((String) -> Unit)? = null,
+    onSelectHome: ((String) -> Unit)? = null,
 ) {
     val colors = LocalFineCatColors.current
     val type = LocalFineCatType.current
     val current = stateHolder.directoryPath
-    var requestedPath by remember { mutableStateOf(stateHolder.fineCatNewSessionDirectoryPath ?: "/") }
+    var requestedPath by remember { mutableStateOf(initialPath ?: stateHolder.fineCatNewSessionDirectoryPath ?: "/") }
     var confirmWhenReady by remember { mutableStateOf(false) }
     val loading = stateHolder.directoryIsLoading
     val error = stateHolder.directoryError
+    fun finishSelection() {
+        if (!sessionMode && current != null && !loading && error == null && onSelectHome != null) onSelectHome(current)
+        else onDismiss()
+    }
     LaunchedEffect(current, loading, error, confirmWhenReady) {
-        if (current != null && !loading && error == null) {
+        if (!sessionMode && onSelectHome == null && current != null && !loading && error == null) {
             stateHolder.selectFineCatDirectory(current)
         }
         if (confirmWhenReady && !loading) {
             confirmWhenReady = false
-            if (error == null) onDismiss()
+            if (error == null) finishSelection()
         }
     }
     fun browse(path: String) {
@@ -63,11 +73,12 @@ internal fun FineCatDirectorySheet(
     }
     FcSheet(
         visible = true,
-        onDismiss = onDismiss,
-        onOutsideClick = { if (loading) confirmWhenReady = true else onDismiss() },
+        onDismiss = { finishSelection() },
+        onOutsideClick = { if (loading) confirmWhenReady = true else finishSelection() },
         title = "工作目录",
         showDone = true,
-        onDone = { if (loading) confirmWhenReady = true else onDismiss() },
+        doneText = if (sessionMode) "关闭" else "完成",
+        onDone = { if (loading) confirmWhenReady = true else finishSelection() },
         modifier = modifier.testTag("finecat.dirSheet"),
     ) {
         Row(
@@ -86,7 +97,7 @@ internal fun FineCatDirectorySheet(
             )
         }
         if (current == "/" && !loading) {
-            Text("先选一个目录，新会话会建在它里面", style = type.xs, color = colors.text3,
+            Text(if (sessionMode) "选择一个目录" else "先选一个目录，新会话会建在它里面", style = type.xs, color = colors.text3,
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
         }
         error?.let {
@@ -132,6 +143,23 @@ internal fun FineCatDirectorySheet(
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
             }
         }
+        if (sessionMode) {
+            continueBlockedReason?.let { Text(it, style = type.xs, color = colors.warn,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
+            val canPick = current != null && current != "/" && !loading && error == null
+            if (onContinue != null) {
+                androidx.compose.material3.Button(
+                    onClick = { current?.let(onContinue) },
+                    enabled = canPick && current != initialPath && continueBlockedReason == null,
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = colors.ink, contentColor = colors.onInk),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).heightIn(min = 46.dp).testTag("finecat.dirContinue"),
+                ) { Text("带当前对话继续", style = type.sm) }
+            }
+            FcTextButton("在此新建会话", enabled = canPick, onClick = { current?.let { onNewSession?.invoke(it) } }, muted = true,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("finecat.dirNewSession"))
+        }
+
     }
 }
 
