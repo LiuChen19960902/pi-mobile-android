@@ -32,6 +32,28 @@ import kotlinx.coroutines.test.resetMain
 @OptIn(ExperimentalCoroutinesApi::class)
 class AndroidSharedStateHolderTest {
     @Test
+    fun bridgeQueueRecallRestoresTextOnceAndKeepsCurrentRunAndNewDraft() {
+        val holder = newPreviewHolder()
+        try {
+            holder.selectSession("s-bridge-queue")
+            holder.wirePayload = """{"kind":"state","sessionId":"s-bridge-queue","isStreaming":true,"isCompacting":false,"pendingMessages":true,"queuedMessages":{"steering":[],"followUp":[]}}"""
+            holder.submitWirePayload()
+            assertTrue(holder.snapshot.sessionStates.getValue("s-bridge-queue").hasQueuedMessages)
+            holder.messageDraft = "new draft"
+            assertTrue(holder.beginQueueRecall("s-bridge-queue", "q-bridge"))
+            holder.wirePayload = """{"kind":"dequeued","sessionId":"s-bridge-queue","queueRequestId":"q-bridge","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["queued draft"]}"""
+            holder.submitWirePayload()
+            assertEquals("queued draft\n\nnew draft", holder.messageDraft)
+            val after = holder.snapshot.sessionStates.getValue("s-bridge-queue")
+            assertFalse(after.hasQueuedMessages)
+            assertTrue(after.isStreaming)
+            holder.submitWirePayload()
+            assertEquals("queued draft\n\nnew draft", holder.messageDraft)
+            assertEquals(0L, holder.successfulMessageSendCount)
+        } finally { holder.close() }
+    }
+
+    @Test
     fun treeActionsCannotPublishIntoAnotherSessionOrSurviveReset() {
         val holder = AndroidSharedStateHolder()
         try {
@@ -119,6 +141,17 @@ class AndroidSharedStateHolderTest {
         // 默认必须保持 false（生产 MainActivity 冷启动自动连接语义不被无声关掉，
         // F13 第三轮复审 MINOR-5）。
         org.junit.Assert.assertFalse(AndroidSharedStateHolder.skipStoredConnectForTest)
+    }
+
+    @Test
+    fun hostModeFrameIsAuthoritativeBeforeInputRefresh() {
+        val holder = AndroidSharedStateHolder()
+        holder.wirePayload = """{"kind":"host-mode","mode":"bridge","changed":false}"""
+        holder.submitWirePayload()
+        assertEquals("bridge", holder.gatewayState.hostMode)
+        holder.wirePayload = """{"kind":"host-mode","mode":"sdk","changed":false}"""
+        holder.submitWirePayload()
+        assertEquals("sdk", holder.gatewayState.hostMode)
     }
 
     @Test
@@ -465,6 +498,18 @@ class AndroidSharedStateHolderTest {
     }
 
     // ---- 手动压缩上下文（CTX02）：真实接线的闸门、归属与统计收尾 ----
+
+    @Test
+    fun compactFailedAckWithoutActivityFlagsReleasesPendingWithFailureNotice() {
+        val holder = AndroidSharedStateHolder()
+        holder.selectSession("session-compact")
+        holder.compactGateForceOpenForTest = true
+        holder.startManualCompact()
+        holder.wirePayload = """{"kind":"compact-started","sessionId":"session-compact","status":"failed"}"""
+        holder.submitWirePayload()
+        assertTrue(holder.canStartManualCompact())
+        assertEquals("上下文压缩失败，请重试", holder.transientNotice)
+    }
 
     @Test
     fun compactRequestGuardBlocksRepeatsWhilePendingOrCompacting() {
@@ -2076,6 +2121,180 @@ class AndroidSharedStateHolderTest {
         holder.restoreOutgoingPreviewDraft(outgoing.sendToken)
         assertEquals("后写新稿", holder.messageDraft)
         assertTrue(holder.preparedImages.isEmpty())
+    }
+
+    @Test
+    fun bridgeSubmittedAcknowledgementCompletesItsOwnDraftAndImageWait() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-bridge")
+        holder.messageDraft = "跨桥原稿"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+        val (_, outgoing) = driveSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge","disposition":"submitted","operationId":"${outgoing.sendToken}","instanceId":"i1","epoch":"e1","status":"submitted","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals("已提交回执结束发送等待，不等不存在的 send settled", "", holder.messageDraft)
+        assertTrue(holder.preparedImages.isEmpty())
+        holder.messageDraft = "后写新稿"
+        holder.markStaleOutgoingPreviews(testNowMs + 45_001)
+        assertTrue("已提交图片不能因等待原生回显而假报未确认", holder.outgoingPreviews.isEmpty())
+        holder.wirePayload = """{"kind":"event","sessionId":"s-bridge","entryId":"other-user","seq":1,"time":1,"event":{"type":"message_end","message":{"role":"user","content":"跨桥原稿"}}}"""
+        holder.submitWirePayload()
+        assertEquals("普通正文回显不能影响之后编辑的草稿", "后写新稿", holder.messageDraft)
+    }
+
+    @Test
+    fun abortFailureRestoresQueuedTextOnlyForMatchingOperation() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-abort-fail")
+        holder.messageDraft = "新草稿"
+        assertTrue(holder.beginStoppingSession("s-abort-fail", "abort-op"))
+
+        holder.finishAbortRequest("s-abort-fail", "other-op", "旧队列")
+        assertEquals("新草稿", holder.messageDraft)
+        assertFalse("错配失败不能结束当前 stop", holder.beginStoppingSession("s-abort-fail", "next"))
+
+        holder.finishAbortRequest("s-abort-fail", "abort-op", "旧队列")
+        assertEquals("旧队列\n\n新草稿", holder.messageDraft)
+        holder.finishAbortRequest("s-abort-fail", "abort-op", "旧队列")
+        assertEquals("重复失败不能重复回填", "旧队列\n\n新草稿", holder.messageDraft)
+        assertTrue("匹配失败已结束 stop", holder.beginStoppingSession("s-abort-fail", "next"))
+    }
+
+    @Test
+    fun nativeRootTrustRefusalKeepsDraftAndWrongTokenCannotOpenConfirmation() {
+        val holder = newPreviewHolder()
+        try {
+            holder.selectFineCatDirectory("/synthetic/new")
+            holder.messageDraft = "original draft"
+            val submission = holder.captureMessageSubmissionForTest()
+            val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
+            holder.rememberNewSessionTextForReject(submission, outgoing, true, true)
+            holder.handleOutgoingMessageRejection(GatewayRuntimeEvent.RequestRejected(
+                requestType = "message", reason = "worktree-trust-required", correlationId = "wrong", serverResponse = true))
+            assertFalse(holder.worktreeUi.open)
+            assertEquals("original draft", holder.messageDraft)
+            holder.handleOutgoingMessageRejection(GatewayRuntimeEvent.RequestRejected(
+                requestType = "message", reason = "worktree-trust-required", correlationId = outgoing.sendToken, serverResponse = true))
+            assertTrue(holder.worktreeUi.open)
+            assertEquals(WorktreePhase.TRUST, holder.worktreeUi.phase)
+            assertEquals("/synthetic/new", holder.worktreeUi.targetPath)
+            assertEquals("original draft", holder.messageDraft)
+            assertNull(holder.snapshot.selectedSessionId)
+            holder.closeWorktree()
+            assertEquals("original draft", holder.messageDraft)
+        } finally { holder.close() }
+    }
+
+    @Test
+    fun nativeRootRefusalAfterNavigationCannotMoveTrustOrDraftToAnotherSession() {
+        val holder = newPreviewHolder()
+        try {
+            holder.selectFineCatDirectory("/synthetic/new")
+            holder.messageDraft = "original draft"
+            val submission = holder.captureMessageSubmissionForTest()
+            val outgoing = holder.beginOutgoingSend(submission, createPreview = true)
+            holder.rememberNewSessionTextForReject(submission, outgoing, true, true)
+            holder.selectSession("other")
+            holder.messageDraft = "other draft"
+            holder.handleOutgoingMessageRejection(GatewayRuntimeEvent.RequestRejected(
+                requestType = "message", reason = "worktree-trust-required", correlationId = outgoing.sendToken, serverResponse = true))
+            assertFalse(holder.worktreeUi.open)
+            assertEquals("other", holder.snapshot.selectedSessionId)
+            assertEquals("other draft", holder.messageDraft)
+        } finally { holder.close() }
+    }
+
+    @Test
+    fun bridgeSubmittedAckMustMatchThePendingSendOperation() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-bridge-order")
+        holder.messageDraft = "B 的原稿"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+        val (_, outgoing) = driveSend(holder)
+
+        // A 的迟到 ACK 不能把 B 的等待队头认成自己的收据。
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-order","disposition":"submitted","operationId":"op-a","instanceId":"i1","epoch":"e1","status":"submitted","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals(listOf(outgoing.sendToken), holder.outgoingPreviews.map { it.sendToken })
+        assertEquals(OutgoingImagePreviewState.SENDING, holder.outgoingPreviews.single().state)
+        assertEquals("B 的原稿", holder.messageDraft)
+
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-order","disposition":"submitted","operationId":"${outgoing.sendToken}","instanceId":"i2","epoch":"e2","status":"submitted","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals("匹配提交才结束这条发送", "", holder.messageDraft)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertTrue(holder.preparedImages.isEmpty())
+        holder.messageDraft = "C 的原稿"
+        driveSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-order","disposition":"submitted","operationId":"${outgoing.sendToken}","instanceId":"i2","epoch":"e2","status":"submitted","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals("重复旧回执不能清下一条草稿", "C 的原稿", holder.messageDraft)
+    }
+
+    @Test
+    fun bridgeSubmittedDoesNotLeaveAnUnconfirmedWarningAfterNativeReply() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-bridge-text")
+        holder.messageDraft = "phone-check"
+        val (_, outgoing) = driveSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-text","disposition":"submitted","operationId":"${outgoing.sendToken}","instanceId":"i1","epoch":"e1","status":"submitted","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals("", holder.messageDraft)
+        holder.wirePayload = """{"kind":"event","sessionId":"s-bridge-text","entryId":"answer","seq":1,"time":1,"event":{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"MIDDLE:phone-check"}]}}}"""
+        holder.submitWirePayload()
+        holder.markStaleOutgoingPreviews(testNowMs + 45_001)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+        assertTrue(holder.snapshot.conversation.any { it.text == "MIDDLE:phone-check" })
+    }
+
+    @Test
+    fun bridgeSubmittedDoesNotClearTextWrittenAfterTheSend() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-bridge-new-draft")
+        holder.messageDraft = "已发原稿"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+        val (_, outgoing) = driveSend(holder)
+        holder.messageDraft = "后写新稿"
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-new-draft","disposition":"submitted","operationId":"${outgoing.sendToken}","instanceId":"i1","epoch":"e1","status":"submitted","isStreaming":true,"isCompacting":false}"""
+        holder.submitWirePayload()
+        assertEquals("后写新稿", holder.messageDraft)
+        holder.markStaleOutgoingPreviews(testNowMs + 45_001)
+        assertTrue(holder.outgoingPreviews.isEmpty())
+    }
+
+    @Test
+    fun bridgeSubmittedWithoutImagePreviewDoesNotBlockTheNextSend() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-bridge-dispatch")
+        holder.messageDraft = "带图追加"
+        holder.setPreparedImagesForTest(listOf(preparedTestImage()))
+        val submission = holder.captureMessageSubmissionForTest()
+        // 忙时 steer/followUp 的真实实发边界：不建本地占位气泡，也没有纯文本快照。
+        val dispatch = holder.beginOutgoingSend(submission, createPreview = false)
+        holder.settleOutgoingSendLocally(submission, dispatch, sent = true, clearInputOnSuccess = false)
+        holder.messageDraft = "后写新稿"
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-dispatch","disposition":"submitted","operationId":"${dispatch.sendToken}","instanceId":"i1","epoch":"e1"}"""
+        holder.submitWirePayload()
+        assertEquals("无本地预览的提交也不能动输入区", "后写新稿", holder.messageDraft)
+        holder.setPreparedImagesForTest(emptyList())
+        holder.messageDraft = "下一条普通发送"
+        val (_, next) = driveSend(holder)
+        holder.wirePayload = """{"kind":"sent","sessionId":"s-bridge-dispatch","disposition":"submitted","operationId":"${next.sendToken}","instanceId":"i1","epoch":"e1"}"""
+        holder.submitWirePayload()
+        assertEquals("上一条必须消费等待队头，不能把后续提交全部挡住", "", holder.messageDraft)
+    }
+
+    @Test
+    fun bridgeSendWithMissingAcknowledgementKeepsExplicitRecovery() {
+        val holder = newPreviewHolder()
+        holder.selectSession("s-bridge-unknown")
+        holder.messageDraft = "没有提交回执的原稿"
+        val (_, outgoing) = driveSend(holder)
+        holder.handleOutgoingSendUnconfirmed()
+        assertEquals(OutgoingImagePreviewState.UNCONFIRMED, holder.outgoingPreviews.single().state)
+        holder.messageDraft = ""
+        holder.restoreOutgoingPreviewDraft(outgoing.sendToken)
+        assertEquals("没有提交回执的原稿", holder.messageDraft)
     }
 
     @Test

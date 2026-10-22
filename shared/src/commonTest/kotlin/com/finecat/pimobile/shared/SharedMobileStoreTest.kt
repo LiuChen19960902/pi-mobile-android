@@ -10,6 +10,118 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SharedMobileStoreTest {
+    @Test fun bridgeModeCannotDisplayStatusesFromAnOldSdkHandle() {
+        val store = SharedMobileStore()
+        val sdk = """{"kind":"extension-status","sessionId":"same","statuses":[{"key":"agent","text":"SDK only"}]}"""
+        assertEquals("SDK only", store.acceptFrame(sdk).extensionStatuses.getValue("same").single().text)
+        assertTrue(store.acceptFrame("""{"kind":"host-mode","mode":"bridge","changed":true}""").extensionStatuses.isEmpty())
+        assertTrue(store.acceptFrame(sdk).extensionStatuses.isEmpty())
+        store.acceptFrame("""{"kind":"host-mode","mode":"sdk","changed":true}""")
+        assertEquals("SDK only", store.acceptFrame(sdk).extensionStatuses.getValue("same").single().text)
+    }
+
+    @Test fun nativeBoundaryWithoutUsageKeepsKnownValueAndAbortCanCorrectIt() {
+        val store = SharedMobileStore()
+        store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"context","busy":true,"isStreaming":false,"isCompacting":true,"contextUsage":{"tokens":500,"contextWindow":1000,"percent":50}}""")
+        val boundary = store.acceptFrame("""{"kind":"event","sessionId":"context","instanceId":"i","epoch":"e","isStreaming":false,"isCompacting":false,"event":{"type":"agent_settled"}}""").sessionStates.getValue("context")
+        assertEquals(500L, boundary.contextUsage?.tokens)
+        val aborted = store.acceptFrame("""{"kind":"aborted","sessionId":"context","isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":null,"contextWindow":1000,"percent":null}}""").sessionStates.getValue("context")
+        assertNull(aborted.contextUsage?.tokens)
+        assertEquals(1000L, aborted.contextUsage?.contextWindow)
+    }
+
+    @Test fun nativeCompactionSnapshotReportsUsageWithoutInventingStreaming() {
+        val store = SharedMobileStore()
+        val state = store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"context","busy":true,"pending":false,"isStreaming":false,"isCompacting":true,"contextUsage":{"tokens":500,"contextWindow":1000,"percent":50}}""").sessionStates.getValue("context")
+        assertEquals(true, state.isCompacting)
+        assertEquals(false, state.isStreaming)
+        assertEquals(500L, state.contextUsage?.tokens)
+        val after = store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"context","busy":false,"pending":false,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":null,"contextWindow":1000,"percent":null}}""").sessionStates.getValue("context")
+        assertNull(after.contextUsage?.tokens)
+        assertNull(after.contextUsage?.percent)
+        assertEquals(1000L, after.contextUsage?.contextWindow)
+        assertEquals(false, after.isCompacting)
+    }
+
+    @Test fun nativeBoundaryUpdatesContextAndOfflineClearsStaleUsage() {
+        val store = SharedMobileStore()
+        store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"context","busy":true,"isStreaming":false,"isCompacting":true,"contextUsage":{"tokens":500,"contextWindow":1000,"percent":50}}""")
+        val end = store.acceptFrame("""{"kind":"event","sessionId":"context","instanceId":"i","epoch":"e","seq":1,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":null,"contextWindow":1000,"percent":null},"event":{"type":"compaction_end","aborted":false}}""").sessionStates.getValue("context")
+        assertEquals(false, end.isCompacting)
+        assertEquals(false, end.isStreaming)
+        assertNull(end.contextUsage?.tokens)
+        assertEquals(1000L, end.contextUsage?.contextWindow)
+        assertNull(store.acceptFrame("""{"kind":"bridge-offline","sessionId":"context"}""").sessionStates.getValue("context").contextUsage)
+    }
+
+
+    @Test fun nativeModelCatalogNeverLeaksBetweenSessionsOrModes() {
+        val store = SharedMobileStore()
+        store.selectSession("s1")
+        store.acceptFrame("""{"kind":"models","sessionId":"s1","groups":[{"provider":"one","models":[]}]}""")
+        assertEquals("one", store.snapshot().modelCatalog?.groups?.single()?.provider)
+        assertNull(store.selectSession("s2").modelCatalog)
+        store.acceptFrame("""{"kind":"host-mode","mode":"bridge","changed":true}""")
+        assertNull(store.acceptFrame("""{"kind":"models","groups":[{"provider":"late-sdk","models":[]}]}""").modelCatalog)
+        assertNull(store.acceptFrame("""{"kind":"models","sessionId":"s1","groups":[{"provider":"stale","models":[]}]}""").modelCatalog)
+        store.acceptFrame("""{"kind":"models","sessionId":"s2","groups":[{"provider":"two","models":[]}]}""")
+        assertEquals("two", store.snapshot().modelCatalog?.groups?.single()?.provider)
+        assertNull(store.acceptFrame("""{"kind":"host-mode","mode":"sdk","changed":true}""").modelCatalog)
+        store.acceptFrame("""{"kind":"models","groups":[{"provider":"sdk","models":[]}]}""")
+        assertEquals("sdk", store.selectSession("s3").modelCatalog?.groups?.single()?.provider)
+    }
+
+    @Test
+    fun bridgePendingFlagKeepsQueueVisibleWithoutInventingText() {
+        val store = SharedMobileStore()
+        for (raw in listOf(
+            """{"kind":"bridge-snapshot","sessionId":"s-queue","busy":true,"pending":true}""",
+            """{"kind":"state","sessionId":"s-queue","isStreaming":true,"isCompacting":false,"pendingMessages":true,"queuedMessages":{"steering":[],"followUp":[]}}""",
+            """{"kind":"history","sessionId":"s-queue","messages":[],"isStreaming":true,"isCompacting":false,"pendingMessages":true,"queuedMessages":{"steering":[],"followUp":[]}}"""
+        )) {
+            val state = store.acceptFrame(raw).sessionStates.getValue("s-queue")
+            assertEquals(true, state.pendingMessages)
+            assertEquals(true, state.hasQueuedMessages)
+            assertEquals(true, state.queuedMessages?.isEmpty ?: true)
+            assertEquals(true, state.isStreaming)
+        }
+    }
+
+    @Test
+    fun bridgeQueueClearsOnRecallOfflineSettleAndSdkMode() {
+        for (terminal in listOf(
+            """{"kind":"dequeued","sessionId":"s-queue","queueRequestId":"q1","isStreaming":true,"queuedMessages":{"steering":[],"followUp":[]},"queued":["queued draft"]}""",
+            """{"kind":"aborted","sessionId":"s-queue","isStreaming":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["queued draft"]}""",
+            """{"kind":"bridge-offline","sessionId":"s-queue"}""",
+            """{"kind":"bridge-snapshot","sessionId":"s-queue","busy":false,"pending":false}""",
+            """{"kind":"event","sessionId":"s-queue","seq":1,"time":1,"event":{"type":"agent_settled"}}""",
+            """{"kind":"host-mode","mode":"sdk"}"""
+        )) {
+            val store = SharedMobileStore()
+            val busy = store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"s-queue","busy":true,"pending":true}""")
+            assertEquals(true, busy.sessionStates.getValue("s-queue").hasQueuedMessages)
+            val snapshot = if (terminal.contains("agent_settled")) {
+                // SharedMobileStore 接收的是 Runtime 已归一的事件，而非原始 Pi 帧。
+                store.acceptLiveEvents(listOf(SessionEvent("s-queue", 1, 1.0, GatewayEvent(type = "turn/end"))))
+            } else store.acceptFrame(terminal)
+            val state = snapshot.sessionStates.getValue("s-queue")
+            assertEquals(false, state.pendingMessages)
+            assertEquals(false, state.hasQueuedMessages)
+            if (terminal.contains("dequeued")) assertEquals(true, state.isStreaming)
+        }
+    }
+
+    @Test
+    fun submittedWithoutPendingSnapshotDoesNotEraseKnownNativeQueue() {
+        val store = SharedMobileStore()
+        store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"s-queue","busy":true,"pending":true}""")
+        val submitted = store.acceptFrame("""{"kind":"sent","sessionId":"s-queue","disposition":"submitted","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]}}""")
+        assertEquals(true, submitted.sessionStates.getValue("s-queue").hasQueuedMessages)
+        val consumed = store.acceptFrame("""{"kind":"state","sessionId":"s-queue","isStreaming":true,"isCompacting":false,"pendingMessages":false,"queuedMessages":{"steering":[],"followUp":[]}}""")
+        assertEquals(false, consumed.sessionStates.getValue("s-queue").hasQueuedMessages)
+        assertEquals(true, consumed.sessionStates.getValue("s-queue").isStreaming)
+    }
+
     @Test
     fun facadeRejectsFrameWithoutKindInsteadOfBeautifying() {
         // 缺 kind 即违背协议骨架：decodeFrameKind 返回 null（上游按 decode-error 处理），
@@ -461,5 +573,72 @@ class SharedMobileStoreTest {
 
         // reset 清空状态行（换网关/配对重置不残留上一个连接的状态）。
         assertTrue(store.reset().extensionStatuses.isEmpty())
+    }
+}
+
+class BridgeFramesTest {
+    @Test
+    fun bridgeSessionsCarryOnlineFlagAndBridgeOfflineClearsIt() {
+        val store = SharedMobileStore()
+        val listed = store.acceptFrame(
+            """{"kind":"sessions","mode":"bridge","items":[{"id":"s1","cwd":"/tmp","created":"2026-10-20T00:00:00.000Z","modified":"2026-10-20T00:00:00.000Z","messageCount":0,"firstMessage":"","running":true,"online":true,"source":"bridge","runtime":{"instanceId":"i1","epoch":"e1","pid":42}}]}"""
+        )
+        val session = listed.sessions.single()
+        assertEquals(true, session.isOnline)
+        assertEquals(true, session.isRunning)
+
+        val offline = store.acceptFrame("""{"kind":"bridge-offline","sessionId":"s1","reason":"process-exited"}""")
+        assertEquals(false, offline.sessions.single().isOnline)
+        assertEquals(false, offline.sessions.single().isRunning)
+        assertEquals(false, offline.sessionStates.getValue("s1").isStreaming)
+
+        // 切回 sdk 后旧标记必须清空，避免继续显示“离线”。
+        val sdk = store.acceptFrame("""{"kind":"host-mode","mode":"sdk","switchable":true}""")
+        assertEquals(null, sdk.sessions.single().isOnline)
+    }
+
+    @Test
+    fun sdkSessionsReplyClearsBridgeOnlineMarks() {
+        val store = SharedMobileStore()
+        store.acceptFrame(
+            """{"kind":"sessions","mode":"bridge","items":[{"id":"s1","cwd":"/tmp","created":"2026-10-20T00:00:00.000Z","modified":"2026-10-20T00:00:00.000Z","messageCount":0,"firstMessage":"","running":false,"online":true}]}"""
+        )
+        val sdk = store.acceptFrame(
+            """{"kind":"sessions","items":[{"id":"s1","cwd":"/tmp","created":"2026-10-20T00:00:00.000Z","modified":"2026-10-20T00:00:00.000Z","messageCount":0,"firstMessage":"","running":false}]}"""
+        )
+        assertEquals(null, sdk.sessions.single().isOnline)
+    }
+
+    @Test
+    fun bridgeOfflineClearsCompactionAndQueuedMessages() {
+        val store = SharedMobileStore()
+        store.acceptFrame(
+            """{"kind":"sessions","mode":"bridge","items":[{"id":"s1","cwd":"/tmp","created":"2026-10-20T00:00:00.000Z","modified":"2026-10-20T00:00:00.000Z","messageCount":0,"firstMessage":"","running":true,"online":true}]}"""
+        )
+        val busy = store.acceptFrame(
+            """{"kind":"state","sessionId":"s1","isStreaming":true,"isCompacting":true,"queuedMessages":{"steering":["steer"],"followUp":["later"]}}"""
+        )
+        assertEquals("later", busy.sessionStates.getValue("s1").queuedMessages?.followUp?.single())
+        val offline = store.acceptFrame("""{"kind":"bridge-offline","sessionId":"s1","reason":"process-exited"}""")
+        val state = offline.sessionStates.getValue("s1")
+        // 离线后压缩和服务器队列都已失效；未确认提交由界面恢复记录承载，不能留在队列里。
+        assertEquals(false, state.isCompacting)
+        assertEquals(true, state.queuedMessages?.isEmpty ?: true)
+        assertEquals(false, state.isStreaming)
+    }
+
+    @Test
+    fun bridgeSnapshotDrivesActivityWithoutSentAck() {
+        val store = SharedMobileStore()
+        store.acceptFrame(
+            """{"kind":"sessions","mode":"bridge","items":[{"id":"s1","cwd":"/tmp","created":"2026-10-20T00:00:00.000Z","modified":"2026-10-20T00:00:00.000Z","messageCount":0,"firstMessage":"","running":false,"online":true}]}"""
+        )
+        val busy = store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"s1","busy":true,"pending":true}""")
+        assertEquals(true, busy.sessionStates.getValue("s1").isStreaming)
+        assertEquals(true, busy.sessions.single().isRunning)
+        assertEquals(true, busy.sessions.single().isOnline)
+
+        val idle = store.acceptFrame("""{"kind":"bridge-snapshot","sessionId":"s1","busy":false,"pending":false}""")
+        assertEquals(false, idle.sessions.single().isRunning)
     }
 }

@@ -29,7 +29,30 @@ data class GatewayFrame(
     val event: JsonValue? = null,
     val code: String? = null,
     val message: String? = null,
+    /** unsubscribed 等帧的可选原因；不是错误正文，不直接展示。 */
+    val reason: String? = null,
     val mode: String? = null,
+    // host-mode / host-mode-put（PROTOCOL §4.30）：网关宿主连接模式。
+    val switchable: Boolean? = null,
+    val changed: Boolean? = null,
+    val reasons: List<String>? = null,
+    // bridge-snapshot / bridge-offline / 桥接会话项（PROTOCOL §4.31–§4.32）。
+    val online: Boolean? = null,
+    val source: String? = null,
+    val runtime: GatewayBridgeRuntime? = null,
+    val instanceId: String? = null,
+    val epoch: String? = null,
+    val pid: Int? = null,
+    val bridgeSeq: Int? = null,
+    val schema: Int? = null,
+    val extensionVersion: String? = null,
+    val busy: Boolean? = null,
+    val pending: Boolean? = null,
+    val pendingMessages: Boolean? = null,
+    val editor: String? = null,
+    val partial: JsonValue? = null,
+    val tools: List<JsonValue>? = null,
+    val queuedText: String? = null,
     val disposition: String? = null,
     val requestType: String? = null,
     val queueRequestId: String? = null,
@@ -236,6 +259,16 @@ data class GatewayPairingPayload(
 }
 
 /** pi `sessions` 应答项（pi SessionInfo 投影，modified 为 ISO-8601 字符串）。 */
+/** 桥接在线实例身份（PROTOCOL §4.32）；只用于展示与诊断，不参与请求关联。 */
+@Serializable
+data class GatewayBridgeRuntime(
+    val instanceId: String? = null,
+    val epoch: String? = null,
+    val pid: Int? = null
+) {
+    override fun toString(): String = "GatewayBridgeRuntime(instanceId=<redacted>, epoch=<redacted>, pid=$pid)"
+}
+
 @Serializable
 data class GatewaySessionSummary(
     val id: String,
@@ -246,7 +279,11 @@ data class GatewaySessionSummary(
     val modified: String? = null,
     val messageCount: Int? = null,
     val firstMessage: String? = null,
-    val running: Boolean = false
+    val running: Boolean = false,
+    /** 桥接模式下该会话是否有加载了扩展的原生 Pi 实例在线；SDK 模式缺省 null。 */
+    val online: Boolean? = null,
+    val source: String? = null,
+    val runtime: GatewayBridgeRuntime? = null
 ) {
     /** 会话标题：优先 pi 会话名，其次首条消息截断（空会话为 "(no messages)" 时视为 blank）。 */
     val displayTitle: String?
@@ -391,7 +428,7 @@ data class GatewayImageAttachment(
     val thinkingLevels: List<String> = emptyList()
 )
 
-/** 模型目录按 provider 分组（provider 与组内模型均按 id 排序）。 */
+/** 模型目录按 provider 分组；SDK 按 id 排序，桥接保留原生会话范围的次序。 */
 @Serializable data class GatewayModelGroup(val provider: String, val models: List<GatewayModelItem> = emptyList())
 
 /** `models` 应答：只含已配置认证的模型（pi `ModelRuntime.getAvailable()`）。 */
@@ -511,8 +548,11 @@ data class GatewayQueuedMessages(
     val model: GatewayModelRef? = null,
     val thinkingLevel: String? = null,
     val contextUsage: GatewayContextUsage? = null,
-    val queuedMessages: GatewayQueuedMessages? = null
-)
+    val queuedMessages: GatewayQueuedMessages? = null,
+    val pendingMessages: Boolean = false
+) {
+    val hasQueuedMessages: Boolean get() = pendingMessages || queuedMessages?.isEmpty == false
+}
 
 @Serializable data class GatewayDirectoryItem(val name: String, val path: String, val hidden: Boolean)
 

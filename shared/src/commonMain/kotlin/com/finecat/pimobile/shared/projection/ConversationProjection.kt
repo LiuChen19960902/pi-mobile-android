@@ -312,6 +312,13 @@ class ConversationProjector(
         streamIndexes.entries.forEach { entry -> if (entry.value > index) entry.setValue(entry.value - 1) }
     }
 
+    /** 丢弃指定流（bridge 快照重放时只替换快照段，不动其它 live 条目）。 */
+    fun discardStreams(keys: Collection<String>): List<ConversationProjectionOperation> {
+        val operations = mutableListOf<ConversationProjectionOperation>()
+        keys.forEach { removeStream(it, operations) }
+        return operations
+    }
+
     companion object {
         private val toolKinds = setOf(ConversationItemKind.TOOL, ConversationItemKind.JSON_TOOL)
 

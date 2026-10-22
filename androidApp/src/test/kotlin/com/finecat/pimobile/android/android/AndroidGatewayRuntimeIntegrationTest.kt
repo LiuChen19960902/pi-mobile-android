@@ -39,6 +39,247 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class AndroidGatewayRuntimeIntegrationTest {
     @Test
+    fun bridgeQueueSurvivesStateAndCanBeRecalledWithoutStoppingCurrentReply() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), ImmediateClock, backgroundScope)
+        val projection = AndroidGatewayProjection()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                if (event is GatewayRuntimeEvent.Frame) projection.acceptFrame(
+                    event.rawJson, event.frame, event.correlatedSessionId, event.normalizedEvents)
+            }
+        }
+        fun receive(raw: String) { transport.receive(raw); runCurrent() }
+        try {
+            runCurrent(); runtime.connectStoredIfPaired(); runCurrent(); transport.open()
+            receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["bridge","host-mode","state","dequeue","history","subscribe"]}""")
+            receive("""{"kind":"host-mode","mode":"bridge","switchable":true}""")
+            projection.selectSession("s-queue")
+            receive("""{"kind":"bridge-snapshot","sessionId":"s-queue","instanceId":"i1","epoch":"e1","bridgeSeq":10,"busy":true,"pending":true,"partial":{"role":"assistant","content":[{"type":"text","text":"BEGIN"}]},"tools":[]}""")
+            assertTrue(projection.snapshot().sessionStates.getValue("s-queue").hasQueuedMessages)
+            assertTrue(runtime.requestState("s-queue")); runCurrent()
+            receive("""{"kind":"state","sessionId":"s-queue","isStreaming":true,"isCompacting":false,"pendingMessages":true,"queuedMessages":{"steering":[],"followUp":[]}}""")
+            assertTrue(projection.snapshot().sessionStates.getValue("s-queue").hasQueuedMessages)
+            assertTrue(runtime.sendRequest(GatewayRequests.dequeue("s-queue", "q-recall"))); runCurrent()
+            receive("""{"kind":"dequeued","sessionId":"s-queue","queueRequestId":"q-recall","isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]},"queued":["queued draft"]}""")
+            val after = projection.snapshot().sessionStates.getValue("s-queue")
+            assertFalse(after.hasQueuedMessages)
+            assertTrue(after.isStreaming)
+            assertEquals(listOf("BEGIN"), projection.snapshot().conversation.map { it.text })
+            receive("""{"kind":"bridge-snapshot","sessionId":"s-queue","instanceId":"i1","epoch":"e1","bridgeSeq":11,"busy":true,"pending":true,"partial":null,"tools":[]}""")
+            receive("""{"kind":"event","sessionId":"s-queue","instanceId":"i1","epoch":"e1","bridgeSeq":12,"seq":1,"time":1,"event":{"type":"agent_settled"}}""")
+            assertFalse(projection.snapshot().sessionStates.getValue("s-queue").hasQueuedMessages)
+            assertFalse(projection.snapshot().sessionStates.getValue("s-queue").isStreaming)
+        } finally { projection.close(); runtime.disconnect() }
+    }
+
+    @Test
+    fun bridgeForegroundCatchUpRetiresCompletedSnapshotWithoutTerminalEvent() = runTest {
+        bridgeForegroundHistoryScenario("completed")
+    }
+
+    @Test
+    fun bridgeForegroundCatchUpRetiresCompletedPrefixDespiteInFlightProgress() = runTest {
+        bridgeForegroundHistoryScenario("completed-progress")
+    }
+
+    @Test
+    fun bridgeForegroundCatchUpKeepsActivePrefix() = runTest {
+        bridgeForegroundHistoryScenario("active")
+    }
+
+    @Test
+    fun idleHistoryCannotRetireANewerBridgeSnapshotOrGeneration() = runTest {
+        bridgeForegroundHistoryScenario("newer-snapshot")
+        bridgeForegroundHistoryScenario("new-generation")
+        bridgeForegroundHistoryScenario("unknown-compacting")
+    }
+
+    private suspend fun kotlinx.coroutines.test.TestScope.bridgeForegroundHistoryScenario(mode: String) {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), ImmediateClock, backgroundScope)
+        val projection = AndroidGatewayProjection(onHistoryPageRequested = { session, cursor, reset ->
+            backgroundScope.launch { runtime.requestHistory(session, cursor, resetLeaf = reset) }
+        })
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                if (event is GatewayRuntimeEvent.Frame) projection.acceptFrame(
+                    event.rawJson, event.frame, event.correlatedSessionId, event.normalizedEvents)
+            }
+        }
+        fun receive(raw: String) { transport.receive(raw); runCurrent() }
+        fun snapshot(seq: Int, epoch: String, text: String) {
+            receive("""{"kind":"bridge-snapshot","sessionId":"s-foreground","instanceId":"i1","epoch":"$epoch","bridgeSeq":$seq,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"$text"}]},"tools":[]}""")
+        }
+        val full = "BEGIN MIDDLE END"
+        try {
+            runCurrent(); runtime.connectStoredIfPaired(); runCurrent(); transport.open()
+            receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["bridge","host-mode","history","subscribe","state"]}""")
+            receive("""{"kind":"host-mode","mode":"bridge","switchable":true}""")
+            receive("""{"kind":"sessions","mode":"bridge","items":[]}""")
+            projection.selectSession("s-foreground"); runCurrent()
+            receive("""{"kind":"history","sessionId":"s-foreground","messages":[{"role":"user","content":"question"}],"entryIds":["u1"],"hasMore":false,"isStreaming":true,"isCompacting":false}""")
+            snapshot(20, "e1", "BEGIN")
+            assertEquals(listOf("question", "BEGIN"), projection.snapshot().conversation.map { it.text })
+
+            // App未收到结束事件，回前台走生产catch-up；history与新snapshot可竞序。
+            projection.catchUpSelectedHistoryAfterReconnect(); runCurrent()
+            if (mode == "completed-progress") {
+                // 同一轮继续输出后，补历史先于终态到达；不能把这次delta误当成新快照。
+                receive("""{"kind":"event","sessionId":"s-foreground","instanceId":"i1","epoch":"e1","bridgeSeq":21,"seq":1,"time":10,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" MIDDLE"}}}""")
+            }
+            if (mode == "newer-snapshot") snapshot(21, "e1", "new active prefix")
+            if (mode == "new-generation") snapshot(20, "e2", "new active prefix")
+            val active = mode == "active"
+            val finalMessage = if (active) "" else """,{"role":"assistant","content":[{"type":"text","text":"$full"}],"stopReason":"stop"}"""
+            val finalId = if (active) "" else ",\"a1\""
+            val compactingField = if (mode == "unknown-compacting") "" else ",\"isCompacting\":false"
+            receive("""{"kind":"history","sessionId":"s-foreground","messages":[{"role":"user","content":"question"}$finalMessage],"entryIds":["u1"$finalId],"latestEntryId":"${if (active) "u1" else "a1"}","hasMore":false,"isStreaming":$active$compactingField}""")
+            when (mode) {
+                "completed", "completed-progress" -> {
+                    assertEquals("idle history must not re-seed cached BEGIN after the full reply", listOf(full),
+                        projection.snapshot().conversation.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text })
+                    assertFalse(projection.snapshot().conversation.any { it.id.startsWith("stream-") })
+                    // 继续补尾部历史也不能让原始chunk重放复活；不只检查当前可见流。
+                    projection.loadHistory("s-foreground", older = false, preserveLive = true); runCurrent()
+                    receive("""{"kind":"history","sessionId":"s-foreground","messages":[{"role":"user","content":"question"},{"role":"assistant","content":[{"type":"text","text":"$full"}],"stopReason":"stop"}],"entryIds":["u1","a1"],"hasMore":false,"isStreaming":false,"isCompacting":false}""")
+                    assertEquals(listOf(full), projection.snapshot().conversation.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text })
+                    assertFalse(projection.snapshot().conversation.any { it.id.startsWith("stream-") })
+                }
+                "unknown-compacting" -> assertEquals(listOf(full, "BEGIN"),
+                    projection.snapshot().conversation.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text })
+                "active" -> {
+                    receive("""{"kind":"event","sessionId":"s-foreground","instanceId":"i1","epoch":"e1","bridgeSeq":21,"seq":1,"time":10,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" MIDDLE"}}}""")
+                    assertEquals(listOf("question", "BEGIN MIDDLE"), projection.snapshot().conversation.map { it.text })
+                }
+                else -> assertEquals("older idle history must not discard newer active output", listOf(full, "new active prefix"),
+                    projection.snapshot().conversation.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text })
+            }
+            assertEquals(null, projection.snapshot().lastError)
+        } finally { projection.close(); runtime.disconnect() }
+    }
+
+    @Test
+    fun bridgeResubscribeCompletionAndHistoryDoNotDuplicateRepliesOrReviveChunks() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), ImmediateClock, backgroundScope)
+        val projection = AndroidGatewayProjection()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                if (event is GatewayRuntimeEvent.Frame) projection.acceptFrame(
+                    event.rawJson, event.frame, event.correlatedSessionId, event.normalizedEvents)
+            }
+        }
+        fun receive(raw: String) { transport.receive(raw); runCurrent() }
+        val question = "phone-check-2"
+        val full = "BEGIN:$question\nMIDDLE:$question\nEND:$question"
+        val escaped = full.replace("\n", "\\n")
+        var nativeSeq = 10
+        var wireSeq = 0
+        var epoch = "e1"
+        fun native(event: String, entryId: String? = null) {
+            val id = entryId?.let { ",\"entryId\":\"$it\"" }.orEmpty()
+            receive("""{"kind":"event","sessionId":"s-resubscribe","instanceId":"i1","epoch":"$epoch","bridgeSeq":${++nativeSeq},"seq":${++wireSeq},"time":10.0$id,"event":$event}""")
+        }
+        fun snapshot(partial: String) {
+            receive("""{"kind":"bridge-snapshot","sessionId":"s-resubscribe","instanceId":"i1","epoch":"$epoch","bridgeSeq":$nativeSeq,"busy":true,"partial":$partial,"tools":[]}""")
+            wireSeq = 0 // 生产 router 每次重订阅都从1重发普通seq，bridgeSeq仍单调。
+        }
+        val historyMessages = mutableListOf<String>()
+        val historyIds = mutableListOf<String>()
+        try {
+            runCurrent(); runtime.connectStoredIfPaired(); runCurrent(); transport.open()
+            receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["bridge","host-mode","history","subscribe","state"]}""")
+            receive("""{"kind":"host-mode","mode":"bridge","switchable":true}""")
+            receive("""{"kind":"sessions","mode":"bridge","items":[]}""")
+            projection.selectSession("s-resubscribe")
+            assertTrue(runtime.requestHistory("s-resubscribe"))
+            receive("""{"kind":"history","sessionId":"s-resubscribe","messages":[],"entryIds":[],"hasMore":false}""")
+            snapshot("null")
+            for (index in 1..3) {
+                if (index == 3) {
+                    native("""{"type":"message_start","message":{"role":"assistant","content":[]}}""")
+                    native("""{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"dead-old-generation"}}""")
+                    epoch = "e2"; nativeSeq = 0; snapshot("null")
+                    assertFalse("新代际不能重放死实例尚未落盘的chunk",
+                        projection.snapshot().conversation.any { "dead-old-generation" in it.text })
+                }
+                native("""{"type":"agent_start"}""")
+                native("""{"type":"message_end","message":{"role":"user","content":"$question"}}""", "u$index")
+                native("""{"type":"message_start","message":{"role":"assistant","content":[]}}""")
+                native("""{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"BEGIN:$question\n"}}""")
+                native("""{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"MIDDLE:$question\n"}}""")
+                snapshot("""{"role":"assistant","content":[{"type":"text","text":"BEGIN:$question\nMIDDLE:$question\n"}]}""")
+                assertEquals("快照替换当前前缀且保留此前合法同文消息", index,
+                    projection.snapshot().conversation.count { it.kind == ConversationItemKind.ASSISTANT })
+                native("""{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"END:$question"}}""")
+                native("""{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"$escaped"}],"stopReason":"stop"}}""", "a$index")
+                native("""{"type":"agent_settled"}""")
+                historyMessages += """{"role":"user","content":"$question"}"""
+                historyMessages += """{"role":"assistant","content":[{"type":"text","text":"$escaped"}],"stopReason":"stop"}"""
+                historyIds += "\"u$index\""; historyIds += "\"a$index\""
+                projection.loadHistory("s-resubscribe", older = false, preserveLive = true)
+                assertTrue(runtime.requestHistory("s-resubscribe"))
+                receive("""{"kind":"history","sessionId":"s-resubscribe","messages":[${historyMessages.joinToString(",")}],"entryIds":[${historyIds.joinToString(",")}],"hasMore":false,"latestEntryId":"a$index"}""")
+                val items = projection.snapshot().conversation
+                assertEquals("只按条目身份收敛，每次合法同文回复均保留；无旧chunk残留", List(index) { full },
+                    items.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text })
+                assertEquals(List(index) { question }, items.filter { it.kind == ConversationItemKind.USER }.map { it.text })
+                assertFalse(items.any { it.id.startsWith("stream-") })
+            }
+        } finally { projection.close(); runtime.disconnect() }
+    }
+
+    @Test
+    fun lateOperationStatusCannotConsumeTheNextReceiptLane() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(transport, FakePreferences(), FakeCredentials(),
+            FakeAttachmentCache(), FakeNetworkMonitor(), ImmediateClock, backgroundScope)
+        val frames = mutableListOf<GatewayRuntimeEvent.Frame>()
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect { event ->
+                events += event
+                if (event is GatewayRuntimeEvent.Frame && event.frame.kind == "operation-status") frames += event
+            }
+        }
+        try {
+            runCurrent()
+            runtime.connectStoredIfPaired(); runCurrent()
+            transport.open()
+            transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["bridge","host-mode"]}""")
+            runCurrent()
+            // hello 后的 host-mode/sessions 预请求先结算，避免它们和收据一起超时。
+            transport.receive("""{"kind":"host-mode","mode":"bridge","switchable":true}""")
+            transport.receive("""{"kind":"sessions","items":[]}""")
+            runCurrent()
+
+            assertTrue(runtime.operationStatus("s", "receipt-a", "i1", "e1"))
+            advanceTimeBy(30_001); runCurrent()
+            assertTrue(
+                "B 未发出：connection=${runtime.state.value.connection} events=$events",
+                runtime.operationStatus("s", "receipt-b", "i1", "e1")
+            )
+            runCurrent()
+            // A 已超时；它的迟到帧不能把仍在等待的 B 当成自己的应答。
+            transport.receive("""{"kind":"operation-status","sessionId":"s","operationId":"receipt-a","status":"settled"}""")
+            runCurrent()
+            assertTrue("迟到 A 不得发布成 B 的结果：$frames", frames.isEmpty())
+
+            transport.receive("""{"kind":"operation-status","sessionId":"s","operationId":"receipt-b","status":"submitted"}""")
+            runCurrent()
+            assertEquals(listOf("receipt-b"), frames.map { it.frame.operationId })
+        } finally {
+            runtime.disconnect()
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun compactAcknowledgementLongStartupAndFinalStateUseProductionHooks() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         val transport = FakeTransport()
@@ -552,4 +793,371 @@ class AndroidGatewayRuntimeIntegrationTest {
         override fun nowEpochMilliseconds(): Long = 0
         override suspend fun delay(milliseconds: Long) = Unit
     }
+    @Test
+    fun bridgeSnapshotProjectsPartialAndToolsThenReplacesByGeneration() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(
+            transport = transport,
+            preferences = FakePreferences(),
+            credentials = FakeCredentials(),
+            attachmentCache = FakeAttachmentCache(),
+            networkMonitor = FakeNetworkMonitor(),
+            clock = ImmediateClock,
+            scope = backgroundScope
+        )
+        val projection = AndroidGatewayProjection()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect {
+                if (it is GatewayRuntimeEvent.Frame) {
+                    projection.acceptFrame(it.rawJson, it.frame, it.correlatedSessionId, it.normalizedEvents)
+                }
+            }
+        }
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","sessions","subscribe","message","abort","history","state"]}""")
+        runCurrent()
+        projection.selectSession("session-b")
+
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-b","instanceId":"i1","epoch":"e1","bridgeSeq":5,"busy":true,"partial":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"partial answer"}]},"tools":[{"toolCallId":"t1","toolName":"bash","args":{"command":"ls"}}]}"""
+        )
+        runCurrent()
+        var conversation = projection.snapshot().conversation
+        assertEquals(listOf("plan", "partial answer", "{\n  \"command\": \"ls\"\n}"), conversation.map { it.text })
+        assertEquals("bash", conversation.last().title)
+        assertEquals(ConversationItemKind.TOOL, conversation.last().kind)
+
+        // 工具事件只接管工具项，不能把快照里的 assistant partial 一起清掉。
+        transport.receive(
+            """{"kind":"event","sessionId":"session-b","instanceId":"i1","epoch":"e1","bridgeSeq":6,"seq":1,"event":{"type":"tool_execution_start","toolCallId":"t2","toolName":"read","args":{"path":"a"}}}"""
+        )
+        runCurrent()
+        assertEquals("partial answer", projection.snapshot().conversation.first { it.kind == ConversationItemKind.ASSISTANT }.text)
+
+        // 同一代际倒退的 bridgeSeq 是迟到帧，不能覆盖快照。
+        transport.receive(
+            """{"kind":"event","sessionId":"session-b","instanceId":"i1","epoch":"e1","bridgeSeq":4,"seq":1,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"stale","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(listOf("plan", "partial answer", "{\n  \"command\": \"ls\"\n}"), projection.snapshot().conversation.map { it.text })
+
+        // 代际变化先丢弃旧快照，再由新快照整体重建；不同实例/epoch 的 seq 不互相比对。
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-b","instanceId":"i1","epoch":"e2","bridgeSeq":1,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"new epoch"}]},"tools":[]}"""
+        )
+        runCurrent()
+        conversation = projection.snapshot().conversation
+        assertEquals(listOf("new epoch"), conversation.map { it.text })
+
+        // 历史是同一会话文件，代际切换应保留；新快照只替换实时段。
+        assertTrue(runtime.requestHistory("session-b"))
+        runCurrent()
+        transport.receive(
+            """{"kind":"history","sessionId":"session-b","messages":[{"role":"user","content":[{"type":"text","text":"loaded history"}]}],"entryIds":["h1"],"hasMore":false,"oldestEntryId":"h1","bytes":32}"""
+        )
+        runCurrent()
+        assertEquals(listOf("loaded history", "new epoch"), projection.snapshot().conversation.map { it.text })
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-b","instanceId":"i1","epoch":"e2","bridgeSeq":7,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"newer partial"}]},"tools":[]}"""
+        )
+        runCurrent()
+        assertEquals(listOf("loaded history", "newer partial"), projection.snapshot().conversation.map { it.text })
+
+        // 旧 epoch 的迟到事件不能把代际切回去，也不能污染新快照。
+        transport.receive(
+            """{"kind":"event","sessionId":"session-b","instanceId":"i1","epoch":"e1","bridgeSeq":100,"seq":2,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"old epoch late","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(listOf("loaded history", "newer partial"), projection.snapshot().conversation.map { it.text })
+
+        // 旧代的 bridge-offline 也不能把代际切回去；新代际后续事件必须继续投影。
+        transport.receive(
+            """{"kind":"bridge-offline","sessionId":"session-b","instanceId":"i1","epoch":"e1","reason":"process-exited"}"""
+        )
+        runCurrent()
+        transport.receive(
+            """{"kind":"event","sessionId":"session-b","instanceId":"i1","epoch":"e2","bridgeSeq":8,"seq":3,"time":4.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" late","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(
+            listOf("loaded history", "newer partial late"),
+            projection.snapshot().conversation.map { it.text }
+        )
+
+        // 同代际重连会再下发快照，但网关侧 normalizer 可能已见过 message_start、turn 已推进。
+        // 快照到达必须把两侧口径一起重置，否则前缀在 text-0-0、后续 delta 进 text-1-0。
+        transport.receive(
+            """{"kind":"event","sessionId":"session-b","instanceId":"i1","epoch":"e2","bridgeSeq":9,"seq":4,"time":5.0,"event":{"type":"message_start","message":{"role":"assistant","content":[]}}}"""
+        )
+        runCurrent()
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-b","instanceId":"i1","epoch":"e2","bridgeSeq":10,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"reset prefix"}]},"tools":[]}"""
+        )
+        runCurrent()
+        transport.receive(
+            """{"kind":"event","sessionId":"session-b","instanceId":"i1","epoch":"e2","bridgeSeq":11,"seq":5,"time":6.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" tail","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(
+            "reset prefix tail",
+            projection.snapshot().conversation.last { it.kind == ConversationItemKind.ASSISTANT }.text
+        )
+        projection.close()
+    }
+
+    @Test
+    fun staleSameGenerationSnapshotCannotRollBackPrefix() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(
+            transport = transport,
+            preferences = FakePreferences(),
+            credentials = FakeCredentials(),
+            attachmentCache = FakeAttachmentCache(),
+            networkMonitor = FakeNetworkMonitor(),
+            clock = ImmediateClock,
+            scope = backgroundScope
+        )
+        val projection = AndroidGatewayProjection()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect {
+                if (it is GatewayRuntimeEvent.Frame) {
+                    projection.acceptFrame(it.rawJson, it.frame, it.correlatedSessionId, it.normalizedEvents)
+                }
+            }
+        }
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","sessions","subscribe","message","abort","history","state"]}""")
+        runCurrent()
+        projection.selectSession("session-stale")
+
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-stale","instanceId":"i1","epoch":"e1","bridgeSeq":10,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"prefix"}]},"tools":[]}"""
+        )
+        runCurrent()
+        transport.receive(
+            """{"kind":"event","sessionId":"session-stale","instanceId":"i1","epoch":"e1","bridgeSeq":11,"seq":1,"time":1.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" suffix","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(
+            listOf("prefix suffix"),
+            projection.snapshot().conversation.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text }
+        )
+
+        // 同代际低水位快照是迟到重放，不能把更长的正文退回旧 prefix。
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-stale","instanceId":"i1","epoch":"e1","bridgeSeq":8,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"old prefix"}]},"tools":[]}"""
+        )
+        runCurrent()
+        val assistant = projection.snapshot().conversation.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text }
+        assertEquals(listOf("prefix suffix"), assistant)
+        assertFalse(assistant.any { it.contains("old prefix") })
+        projection.close()
+    }
+
+    @Test
+    fun equalGenerationSnapshotAfterOfflineRecoversPartialAndDelta() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(
+            transport = transport,
+            preferences = FakePreferences(),
+            credentials = FakeCredentials(),
+            attachmentCache = FakeAttachmentCache(),
+            networkMonitor = FakeNetworkMonitor(),
+            clock = ImmediateClock,
+            scope = backgroundScope
+        )
+        val projection = AndroidGatewayProjection()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect {
+                if (it is GatewayRuntimeEvent.Frame) {
+                    projection.acceptFrame(it.rawJson, it.frame, it.correlatedSessionId, it.normalizedEvents)
+                }
+            }
+        }
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","sessions","subscribe","message","abort","history","state"]}""")
+        runCurrent()
+        projection.selectSession("session-equal")
+        assertTrue(runtime.requestHistory("session-equal"))
+        runCurrent()
+        transport.receive(
+            """{"kind":"history","sessionId":"session-equal","messages":[{"role":"user","content":[{"type":"text","text":"question"}]}],"entryIds":["u1"],"hasMore":false,"latestEntryId":"u1"}"""
+        )
+        runCurrent()
+        assertEquals(listOf("question"), projection.snapshot().conversation.map { it.text })
+        val snapshot = """{"kind":"bridge-snapshot","sessionId":"session-equal","instanceId":"i1","epoch":"e1","bridgeSeq":10,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"prefix"}]},"tools":[]}"""
+        transport.receive(snapshot)
+        runCurrent()
+        transport.receive(
+            """{"kind":"bridge-offline","sessionId":"session-equal","instanceId":"i1","epoch":"e1","reason":"process-exited"}"""
+        )
+        runCurrent()
+        assertEquals(listOf("question"), projection.snapshot().conversation.map { it.text })
+
+        // 原生实例未换代且没有新事件时，恢复快照允许与已消费水位相等；重复仍幂等。
+        transport.receive(snapshot)
+        transport.receive(snapshot)
+        runCurrent()
+        assertEquals(listOf("question", "prefix"), projection.snapshot().conversation.map { it.text })
+        transport.receive(
+            """{"kind":"event","sessionId":"session-equal","instanceId":"i1","epoch":"e1","bridgeSeq":11,"seq":1,"time":2.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" suffix","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(
+            listOf("question", "prefix suffix"),
+            projection.snapshot().conversation.map { it.text }
+        )
+        projection.close()
+    }
+
+    @Test
+    fun explicitDisconnectReconnectAllowsEqualSnapshotAndDelta() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(
+            transport = transport,
+            preferences = FakePreferences(),
+            credentials = FakeCredentials(),
+            attachmentCache = FakeAttachmentCache(),
+            networkMonitor = FakeNetworkMonitor(),
+            clock = ImmediateClock,
+            scope = backgroundScope
+        )
+        val projection = AndroidGatewayProjection()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            runtime.events.collect {
+                if (it is GatewayRuntimeEvent.Frame) {
+                    projection.acceptFrame(it.rawJson, it.frame, it.correlatedSessionId, it.normalizedEvents)
+                }
+            }
+        }
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","sessions","subscribe","message","abort","history","state"]}""")
+        runCurrent()
+        projection.selectSession("session-reconnect")
+        assertTrue(runtime.requestHistory("session-reconnect"))
+        runCurrent()
+        transport.receive(
+            """{"kind":"history","sessionId":"session-reconnect","messages":[{"role":"user","content":[{"type":"text","text":"question"}]}],"entryIds":["u1"],"hasMore":false,"latestEntryId":"u1"}"""
+        )
+        runCurrent()
+        assertEquals(listOf("question"), projection.snapshot().conversation.map { it.text })
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-reconnect","instanceId":"i1","epoch":"e1","bridgeSeq":10,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"prefix"}]},"tools":[]}"""
+        )
+        runCurrent()
+        // 让 normalizer 的 turn 推进；显式断开只清 normalizer，不清投影旧位置。
+        transport.receive(
+            """{"kind":"event","sessionId":"session-reconnect","instanceId":"i1","epoch":"e1","bridgeSeq":11,"seq":1,"time":1.0,"event":{"type":"message_start","message":{"role":"assistant","content":[]}}}"""
+        )
+        transport.receive(
+            """{"kind":"event","sessionId":"session-reconnect","instanceId":"i1","epoch":"e1","bridgeSeq":12,"seq":2,"time":2.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" suffix","contentIndex":0}}}"""
+        )
+        runCurrent()
+
+        runtime.disconnect()
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","sessions","subscribe","message","abort","history","state"]}""")
+        runCurrent()
+
+        // 用户设置页断开后重连，源没有新事件，快照仍为 seq=12。
+        transport.receive(
+            """{"kind":"bridge-snapshot","sessionId":"session-reconnect","instanceId":"i1","epoch":"e1","bridgeSeq":12,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"prefix suffix"}]},"tools":[]}"""
+        )
+        runCurrent()
+        transport.receive(
+            """{"kind":"event","sessionId":"session-reconnect","instanceId":"i1","epoch":"e1","bridgeSeq":13,"seq":3,"time":3.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" more","contentIndex":0}}}"""
+        )
+        runCurrent()
+        assertEquals(
+            listOf("question", "prefix suffix more"),
+            projection.snapshot().conversation.map { it.text }
+        )
+        projection.close()
+    }
+
+    @Test
+    fun bridgeWriteBindsOperationAndEpochAndCanQueryStatus() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(
+            transport = transport,
+            preferences = FakePreferences(),
+            credentials = FakeCredentials(),
+            attachmentCache = FakeAttachmentCache(),
+            networkMonitor = FakeNetworkMonitor(),
+            clock = ImmediateClock,
+            scope = backgroundScope
+        )
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","sessions","subscribe","message","abort","history","state"]}""")
+        runCurrent()
+        assertTrue(
+            runtime.sendMessage(
+                text = "hello",
+                images = emptyList(),
+                sessionId = "s-1",
+                operationId = "op-1",
+                instanceId = "instance-1",
+                epoch = "epoch-1"
+            )
+        )
+        runCurrent()
+        val sent = transport.sentPayloads.last()
+        assertTrue(sent.contains("\"operationId\":\"op-1\""))
+        assertTrue(sent.contains("\"instanceId\":\"instance-1\""))
+        assertTrue(sent.contains("\"epoch\":\"epoch-1\""))
+        assertTrue(runtime.operationStatus("s-1", "op-1"))
+        runCurrent()
+        assertTrue(transport.sentPayloads.last().contains("\"type\":\"operation-status\""))
+        assertTrue(transport.sentPayloads.last().contains("\"operationId\":\"op-1\""))
+    }
+
+    @Test
+    fun bridgeStartSendsOperationAndReleasesLaneOnMatchingReply() = runTest {
+        val transport = FakeTransport()
+        val runtime = GatewayRuntime(
+            transport = transport,
+            preferences = FakePreferences(),
+            credentials = FakeCredentials(),
+            attachmentCache = FakeAttachmentCache(),
+            networkMonitor = FakeNetworkMonitor(),
+            clock = ImmediateClock,
+            scope = backgroundScope
+        )
+        runCurrent()
+        assertTrue(runtime.connectStoredIfPaired())
+        runCurrent()
+        transport.open()
+        transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["ping","bridge","bridge-start"]}""")
+        runCurrent()
+        assertTrue(runtime.startBridgeSession("s-offline", "start-1"))
+        runCurrent()
+        assertTrue(transport.sentPayloads.last().contains("\"type\":\"bridge-start\""))
+        assertTrue(transport.sentPayloads.last().contains("\"sessionId\":\"s-offline\""))
+        assertTrue(transport.sentPayloads.last().contains("\"operationId\":\"start-1\""))
+        transport.receive(
+            """{"kind":"bridge-started","operationId":"start-1","sessionId":"s-offline","instanceId":"i1","epoch":"e1","pid":1,"duplicate":false,"attachHint":"pi-mobile attach s-offline","requestType":"bridge-start"}"""
+        )
+        runCurrent()
+        // 匹配的回执必须释放 lane，否则用户重试会一直 REJECT_IF_BUSY。
+        assertTrue(runtime.startBridgeSession("s-offline", "start-2"))
+    }
+
 }
