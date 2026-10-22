@@ -265,6 +265,12 @@ fun FineCatSessionDrawer(
             val session = visible.firstOrNull { it.id == id }
             if (session != null) FcPopover(true, { menuId = null }, menuAnchor, focusable = false,
                 elevation = FineCatElevation.Card, modifier = Modifier.testTag("finecat.drawerMenu.$id")) {
+                if (session.isOnline == false && stateHolder.supportsRequest("bridge-start")) {
+                    MenuRow("启动后台 Pi", FineCatIcons.Plus, "finecat.drawerStart.$id") {
+                        menuId = null
+                        stateHolder.startBridgeSession(session.id)
+                    }
+                }
                 MenuRow("重命名", FineCatIcons.Edit, "finecat.drawerRename.$id") { menuId = null; onRename(session) }
                 MenuRow("复制sessionId", FineCatIcons.Copy, "finecat.drawerCopySessionId.$id") {
                     clipboard.setText(AnnotatedString(session.id))
@@ -337,6 +343,9 @@ private fun SessionRow(session: SessionSummary, isCurrent: Boolean, isHidden: Bo
     val ago = remember(session.lastActivityEpochSeconds, now, zone) { relativeTime(session.lastActivityEpochSeconds, now, zone) }
     val status = when {
         session.isRunning -> "进行中"
+        // 桥接模式：区分“已加载扩展的原生实例在线”和仅磁盘可读的会话。
+        session.isOnline == true -> "在线"
+        session.isOnline == false -> "离线"
         session.hasFailure -> "失败"
         session.hasUnread -> "待查看"
         else -> null

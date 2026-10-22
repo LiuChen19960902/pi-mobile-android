@@ -1,5 +1,9 @@
 # Pi Mobile
 
+> 探索未至之境<br>
+> 不诱于誉，不恐于诽，率道而行，端然正己<br>
+> 为善与众行之，为巧与众能之
+
 在手机上用你电脑里跑的 [pi](https://github.com/earendil-works/pi)：发消息、看流式回复与思考过程、看工具调用与 Pi 会话树、切模型与思考档位。
 
 https://github.com/user-attachments/assets/110ed9f9-a819-488e-ac77-33d44402a2b2
@@ -134,7 +138,7 @@ export ANDROID_HOME=/path/to/android-sdk      # 或写进 local.properties：sdk
 
 跨仓一致性测试会把 `pi-mobile-gateway` 当同级目录找（`../pi-mobile-gateway`），也可用 `PI_GATEWAY_DIR` 显式指定；找不到或本机无 node 时这些用例自动跳过。其余参数与 CI 口径见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-普通启动默认使用新版 FineCat；debug 构建另带试用入口和旧界面对照参数。正式签名与 Release 优化构建见 [发布说明](Docs/releasing.md)。
+普通启动默认使用新版 FineCat。日常开发与验收使用独立安装的 Preview 调试包，渠道、签名与正式发布规则见 [发布说明](Docs/releasing.md)。
 
 连上真机后，`./scripts/deploy.sh` 是一条命令的开发循环（构建 → 安装 → `adb reverse` → 启动）。
 
