@@ -1,5 +1,9 @@
 # Pi Mobile
 
+> 探索未至之境<br>
+> 不诱于誉，不恐于诽，率道而行，端然正己<br>
+> 为善与众行之，为巧与众能之
+
 在手机上用你电脑里跑的 [pi](https://github.com/earendil-works/pi)：发消息、看流式回复与思考过程、看工具调用与 Pi 会话树、切模型与思考档位。
 
 https://github.com/user-attachments/assets/110ed9f9-a819-488e-ac77-33d44402a2b2
