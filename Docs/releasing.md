@@ -1,6 +1,30 @@
-# 正式构建与升级
+# 构建渠道与正式升级
 
-正式版普通启动进入 FineCat，使用 R8 优化，不包含 debug 试用 Activity。版本号集中在 `androidApp/build.gradle.kts`；升级需递增 `versionCode`。
+正式版普通启动进入 FineCat，使用 R8 优化，不包含调试宿主。版本号集中在 `androidApp/build.gradle.kts`；升级需递增 `versionCode`。
+
+## Preview 调试渠道
+
+正式发版前的日常开发、联调和真机验收统一使用 **Pi Mobile Preview**。Gradle 的 `debug` 构建类型就是 Preview，保留调试能力；非正式安装包只有这个渠道。
+
+| 项目 | Preview | Release |
+| --- | --- | --- |
+| 应用名称 | Pi Mobile Preview | Pi Mobile |
+| 包名 | `com.finecat.pimobile.android.preview` | `com.finecat.pimobile.android` |
+| 版本名 | 基础版本追加 `-preview` | 基础版本 |
+| 签名 | Android 调试签名 | 发布者的长期签名 |
+| 本地数据与配对 | 独立保存 | 独立保存 |
+
+两者可以同时安装；首次使用 Preview 需要单独配对，不能用它覆盖正式版来继承数据。Preview 只提供一个桌面入口，默认进入 FineCat；`src/debug/` 保留仅供开发的测试宿主。两种构建都关闭开发仓版本控制元数据。
+
+```bash
+./gradlew :androidApp:assembleDebug
+```
+
+构建产物位于 `androidApp/build/outputs/apk/debug/`；对外分发为 `pi-mobile-v<基础版本>-preview.apk`，文件校验值随产物保留。Preview 保持同一调试签名时可覆盖升级，调试密钥变更后不能覆盖安装；不要通过卸载或清数据绕过签名检查。
+
+固定下载入口按渠道分开：`preview.apk` 指向 Preview，`latest.apk` 指向正式版。更新时只切换对应别名，保留已核验的版本文件，并完整下载核对 SHA-256。
+
+最终发布前仍需用最终签名、启用 R8 的 Release 完成下文的受影响路径验证，Preview 验收不替代该检查。
 
 ## 发布签名
 

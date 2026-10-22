@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: LiuChen19960902/pi-mobile-gateway
-          ref: 2b570dc5177d317d2050d9b6a5b5a6a812422d1f
+          ref: b4ffe5161c8a6d5972d398c2d3d795ab2e3d034d
           path: pi-mobile-gateway
           ssh-key: ${{ secrets.GATEWAY_CI_SSH_KEY }}
           persist-credentials: false
@@ -65,7 +65,7 @@ jobs:
         run: |
           uv run --no-project python scripts/check-docs.py
           uv run --no-project python -m unittest discover -s scripts -p 'test_*.py'
-      - name: Test and build
+      - name: Test and build Preview
         env:
           PI_GATEWAY_DIR: ${{ github.workspace }}/pi-mobile-gateway
         run: >-
