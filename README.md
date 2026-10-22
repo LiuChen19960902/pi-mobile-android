@@ -1,8 +1,10 @@
 # Pi Mobile
 
-> 探索未至之境<br>
-> 不诱于誉，不恐于诽，率道而行，端然正己<br>
-> 为善与众行之，为巧与众能之
+<p align="center">
+  <strong>探索未至之境</strong><br>
+  <sub>不诱于誉，不恐于诽，率道而行，端然正己</sub><br>
+  <sub>为善与众行之，为巧与众能之</sub>
+</p>
 
 在手机上用你电脑里跑的 [pi](https://github.com/earendil-works/pi)：发消息、看流式回复与思考过程、看工具调用与 Pi 会话树、切模型与思考档位。
 
@@ -53,7 +55,7 @@ pi coding agent（宿主电脑）
 | 电脑 | Ubuntu 26.04.1 / x86_64 / Node.js 24.21.0，已安装 `fd` | 曾在 gateway 0.3.0 的较早快照验证安装、配对、Provider 配置、真实聊天、工具与历史；最新 Tree 动作及手动压缩未在该主机复验 |
 | 电脑 | 纯 Windows（不装 WSL）、macOS、其他 Linux 环境 | 未验证，欢迎反馈 |
 
-版本配套要求：**Android 1.1.0 ↔ gateway 0.4.0（Pi SDK 1.3.0）**。协议在演进，客户端与网关要配套升级。
+版本配套要求：**Android 1.2.0 ↔ gateway 0.5.0（Pi SDK 1.3.0）**。协议在演进，客户端与网关要配套升级。
 
 ## 开始使用
 
@@ -69,7 +71,7 @@ pi coding agent（宿主电脑）
 
    网关默认按局域网 IPv4 推断手机可达地址；推断不到时会直接拒绝配对并提示补 `--public-url ws://<手机可达 IP>:3082/ws/mobile`（走 Tailscale 就填 tailnet 地址）。
 
-2. **手机装 App**：从 [Releases](https://github.com/LiuChen19960902/pi-mobile-android/releases) 下载签名 APK，或按下方「从源码构建」产出 debug APK。正式版与 debug 测试版签名不同，不能互相覆盖安装；正式版后续升级沿用同一发布密钥。
+2. **手机装 App**：从 [Releases](https://github.com/LiuChen19960902/pi-mobile-android/releases/latest) 下载长期签名的正式 APK。开发和验收使用的 Preview 可与正式版同时安装，两者分别配对；构建与签名见[发布说明](Docs/releasing.md)。
 
 3. **配对**：打开 App → 左上角会话列表按钮 → 抽屉顶部设置图标 → 设置页网关卡 → 「扫码配对」或「手动配对」。
 
