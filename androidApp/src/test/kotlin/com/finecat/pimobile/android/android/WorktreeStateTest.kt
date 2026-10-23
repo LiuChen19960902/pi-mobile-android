@@ -13,116 +13,12 @@ import org.junit.Test
 class WorktreeStateTest {
     /** 只替换宿主连接快照，操作与草稿仍走生产门面；无网络、设备或真实配置。 */
     @Suppress("UNCHECKED_CAST")
-    private fun connected(holder: AndroidSharedStateHolder, bridge: Boolean = false, worktrees: Boolean = true) {
+    private fun connected(holder: AndroidSharedStateHolder) {
         val field = AndroidSharedStateHolder::class.java.getDeclaredField("gatewayState\$delegate")
         field.isAccessible = true
         (field.get(holder) as MutableState<GatewayRuntimeState>).value = GatewayRuntimeState(
-            connection = GatewayConnectionState.CONNECTED,
-            capabilities = (if (bridge) setOf("bridge", "bridge-workspace-v1") else emptySet()) +
-                (if (worktrees) setOf("worktree-v1") else emptySet()),
-            hostMode = if (bridge) "bridge" else "sdk",
+            connection = GatewayConnectionState.CONNECTED, capabilities = setOf("worktree-v1"),
         )
-    }
-
-    private fun wire(holder: AndroidSharedStateHolder, payload: String) {
-        holder.wirePayload = payload
-        holder.submitWirePayload()
-    }
-
-    private fun query(holder: AndroidSharedStateHolder): String? {
-        val field = AndroidSharedStateHolder::class.java.getDeclaredField("activeWorktreeQuery")
-        field.isAccessible = true
-        return field.get(holder) as String?
-    }
-
-    private fun nativeSnapshot(holder: AndroidSharedStateHolder, session: String = "source", epoch: String = "epoch") {
-        wire(holder, """{"kind":"bridge-snapshot","sessionId":"$session","instanceId":"instance","epoch":"$epoch","bridgeSeq":1,"cwd":"/synthetic/source","busy":false,"online":true}""")
-    }
-
-    @Test fun nativeIdentityArrivalRetriesTheInitialDirectoryQueryAndRevealsTheGitLocation() {
-        val holder = AndroidSharedStateHolder()
-        try {
-            connected(holder, bridge = true)
-            holder.selectSession("source")
-            holder.messageDraft = "keep draft"
-            holder.refreshWorktreeLocation("/synthetic/source")
-            val earlyQuery = requireNotNull(query(holder))
-            nativeSnapshot(holder)
-            val readyQuery = requireNotNull(query(holder))
-            assertNotEquals("identity arrival must retry the early query", earlyQuery, readyQuery)
-            holder.receiveWorktreeFrame(GatewayFrame(kind = "worktree-list", queryId = readyQuery,
-                cwd = "/synthetic/source", repoRoot = "/synthetic/source", branch = "main"))
-            assertEquals("/synthetic/source", holder.worktreeLocation?.repoRoot)
-            assertEquals("keep draft", holder.messageDraft)
-            assertEquals("source", holder.snapshot.selectedSessionId)
-            assertFalse(holder.worktreeUi.open)
-            nativeSnapshot(holder)
-            assertEquals("same identity must not keep querying", readyQuery, query(holder))
-            nativeSnapshot(holder, session = "other")
-            assertEquals("another session must not replace the query", readyQuery, query(holder))
-            nativeSnapshot(holder, epoch = "next")
-            assertNotEquals(readyQuery, query(holder))
-        } finally { holder.close() }
-    }
-
-    @Test fun nativeReconnectAndOfflineAllowTheSameIdentityToRefreshAgain() {
-        val holder = AndroidSharedStateHolder()
-        try {
-            connected(holder, bridge = true)
-            holder.selectSession("source")
-            nativeSnapshot(holder)
-            val first = requireNotNull(query(holder))
-            wire(holder, """{"kind":"bridge-offline","sessionId":"source"}""")
-            nativeSnapshot(holder)
-            val afterOffline = requireNotNull(query(holder))
-            assertNotEquals(first, afterOffline)
-            wire(holder, """{"kind":"hello","capabilities":["worktree-v1","bridge","bridge-workspace-v1"]}""")
-            nativeSnapshot(holder)
-            assertNotEquals(afterOffline, query(holder))
-        } finally { holder.close() }
-    }
-
-    @Test fun nativeDirectoryRefreshIgnoresMissingIdentityAndSdkSnapshots() {
-        val holder = AndroidSharedStateHolder()
-        try {
-            connected(holder, bridge = true)
-            holder.selectSession("source")
-            wire(holder, """{"kind":"bridge-snapshot","sessionId":"source","instanceId":"","epoch":"epoch","bridgeSeq":1,"cwd":"/synthetic/source"}""")
-            assertNull(query(holder))
-            connected(holder)
-            nativeSnapshot(holder)
-            assertNull(query(holder))
-        } finally { holder.close() }
-    }
-
-    @Test fun nativeSnapshotDoesNotConsumeRefreshWhileCapabilitiesAreMissing() {
-        val holder = AndroidSharedStateHolder()
-        try {
-            connected(holder, bridge = true, worktrees = false)
-            holder.selectSession("source")
-            nativeSnapshot(holder)
-            assertNull(query(holder))
-            connected(holder, bridge = true)
-            nativeSnapshot(holder)
-            assertNotNull(query(holder))
-        } finally { holder.close() }
-    }
-
-    @Test fun hostModeChangeAndReselectionPermitDirectoryRefreshAgain() {
-        val holder = AndroidSharedStateHolder()
-        try {
-            connected(holder, bridge = true)
-            holder.selectSession("source")
-            nativeSnapshot(holder)
-            val first = requireNotNull(query(holder))
-            wire(holder, """{"kind":"host-mode","mode":"bridge","changed":true}""")
-            nativeSnapshot(holder)
-            val afterModeChange = requireNotNull(query(holder))
-            assertNotEquals(first, afterModeChange)
-            holder.selectSession("source")
-            nativeSnapshot(holder)
-            assertNotEquals(afterModeChange, query(holder))
-        } finally { holder.close() }
     }
 
     private fun begin(holder: AndroidSharedStateHolder): String {

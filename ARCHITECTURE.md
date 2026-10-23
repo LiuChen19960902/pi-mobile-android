@@ -29,7 +29,7 @@ Pi Mobile 是 Kotlin Multiplatform 项目：KMP `shared` 模块承载跨平台�
         pi-mobile-gateway（姊妹仓库） → pi
 ```
 
-正式入口使用 `FineCatApp`；旧 `PiProductApp` 保留为 Preview 调试对照。FineCat 会话只有对话与树视图，轨迹投影用于对话里的思考和工具步骤。
+正式入口使用 `FineCatApp`；旧 `PiProductApp` 保留为 debug 对照。FineCat 会话只有对话与树视图，轨迹投影用于对话里的思考和工具步骤。
 
 Pi 接入以网关实际锁定的 SDK 契约为边界；通用消息/工具语义、扩展 UI 与插件私有状态的区分见 [Pi 支持边界](Docs/pi-compatibility.md)。SDK 的 RPC 模式绑定不等于镜像终端或完整接入扩展 UI。
 

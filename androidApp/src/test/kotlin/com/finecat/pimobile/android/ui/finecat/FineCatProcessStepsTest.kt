@@ -5,8 +5,6 @@ import com.finecat.pimobile.android.ui.ConversationDisplayEntry
 import com.finecat.pimobile.android.ui.makeConversationDisplayEntries
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatSteps
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatWorkingGroupId
-import com.finecat.pimobile.android.ui.finecat.conversation.fineCatStepSummary
-import com.finecat.pimobile.android.ui.finecat.conversation.fineCatStepsSummaryPrefix
 import com.finecat.pimobile.shared.projection.ConversationItem
 import com.finecat.pimobile.shared.projection.ConversationItemKind
 import org.junit.Assert.*
@@ -31,25 +29,6 @@ class FineCatProcessStepsTest {
         assertTrue(step.completed)
         assertEquals("1.0s", step.durationText)
         assertEquals("bash", step.toolName)
-    }
-
-    @Test fun notificationIsACompletedInspectableStepWithFullText() {
-        val text = "完整通知\n".repeat(100)
-        val notice = item("n", ConversationItemKind.NOTICE, text).copy(title = "通知")
-        val steps = fineCatSteps(ConversationProcessGroup("g", listOf(
-            item("call", ConversationItemKind.TOOL, "pwd", toolId = "t"),
-            notice,
-            item("result", ConversationItemKind.TOOL_RESULT, "/tmp", toolId = "t"),
-        )))
-        assertEquals(listOf("call", "n"), steps.map { it.id })
-        assertTrue(steps.all { it.completed })
-        val step = steps.last()
-        assertTrue(step.isNotice)
-        assertNull(step.command)
-        assertEquals(text, step.detail)
-        assertEquals("通知", fineCatStepSummary(step).first)
-        assertTrue(fineCatStepSummary(step).second.length <= 120)
-        assertEquals("完成了 ", fineCatStepsSummaryPrefix(steps, false))
     }
 
     @Test fun lateResultUpdatesSameStepAndDistinguishesEmptyOutput() {

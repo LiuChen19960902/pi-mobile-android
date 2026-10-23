@@ -40,52 +40,6 @@ class ConversationDisplayGroupsTest {
     }
 
     @Test
-    fun noticesJoinStepsButErrorsAndMessagesRemainBoundaries() {
-        val entries = makeConversationDisplayEntries(listOf(
-            item("user", ConversationItemKind.USER),
-            item("call", ConversationItemKind.TOOL, toolCallId = "t"),
-            item("notice", ConversationItemKind.NOTICE, text = "background result"),
-            item("result", ConversationItemKind.TOOL_RESULT, toolCallId = "t"),
-            item("error", ConversationItemKind.SYSTEM).copy(isError = true),
-            item("second-notice", ConversationItemKind.NOTICE),
-            item("answer", ConversationItemKind.ASSISTANT),
-        ))
-        assertEquals(5, entries.size)
-        val group = (entries[1] as ConversationDisplayEntry.Process).group
-        assertEquals(listOf("notice"), group.notices.map { it.id })
-        assertEquals(listOf("call", "notice"), group.orderedSegments().map { it.id })
-        val tool = (group.orderedSegments().first() as ConversationProcessSegment.ToolRun).tools.single()
-        assertEquals("result", tool.result?.id)
-        assertTrue((entries[2] as ConversationDisplayEntry.Message).item.isError)
-    }
-
-    @Test
-    fun resultAcrossNoticePrefersExactIdOverAnEarlierUnknownCall() {
-        val group = ConversationProcessGroup("g", listOf(
-            item("unknown", ConversationItemKind.TOOL),
-            item("notice1", ConversationItemKind.NOTICE),
-            item("known", ConversationItemKind.TOOL, toolCallId = "known"),
-            item("notice2", ConversationItemKind.NOTICE),
-            item("result", ConversationItemKind.TOOL_RESULT, toolCallId = "known"),
-        ))
-        val tools = group.orderedSegments().filterIsInstance<ConversationProcessSegment.ToolRun>().flatMap { it.tools }
-        assertNull(tools.first().result)
-        assertEquals("result", tools.last().result?.id)
-    }
-
-    @Test
-    fun lateNotificationIsNotMovedAheadOfTheDispatchReply() {
-        val rounds = groupAssistantRounds(makeConversationDisplayEntries(listOf(
-            item("dispatch", ConversationItemKind.ASSISTANT, text = "已派发"),
-            item("notice", ConversationItemKind.NOTICE, text = "后台任务完成"),
-            item("answer", ConversationItemKind.ASSISTANT, text = "收到结果"),
-        )))
-        assertEquals(2, rounds.size)
-        assertEquals("dispatch", rounds.first().single().id)
-        assertEquals(listOf("process:dispatch:0", "answer"), rounds.last().map { it.id })
-    }
-
-    @Test
     fun consecutiveProcessEventsBecomeOneNestedGroup() {
         val entries = makeConversationDisplayEntries(
             listOf(

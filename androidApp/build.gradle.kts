@@ -11,18 +11,12 @@ android {
         applicationId = "com.finecat.pimobile.android"
         minSdk = 24
         targetSdk = 36
-        versionCode = 78
-        versionName = "1.2.0"
+        versionCode = 60
+        versionName = "1.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
-        debug {
-            // Preview 是唯一调试渠道；独立应用身份隔离正式版的配对和本地数据。
-            applicationIdSuffix = ".preview"
-            versionNameSuffix = "-preview"
-            vcsInfo.include = false
-        }
         release {
             // 发布包不携带本机开发仓的版本控制信息。
             vcsInfo.include = false

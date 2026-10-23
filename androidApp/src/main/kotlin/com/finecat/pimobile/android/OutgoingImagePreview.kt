@@ -68,8 +68,6 @@ internal class OutgoingImagePreviewTracker {
     private val items = mutableListOf<OutgoingImagePreview>()
     val previews: List<OutgoingImagePreview> get() = items.toList()
     private var tokenSequence = 0L
-    /** 进程/实例随机段：operationId 会跨进程进入网关去重表，不能只靠实例内序号。 */
-    private val trackerId = java.util.UUID.randomUUID().toString().replace("-", "").take(12)
 
     /** 在途实发队列（FIFO=实发顺序；runtime 单 message lane + sendInFlight
      *  保证同一时刻至多一个"等待 sent"请求，队头即当前请求身份）。 */
@@ -79,7 +77,7 @@ internal class OutgoingImagePreviewTracker {
     private val boundSessionsByToken = mutableMapOf<String, String>()
 
     /** 请求身份：所有实发（含纯文本/吸附派发，无预览）都分配并进等待队列。 */
-    fun newSendToken(): String = "send-$trackerId-${++tokenSequence}"
+    fun newSendToken(): String = "send-${++tokenSequence}"
 
     /** 建立一条发送中预览（Main 同步调用，先于附件缓存/网络）。仅带图且普通发送。 */
     fun begin(
@@ -150,12 +148,12 @@ internal class OutgoingImagePreviewTracker {
      * 的 FIFO 完成一致，帧内没有任何字段能区分两个新会话请求。
      * 帧 sessionId 缺失或空白时不消费队头；runtime 已拦截，此处保留同样守卫。
      *
-     * 已收到匹配提交回执时完成预览；SDK 归一图片和原生 Pi 事件均可能不保留
-     * attachmentId，不能要求同 ID 回显。旧网关未带 disposition 则保留原匹配等待。
-     * 返回本次发生变化的预览，供调用方刷新列表；submissionAcknowledged时返回已移除项。
+     * SDK已明确受理时完成预览；SDK1.0.4归一图片会移除attachmentId，不能再
+     * 要求同ID回显来证明发送。旧网关未带disposition则保留原匹配等待。
+     * 返回本次发生变化的预览，供调用方刷新列表；sdkAccepted时返回已移除项。
      * 无变化返回null，返回值不表示该项仍保留在列表中。
      */
-    fun consumeSent(frameSessionId: String?, nowMs: Long, submissionAcknowledged: Boolean = false): OutgoingImagePreview? {
+    fun consumeSent(frameSessionId: String?, nowMs: Long, sdkAccepted: Boolean = false): OutgoingImagePreview? {
         val head = awaiting.firstOrNull() ?: return null
         val frameSession = frameSessionId?.takeIf(String::isNotBlank) ?: return null
         if (head.sessionId != null && head.sessionId != frameSession) {
@@ -174,7 +172,7 @@ internal class OutgoingImagePreviewTracker {
         if (index < 0) return null
         val preview = items[index]
         // 结束本次本地等待；只按已匹配的token清理，不认领别的消息或图片。
-        if (submissionAcknowledged) return items.removeAt(index)
+        if (sdkAccepted) return items.removeAt(index)
         val confirmed = preview.copy(
             state = OutgoingImagePreviewState.CONFIRMED,
             sentAtMs = nowMs,

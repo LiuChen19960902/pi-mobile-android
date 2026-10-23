@@ -1,11 +1,5 @@
 # Pi Mobile
 
-<p align="center">
-  <strong>探索未至之境</strong><br>
-  <sub>不诱于誉，不恐于诽，率道而行，端然正己</sub><br>
-  <sub>为善与众行之，为巧与众能之</sub>
-</p>
-
 在手机上用你电脑里跑的 [pi](https://github.com/earendil-works/pi)：发消息、看流式回复与思考过程、看工具调用与 Pi 会话树、切模型与思考档位。
 
 https://github.com/user-attachments/assets/110ed9f9-a819-488e-ac77-33d44402a2b2
@@ -55,7 +49,7 @@ pi coding agent（宿主电脑）
 | 电脑 | Ubuntu 26.04.1 / x86_64 / Node.js 24.21.0，已安装 `fd` | 曾在 gateway 0.3.0 的较早快照验证安装、配对、Provider 配置、真实聊天、工具与历史；最新 Tree 动作及手动压缩未在该主机复验 |
 | 电脑 | 纯 Windows（不装 WSL）、macOS、其他 Linux 环境 | 未验证，欢迎反馈 |
 
-版本配套要求：**Android 1.2.0 ↔ gateway 0.5.0（Pi SDK 1.3.0）**。协议在演进，客户端与网关要配套升级。
+版本配套要求：**Android 1.1.0 ↔ gateway 0.4.0（Pi SDK 1.3.0）**。协议在演进，客户端与网关要配套升级。
 
 ## 开始使用
 
@@ -71,7 +65,7 @@ pi coding agent（宿主电脑）
 
    网关默认按局域网 IPv4 推断手机可达地址；推断不到时会直接拒绝配对并提示补 `--public-url ws://<手机可达 IP>:3082/ws/mobile`（走 Tailscale 就填 tailnet 地址）。
 
-2. **手机装 App**：从 [Releases](https://github.com/LiuChen19960902/pi-mobile-android/releases/latest) 下载长期签名的正式 APK。开发和验收使用的 Preview 可与正式版同时安装，两者分别配对；构建与签名见[发布说明](Docs/releasing.md)。
+2. **手机装 App**：从 [Releases](https://github.com/LiuChen19960902/pi-mobile-android/releases) 下载签名 APK，或按下方「从源码构建」产出 debug APK。正式版与 debug 测试版签名不同，不能互相覆盖安装；正式版后续升级沿用同一发布密钥。
 
 3. **配对**：打开 App → 左上角会话列表按钮 → 抽屉顶部设置图标 → 设置页网关卡 → 「扫码配对」或「手动配对」。
 
@@ -104,7 +98,6 @@ pi coding agent（宿主电脑）
 - 设置页的 `scope-model` 可逐个勾选模型，保存时写入 Pi 全局 `settings.json` 的 `enabledModels`，不切换当前会话模型。改动后点击面板外部也会保存，返回或取消不写；“恢复 Pi 默认范围”表示显示全部可用模型。
 - 输入 `/` 选择宿主发现的 Skill 或自定义 Prompt；输入 `@` 补全当前工作目录中的文件和目录，只插入引用，不立即发送。候选依赖网关对应能力；手动输入扩展命令由 SDK 处理，不保证其终端界面或私有后台状态能在手机显示，见 [Pi 支持边界](Docs/pi-compatibility.md)
 - 回复进行中可点停止；忙时再发的消息可选注入本轮或排队下轮；尚未执行的待发消息可取回输入框
-- 扩展通过 `ctx.ui.setStatus` 发布的提示文本显示在输入区上方（例如「1 agent running」），配盲文动效；不据此判断任务是否仍在运行或已结束
 - 点击输入区上下文圆环查看占用，并可手动压缩。压缩通过网关调用宿主 Pi SDK，遵循宿主已加载的压缩扩展钩子；重复触发受限
 
 ### 会话与设备
@@ -140,7 +133,7 @@ export ANDROID_HOME=/path/to/android-sdk      # 或写进 local.properties：sdk
 
 跨仓一致性测试会把 `pi-mobile-gateway` 当同级目录找（`../pi-mobile-gateway`），也可用 `PI_GATEWAY_DIR` 显式指定；找不到或本机无 node 时这些用例自动跳过。其余参数与 CI 口径见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-普通启动默认使用新版 FineCat。日常开发与验收使用独立安装的 Preview 调试包，渠道、签名与正式发布规则见 [发布说明](Docs/releasing.md)。
+普通启动默认使用新版 FineCat；debug 构建另带试用入口和旧界面对照参数。正式签名与 Release 优化构建见 [发布说明](Docs/releasing.md)。
 
 连上真机后，`./scripts/deploy.sh` 是一条命令的开发循环（构建 → 安装 → `adb reverse` → 启动）。
 
@@ -166,7 +159,7 @@ export ANDROID_HOME=/path/to/android-sdk      # 或写进 local.properties：sdk
 
 ## 已知限制
 
-- 没有审批 / 提问类交互：pi 扩展发起的审批/提问 UI 请求由网关的 no-op 兜底自动取消，移动端等价物未做；`setStatus` 状态行只显示文本，不提供交互
+- 没有审批 / 提问类交互：pi 扩展发起的 UI 请求目前由网关的 no-op 兜底自动取消，移动端等价物未做
 - CLI 与手机同时操作同一运行会话的协调体验尚未提供；当前网关的多连接订阅不等于完整的多端协同
 - macOS、纯 Windows 和其他 Linux 环境未验证；Android 最低版本、折叠屏及无障碍的完整专项覆盖尚未完成
 - 会话输入草稿和离线 Provider 草稿只在当前 App 进程内保留，不保证进程被系统终止后恢复；已发送会话以宿主落盘记录为准

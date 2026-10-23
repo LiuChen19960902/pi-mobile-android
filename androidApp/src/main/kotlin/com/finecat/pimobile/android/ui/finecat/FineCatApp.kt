@@ -107,7 +107,6 @@ import com.finecat.pimobile.android.ui.finecat.composer.*
 import com.finecat.pimobile.android.AndroidSharedStateHolder
 import com.finecat.pimobile.android.BuildConfig
 import com.finecat.pimobile.android.ui.ConversationDisplayEntry
-import com.finecat.pimobile.android.ui.ExtensionStatusBar
 import com.finecat.pimobile.android.ui.groupAssistantRounds
 import com.finecat.pimobile.android.ui.HeroCopyEditorDialog
 import com.finecat.pimobile.android.ui.SessionRenameDialog
@@ -306,10 +305,6 @@ private fun FineCatAppContent(
             stateHolder.setInputAssistContext(snapshot.selectedSessionId, assistContextCwd)
         }
         val assistToken = if (composerFocused) inputAssistToken(editorValue) else null
-        // 原生 /reload 的资源发现可晚于首份快照；打开候选时读取当前清单。
-        LaunchedEffect(assistToken?.isFile == false, assist.generation, connected) {
-            if (assistToken?.isFile == false && connected) stateHolder.refreshInputResources()
-        }
         val assistContextMatches = assist.context.sessionId == snapshot.selectedSessionId &&
             (!showHome || assist.context.cwd == assistContextCwd)
         val assistCommands = if (assistContextMatches && assistToken?.isFile == false) {
@@ -1121,12 +1116,6 @@ private fun FineCatAppContent(
                         }
                     }
                 }
-                // 扩展状态行只显示当前会话的提示，不改变忙闲或发送状态。
-                ExtensionStatusBar(
-                    stateHolder = stateHolder,
-                    sessionId = snapshot.selectedSessionId,
-                    color = colors.text3,
-                )
                 // P4b：忙时点发送 → 草稿吸附条（注入本轮 / 排队下轮 / 取回）
                 stateHolder.pendingDispatch?.let { pending ->
                     if (pending.sessionId == snapshot.selectedSessionId) {
@@ -1137,35 +1126,27 @@ private fun FineCatAppContent(
                         )
                     }
                 }
-                // 原生桥接只暴露 pending；无正文时显示存在提示，不猜条数或派发方式。
-                sessionState?.takeIf { it.hasQueuedMessages }?.let { queueState ->
-                    val queued = queueState.queuedMessages
+                // 服务端队列（与本地吸附条不同源，R4）：按旧口径 dim 行展示
+                sessionState?.queuedMessages?.takeIf { !it.isEmpty }?.let { queued ->
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 20.dp)
                             .testTag("finecat.queued"),
                     ) {
-                        if (queued?.isEmpty != false) Text(
-                            text = "有消息等待执行",
-                            style = LocalFineCatType.current.xs,
-                            color = colors.text3,
-                            modifier = Modifier.testTag("finecat.queued.pending"),
-                        )
-                        queued?.steering.orEmpty().forEach { Text(
+                        queued.steering.forEach { Text(
                             text = "Steering: $it",
                             style = LocalFineCatType.current.xs,
                             color = colors.text3,
                         ) }
-                        queued?.followUp.orEmpty().forEach { Text(
+                        queued.followUp.forEach { Text(
                             text = "Follow-up: $it",
                             style = LocalFineCatType.current.xs,
                             color = colors.text3,
                         ) }
                         if ("dequeue" in stateHolder.gatewayState.capabilities) {
                             FcTextButton(
-                                text = if (queueState.pendingMessages || queued?.let { it.steering.size + it.followUp.size > 1 } == true)
-                                    "全部撤回到输入框" else "撤回到输入框",
+                                text = if (queued.steering.size + queued.followUp.size > 1) "全部撤回到输入框" else "撤回到输入框",
                                 onClick = stateHolder::recallQueuedMessages,
                                 enabled = stateHolder.canRecallQueuedMessages,
                                 modifier = Modifier.align(Alignment.End).testTag("finecat.queued.recall"),
@@ -1449,9 +1430,11 @@ private fun FineCatAppContent(
                     },
                 )
             }
-            // 抽屉与设置整页都会遮住正文提示，反馈必须绘制在这些覆盖层之后。
-            // 独立 tag 区分前景提示，避免测试命中被遮住的正文节点。
-            if (drawerOpen || gatewaySheetOpen) {
+            // 浮层之上的全局瞬态提示（审查 F2）：抽屉是不透明面板，会把
+            // 前面那几个 GlobalTransientNotice（在抽屉之前声明）盖住——长按组标题隐藏
+            // 目录的反馈就在抽屉开着时触发。这里在抽屉之后**再**渲染一份，保证浮层
+            // 开着时提示仍可见；用独立 tag 避免同 tag 双节点制造假绿（审查 G3）。
+            if (drawerOpen) {
                 GlobalTransientNotice(
                     stateHolder = stateHolder,
                     modifier = Modifier

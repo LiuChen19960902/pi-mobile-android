@@ -18,9 +18,7 @@ Pi 在运行时可以接收 steer（注入本轮）和 followUp（排到下一�
 
 ### 服务端队列
 
-- SDK 已派发条目按 `queuedMessages.steering / followUp` 显示，不从本地草稿推测。轮内清除依赖 `queue_update`，见 [会话运行状态的补偿路径](../architecture/2026-09-16-session-state-compensation.md)。
-- 原生桥接的公开扩展接口只有 `hasPendingMessages()`，没有队列正文；`bridge-snapshot.pending` 与 `state/history.pendingMessages` 单独保存为是否待执行。无明细时显示“有消息等待执行”和整批撤回入口，不伪造 Follow-up 文本、条数或逐项身份。`submitted` 不带队列真值时保留此前 pending，由既有 sent 后 state 补拉确认；user 回显后再补一次 state，同轮已消费队列也能及时退场。`agent_settled`、明确空队列取回回执、离线和切回 SDK 清掉提示；不能只改 UI，撤回资格也必须认布尔真值。
-- 桥接撤回走原生 editor 的整批 dequeue，回执带文本后才并回输入框；不能为读取队列另建 SDK 句柄，也不能用取出再放回模拟只读查询。无文本快照不代表没有队列，提交成功也不保证某条输入已经执行。
+- 已派发条目按 `queuedMessages.steering / followUp` 显示，不从本地草稿推测。轮内清除依赖 `queue_update`，见 [会话运行状态的补偿路径](../architecture/2026-09-16-session-state-compensation.md)。
 - **停止并取回**：Pi SDK 1.0.4 的 `abort()` 只停止并等待 idle，`clearQueue()` 才清空 steering / followUp 并返回文本。TUI 的 Esc 先 `clearQueue`，把 steering → followUp 用双换行放到现有编辑内容前，再 abort。客户端显式请求 `restoreQueued: true` 时，网关在同会话的 admission 串行区内执行 clearQueue → abort，`aborted.queued` 是取回文本，`queuedMessages` 是清理后的状态。默认不清队列，兼容旧客户端；旧网关的裸 ACK 只补拉 state，不从旧快照伪造取回内容。第二次空闲 abort 不会再产生 settled，需要显式清队列和权威状态回执；被取消的队列不会逐条 settled，按匹配的 idle 回执收敛该会话的 turn 计数。
 - **不打断运行的取回**：独立的 `dequeue` 请求只 `clearQueue` 不 abort。`clearQueue` 同步 emit 而网关事件在微任务中 flush，所以在 admission 临界区内同步完成 clear → 快照 → 回执，否则后续 settled 可能先到。回执 `dequeued` 按会话加 `queueRequestId` 关联，载荷、队列快照和运行状态齐全才完成；新发送、派发与取回互斥。
 - SDK 只整批返回文本，不提供单条撤回或排队图片恢复，取回不包含附件。不能全清后按手机旧快照重新排队：会重走输入展开、丢图，并重复执行已消费项。

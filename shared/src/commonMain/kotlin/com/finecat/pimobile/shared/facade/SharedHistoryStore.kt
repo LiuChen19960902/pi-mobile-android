@@ -160,28 +160,6 @@ class SharedHistoryStore(
         )
     }
 
-    /** bridge 快照替换活动流时，同步移除可被后续 history 重建重放的旧 chunk。 */
-    fun discardStreamChunks(sessionId: String, keys: List<String>): SharedMviDispatchResult = dispatch("discard-streams", sessionId) {
-        require(sessionId.isNotBlank()) { "sessionId must not be blank" }
-        val old = eventsBySession[sessionId].orEmpty()
-        val remaining = old.filterNot { record ->
-            val event = record.event
-            val prefix = when (event.chunkType) {
-                "text-delta" -> "text"
-                "reasoning-delta" -> "reason"
-                else -> null
-            }
-            event.type == "assistant/chunk" && prefix != null &&
-                "$prefix-${event.turn ?: -1}-${event.step ?: -1}" in keys
-        }
-        Transition(
-            state = state,
-            eventsBySession = if (remaining == old) eventsBySession else eventsBySession + (sessionId to remaining),
-            eventPatch = if (remaining == old) null else SharedHistoryEventPatch(kind = "discard-streams", replacementEvents = remaining),
-            result = HistoryResult.None
-        )
-    }
-
     fun liveEventReceived(eventJson: String): SharedMviDispatchResult = dispatch("live", null) {
         val record = wireJson.decodeFromString<SessionEvent>(eventJson)
         require(record.sessionId.isNotBlank()) { "sessionId must not be blank" }

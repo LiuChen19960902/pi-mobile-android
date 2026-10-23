@@ -6,7 +6,7 @@ import com.finecat.pimobile.shared.protocol.SessionEvent
 import kotlinx.serialization.Serializable
 
 @Serializable
-enum class ConversationItemKind { USER, CONTEXT, ASSISTANT, REASONING, TOOL, JSON_TOOL, TOOL_RESULT, STATUS, SYSTEM, NOTICE }
+enum class ConversationItemKind { USER, CONTEXT, ASSISTANT, REASONING, TOOL, JSON_TOOL, TOOL_RESULT, STATUS, SYSTEM }
 
 @Serializable
 data class ConversationProjectionLabels(
@@ -222,9 +222,8 @@ class ConversationProjector(
                 epochSeconds = date,
                 toolCallId = event.callId, parentToolCallId = event.parentCallId
             ), operations)
-            (event.type == "notice/custom" || event.type == "notice/omitted") && !event.text.isNullOrBlank() -> insert(ConversationItem(
-                id = eventId(record),
-                kind = if (event.type == "notice/custom") ConversationItemKind.NOTICE else ConversationItemKind.SYSTEM,
+            event.type == "notice/custom" && !event.text.isNullOrBlank() -> insert(ConversationItem(
+                id = eventId(record), kind = ConversationItemKind.SYSTEM,
                 title = labels.customNotice, text = event.text, epochSeconds = date
             ), operations)
             event.type == "notice/upstream" -> insertUpstreamError(record, event.text, operations, date)
@@ -310,13 +309,6 @@ class ConversationProjector(
         val removed = mutableItems.removeAt(index)
         operations += ConversationProjectionOperation(kind = "remove", itemId = removed.id)
         streamIndexes.entries.forEach { entry -> if (entry.value > index) entry.setValue(entry.value - 1) }
-    }
-
-    /** 丢弃指定流（bridge 快照重放时只替换快照段，不动其它 live 条目）。 */
-    fun discardStreams(keys: Collection<String>): List<ConversationProjectionOperation> {
-        val operations = mutableListOf<ConversationProjectionOperation>()
-        keys.forEach { removeStream(it, operations) }
-        return operations
     }
 
     companion object {

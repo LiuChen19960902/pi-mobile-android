@@ -537,7 +537,7 @@ private fun saveShot(name: String) {
             name,
         )
         out.parentFile?.mkdirs()
-        val remote = out.absolutePath
+        val remote = "/sdcard/Android/data/com.finecat.pimobile.android/files/$name"
         val ok = runCatching {
             shell("screencap -p $remote")
             Thread.sleep(500)
