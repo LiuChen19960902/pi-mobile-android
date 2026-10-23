@@ -17,17 +17,6 @@ import org.junit.Test
  * 失败/未确认的带图发送会把整段载荷留在内存里。
  */
 class OutgoingImagePreviewTrackerTest {
-
-    @Test
-    fun sendTokensAreUniqueAcrossTrackersAndProcessIncarnations() {
-        // 请求身份会经 sent 帧进入 operationId；两个 tracker 各自从 send-1 起号时，
-        // 不同进程/实例的请求会撞成同一个 operationId，网关只按操作 ID 去重。
-        val first = OutgoingImagePreviewTracker().newSendToken()
-        val second = OutgoingImagePreviewTracker().newSendToken()
-        assertTrue("sendToken 必须跨 tracker 唯一：$first / $second", first != second)
-        assertTrue("sendToken 需要带随机段：$first", Regex("^send-[0-9a-f]{12,}-1$").matches(first))
-    }
-
     @Test
     fun handledConsumesOnlyItsOwnPreviewWithoutWaitingForUserEcho() {
         val tracker = OutgoingImagePreviewTracker()
@@ -35,7 +24,7 @@ class OutgoingImagePreviewTrackerTest {
             tracker.begin(token, "s-1", 0L, "draft", images(token), restoreImages(token))
         }
         tracker.trackAwaiting("handled", "s-1")
-        assertEquals("handled", tracker.consumeSent("s-1", 10L, submissionAcknowledged = true)?.sendToken)
+        assertEquals("handled", tracker.consumeSent("s-1", 10L, sdkAccepted = true)?.sendToken)
         assertNull(tracker.headAwaitingToken())
         assertEquals(listOf("other"), tracker.previews.map { it.sendToken })
         assertNull(tracker.settleLocalFailure("handled"))

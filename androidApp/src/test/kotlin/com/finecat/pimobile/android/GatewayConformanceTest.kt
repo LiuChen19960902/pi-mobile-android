@@ -68,56 +68,6 @@ import org.junit.Test
 class GatewayConformanceTest {
 
     @Test
-    fun nativeBranchResponseUsesTheAndroidQueueWireShape() {
-        val dir = gatewayDir()
-        assumeTrue("跨仓库路由夹具需要网关仓库和 Node", dir != null && File(dir, "scripts/bridge-contract-fixture.ts").isFile)
-        val process = ProcessBuilder("node", "scripts/bridge-contract-fixture.ts").directory(dir).start()
-        try {
-            assertTrue("路由夹具未正常退出", process.waitFor(15, java.util.concurrent.TimeUnit.SECONDS))
-            val text = process.inputStream.bufferedReader().readText().trim()
-            assertEquals("路由夹具失败：" + process.errorStream.bufferedReader().readText(), 0, process.exitValue())
-            val frame = com.finecat.pimobile.shared.protocol.GatewayWireDecoder.decode(text)
-            assertEquals("branch-switched", frame.kind)
-            assertEquals("contract-operation", frame.operationId)
-            assertEquals("contract-session", frame.sessionId)
-            assertEquals("contract-instance", frame.instanceId)
-            assertEquals("contract-epoch", frame.epoch)
-            assertEquals("user-node", frame.entryId)
-            assertEquals("node text", frame.editorText)
-            assertEquals(emptyList<String>(), frame.queued)
-            assertEquals(false, frame.isStreaming)
-            println("NATIVE_BRANCH_QUEUE_WIRE_PASS")
-        } finally { process.destroy() }
-    }
-
-    @Test
-    fun shortCodePairsThroughProductionTransportAndReconnectsWithStoredToken() = runBlocking {
-        val started = System.nanoTime()
-        val fixture = startFixtureProcess()
-        val runtime = buildRuntime()
-        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
-        try {
-            connectProjection(runtime, frames)
-            runtime.applicationDidBecomeActive()
-            val payload = com.finecat.pimobile.shared.gateway.GatewayPairingPayloadParser.parse(
-                fixture.info.pairingText, System.currentTimeMillis()
-            )
-            runtime.pairWithCode(payload.publicUrl, fixture.info.shortCode)
-            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
-            assertTrue(frames.any { it.frame.kind == "paired" })
-            runtime.disconnect()
-            runtime.connectStoredIfPaired()
-            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
-            assertNoErrorFrames(frames, runtime)
-            println("SHORT_PAIRING_WIRE_PASS elapsedMs=" + (System.nanoTime() - started) / 1_000_000)
-        } finally {
-            runtime.disconnect()
-            fixture.process.destroy()
-        }
-    }
-
-
-    @Test
     fun worktreeListsCreatesAndContinuesThroughProductionProtocol() = runBlocking {
         val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
         val fixture = startFixtureProcess()
@@ -243,105 +193,6 @@ class GatewayConformanceTest {
             assertEquals(false, sent.isStreaming)
             awaitState(runtime) { !it.shouldKeepAliveInBackground }
             assertTrue(frames.none { it.normalizedEvents.any { record -> record.event.type == "turn/end" } })
-            assertNoErrorFrames(frames, runtime)
-        } finally {
-            fixture.process.destroy()
-            fixture.process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
-        }
-    }
-
-    @Test
-    fun hostModeSwitchAndBridgeOfflineUseProductionWire() = runBlocking {
-        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
-        val rejections = CopyOnWriteArrayList<GatewayRuntimeEvent.RequestRejected>()
-        val fixture = startFixtureProcess()
-        try {
-            val runtime = buildRuntime()
-            // 只订一次 events：Frame 与 RequestRejected 分流到两个列表，
-            // 不启动 projection（本用例不涉及历史/UI 状态）。
-            scope.launch {
-                runtime.events.collect { event ->
-                    when (event) {
-                        is GatewayRuntimeEvent.Frame -> frames += event
-                        is GatewayRuntimeEvent.RequestRejected -> rejections += event
-                        else -> Unit
-                    }
-                }
-            }
-            runtime.applicationDidBecomeActive()
-            runtime.pair(fixture.info.pairingText)
-            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
-            assertTrue("新网关必须宣告桥接能力", "bridge" in runtime.state.value.capabilities)
-            assertTrue("新网关必须宣告模式切换", "host-mode" in runtime.state.value.capabilities)
-            // hello 后自动对账：首个 host-mode 应答是 sdk（fixture 默认）。
-            assertEquals("sdk", awaitFrame(frames) { it.frame.kind == "host-mode" }.frame.mode)
-
-            assertTrue(runtime.setHostMode("bridge"))
-            val switched = awaitFrame(frames) {
-                it.frame.kind == "host-mode" && it.frame.mode == "bridge"
-            }.frame
-            assertEquals(true, switched.changed)
-            awaitState(runtime) { it.hostMode == "bridge" }
-
-            // 没有加载桥接扩展的实例：磁盘会话仍列出，但写入按 bridge-offline 拒绝。
-            assertTrue(runtime.requestSessions())
-            val listed = awaitFrame(frames) {
-                it.frame.kind == "sessions" && it.frame.mode == "bridge"
-            }.frame
-            val items = listed.items.orEmpty().map { it.toJsonElement().jsonObject }
-            assertTrue(
-                "磁盘会话必须仍出现在桥接列表",
-                items.any { it["id"]?.jsonPrimitive?.content == fixture.info.fixtureSessionId }
-            )
-            assertEquals(false, items.any { it["online"]?.jsonPrimitive?.content == "true" })
-            assertTrue(runtime.sendMessage("hello", emptyList(), fixture.info.fixtureSessionId))
-            val rejected = withTimeout(10_000) {
-                var found: GatewayRuntimeEvent.RequestRejected? = null
-                while (found == null) {
-                    found = rejections.lastOrNull { it.requestType == "message" }
-                    if (found == null) delay(25)
-                }
-                found
-            }
-            assertEquals("bridge-offline", rejected.reason)
-
-            // 桥接没有运行实例，可以直接切回网关会话模式。
-            assertTrue(runtime.setHostMode("sdk"))
-            awaitState(runtime) { it.hostMode == "sdk" }
-            val unexpected = rejections.filter { it.requestType != "message" }
-            assertTrue("除预期的离线拒绝外不应有其它拒绝: ${unexpected.map { it.requestType + "/" + it.reason }}", unexpected.isEmpty())
-        } finally {
-            fixture.process.destroy()
-            fixture.process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
-        }
-    }
-
-    @Test
-    fun extensionStatusFramesBridgePiSetStatusAcrossRealGatewayAndClient() = runBlocking {
-        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
-        val fixture = startFixtureProcess()
-        try {
-            val runtime = buildRuntime()
-            connectProjection(runtime, frames)
-            runtime.applicationDidBecomeActive()
-            runtime.pair(fixture.info.pairingText)
-            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
-            assertTrue(
-                "hello.capabilities 必须宣告 extension-status：${runtime.state.value.capabilities}",
-                "extension-status" in runtime.state.value.capabilities
-            )
-
-            // fixture 会话在收到该文本时调用 ctx.ui.setStatus，80ms 后清除。
-            assertTrue(runtime.sendMessage("fixture:status", emptyList(), fixture.info.fixtureSessionId))
-            val live = awaitFrame(frames) {
-                it.frame.kind == "extension-status" &&
-                    it.frame.statuses.orEmpty().any { status -> status.text == "1 agent running" }
-            }
-            assertEquals(fixture.info.fixtureSessionId, live.frame.sessionId)
-            val cleared = awaitFrame(frames) {
-                it.frame.kind == "extension-status" && it.frame.statuses.orEmpty().isEmpty()
-            }
-            assertEquals(fixture.info.fixtureSessionId, cleared.frame.sessionId)
             assertNoErrorFrames(frames, runtime)
         } finally {
             fixture.process.destroy()
@@ -542,13 +393,12 @@ class GatewayConformanceTest {
 
     // -- fixture 进程管理 -------------------------------------------------------
 
-    private data class FixtureInfo(val pairingText: String, val shortCode: String, val fixtureSessionId: String, val fixtureCwd: String)
+    private data class FixtureInfo(val pairingText: String, val fixtureSessionId: String, val fixtureCwd: String)
 
     private fun parseFixture(line: String): FixtureInfo {
         val json = Json.parseToJsonElement(line.removePrefix("FIXTURE_READY ")).jsonObject
         return FixtureInfo(
             pairingText = json.getValue("pairingText").jsonPrimitive.content,
-            shortCode = json.getValue("shortCode").jsonPrimitive.content,
             fixtureSessionId = json.getValue("fixtureSessionId").jsonPrimitive.content,
             fixtureCwd = json.getValue("fixtureCwd").jsonPrimitive.content
         )

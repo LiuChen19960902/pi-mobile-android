@@ -12,7 +12,7 @@ import com.finecat.pimobile.android.ui.finecat.theme.FineCatTheme
 /**
  * P1 测试宿主（仅 debug 变体）：固定亮暗、fixture 数据与容器大小，可真实点击
  * 切换状态（03 · P1）。不接业务门面，数据全是 debug 假数据。
- * 通过 `adb shell am start -n com.finecat.pimobile.android.preview/com.finecat.pimobile.android.ui.finecat.FineCatGalleryActivity` 启动。
+ * 通过 `adb shell am start -n com.finecat.pimobile.android/.ui.finecat.FineCatGalleryActivity` 启动。
  */
 class FineCatGalleryActivity : ComponentActivity() {
 

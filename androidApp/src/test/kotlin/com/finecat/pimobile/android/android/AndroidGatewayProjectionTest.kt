@@ -11,7 +11,6 @@ import com.finecat.pimobile.shared.protocol.SessionEvent
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -20,27 +19,6 @@ import org.junit.Test
  * pi 条目游标分页（messages/entryIds/oldestEntryId）。
  */
 class AndroidGatewayProjectionTest {
-    @Test fun nativeCompactBoundaryUpdatesRingAndDrawerWithoutASecondRun() {
-        val projection = AndroidGatewayProjection()
-        try {
-            projection.selectSession("context")
-            val start = """{"kind":"bridge-snapshot","sessionId":"context","instanceId":"i","epoch":"e","bridgeSeq":1,"busy":true,"isStreaming":false,"isCompacting":true,"pending":false,"contextUsage":{"tokens":500,"contextWindow":1000,"percent":50}}"""
-            projection.acceptFrame(start, GatewayWireDecoder.decode(start), "context")
-            assertEquals(500L, projection.snapshot().sessionStates["context"]?.contextUsage?.tokens)
-            assertEquals(true, projection.snapshot().sessionStates["context"]?.isCompacting)
-            val end = """{"kind":"event","sessionId":"context","instanceId":"i","epoch":"e","bridgeSeq":2,"seq":1,"time":2,"isStreaming":false,"isCompacting":false,"contextUsage":{"tokens":null,"contextWindow":1000,"percent":null},"event":{"type":"compaction_end","aborted":false}}"""
-            val frame = GatewayWireDecoder.decode(end)
-            val events = PiEventNormalizer("context").normalize(1, 2.0, requireNotNull(frame.event))
-            projection.acceptFrame(end, frame, "context", events)
-            val state = projection.snapshot().sessionStates.getValue("context")
-            assertEquals(false, state.isCompacting)
-            assertEquals(false, state.isStreaming)
-            assertNull(state.contextUsage?.tokens)
-            assertEquals(1000L, state.contextUsage?.contextWindow)
-        } finally { projection.close() }
-    }
-
-
     @Test
     fun handledAckUsesActualStateWithoutInventingTurnEnd() {
         val projection = AndroidGatewayProjection()
@@ -54,121 +32,6 @@ class AndroidGatewayProjectionTest {
         assertEquals(false, projection.snapshot().sessionStates["s-handled"]?.isStreaming)
         assertTrue(projection.snapshot().conversation.isEmpty())
         projection.close()
-    }
-
-
-    @Test
-    fun bridgeSnapshotPartialIsSeededIntoTheSameStreamThatLaterDeltasAppendTo() {
-        val projection = AndroidGatewayProjection()
-        try {
-            projection.selectSession("s-seed")
-            val history = historyFrame(
-                "s-seed",
-                listOf("""{"role":"user","content":[{"type":"text","text":"synthetic question"}]}"""),
-                listOf("u1"),
-                false
-            )
-            projection.acceptFrame(history, GatewayWireDecoder.decode(history), "s-seed")
-            val snapshot = """{"kind":"bridge-snapshot","sessionId":"s-seed","instanceId":"i1","epoch":"e1","bridgeSeq":5,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"prefix"}]},"tools":[]}"""
-            projection.acceptFrame(snapshot, GatewayWireDecoder.decode(snapshot), "s-seed")
-            assertEquals(listOf("synthetic question", "prefix"), projection.snapshot().conversation.map { it.text })
-
-            val raw = """{"kind":"event","sessionId":"s-seed","instanceId":"i1","epoch":"e1","bridgeSeq":6,"seq":1,"time":1.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" suffix","contentIndex":0}}}"""
-            val frame = GatewayWireDecoder.decode(raw)
-            val events = PiEventNormalizer("s-seed").normalize(1, 1.0, requireNotNull(frame.event), null)
-            projection.acceptFrame(raw, frame, "s-seed", events)
-            assertEquals(
-                listOf("synthetic question", "prefix suffix"),
-                projection.snapshot().conversation.map { it.text }
-            )
-
-            // 历史页晚于 delta 到达会整体重建会话；快照前缀和已收 delta 都要补回，
-            // 否则历史一刷新就把正在生成的回答吞掉。
-            val reload = historyFrame(
-                "s-seed",
-                listOf("""{"role":"user","content":[{"type":"text","text":"synthetic question"}]}"""),
-                listOf("u1"),
-                false
-            )
-            projection.acceptFrame(reload, GatewayWireDecoder.decode(reload), "s-seed")
-            assertEquals(
-                listOf("synthetic question", "prefix suffix"),
-                projection.snapshot().conversation.map { it.text }
-            )
-        } finally {
-            projection.close()
-        }
-    }
-
-    @Test
-    fun bridgeOfflineDropsSeededSnapshotSoReconnectHistoryCannotResurrectIt() {
-        val projection = AndroidGatewayProjection()
-        try {
-            projection.selectSession("s-offline-seed")
-            val history = historyFrame(
-                "s-offline-seed",
-                listOf("""{"role":"user","content":[{"type":"text","text":"question"}]}"""),
-                listOf("u1"),
-                false
-            )
-            projection.acceptFrame(history, GatewayWireDecoder.decode(history), "s-offline-seed")
-            val snapshot = """{"kind":"bridge-snapshot","sessionId":"s-offline-seed","instanceId":"i1","epoch":"e1","bridgeSeq":5,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"dead partial"}]},"tools":[]}"""
-            projection.acceptFrame(snapshot, GatewayWireDecoder.decode(snapshot), "s-offline-seed")
-            assertEquals(listOf("question", "dead partial"), projection.snapshot().conversation.map { it.text })
-
-            val offline = """{"kind":"bridge-offline","sessionId":"s-offline-seed","instanceId":"i1","epoch":"e1","reason":"process-exited"}"""
-            projection.acceptFrame(offline, GatewayWireDecoder.decode(offline), "s-offline-seed")
-            assertEquals(listOf("question"), projection.snapshot().conversation.map { it.text })
-
-            // 重连补拉历史不能把死实例的 partial 再种回来。
-            projection.acceptFrame(history, GatewayWireDecoder.decode(history), "s-offline-seed")
-            assertEquals(listOf("question"), projection.snapshot().conversation.map { it.text })
-        } finally {
-            projection.close()
-        }
-    }
-
-    @Test
-    fun equalSnapshotAfterOfflineRestoresPartialOnceAndAppendsDelta() {
-        val projection = AndroidGatewayProjection()
-        try {
-            projection.selectSession("s-equal-seed")
-            val history = historyFrame(
-                "s-equal-seed",
-                listOf("""{"role":"user","content":[{"type":"text","text":"question"}]}"""),
-                listOf("u1"),
-                false
-            )
-            projection.acceptFrame(history, GatewayWireDecoder.decode(history), "s-equal-seed")
-            val snapshot = """{"kind":"bridge-snapshot","sessionId":"s-equal-seed","instanceId":"i1","epoch":"e1","bridgeSeq":10,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"prefix"}]},"tools":[]}"""
-            projection.acceptFrame(snapshot, GatewayWireDecoder.decode(snapshot), "s-equal-seed")
-            val offline = """{"kind":"bridge-offline","sessionId":"s-equal-seed","instanceId":"i1","epoch":"e1","reason":"process-exited"}"""
-            projection.acceptFrame(offline, GatewayWireDecoder.decode(offline), "s-equal-seed")
-            assertEquals(listOf("question"), projection.snapshot().conversation.map { it.text })
-
-            // 同一实例暂时不可达，恢复快照可与已消费水位相等；重复同一快照仍幂等。
-            projection.acceptFrame(snapshot, GatewayWireDecoder.decode(snapshot), "s-equal-seed")
-            projection.acceptFrame(snapshot, GatewayWireDecoder.decode(snapshot), "s-equal-seed")
-            assertEquals(listOf("question", "prefix"), projection.snapshot().conversation.map { it.text })
-            val raw = """{"kind":"event","sessionId":"s-equal-seed","instanceId":"i1","epoch":"e1","bridgeSeq":11,"seq":1,"time":1.0,"event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" suffix","contentIndex":0}}}"""
-            val frame = GatewayWireDecoder.decode(raw)
-            val events = PiEventNormalizer("s-equal-seed").normalize(1, 1.0, requireNotNull(frame.event), null)
-            projection.acceptFrame(raw, frame, "s-equal-seed", events)
-            assertEquals(
-                listOf("question", "prefix suffix"),
-                projection.snapshot().conversation.map { it.text }
-            )
-
-            // 严格更低水位仍是迟到重放。
-            val stale = """{"kind":"bridge-snapshot","sessionId":"s-equal-seed","instanceId":"i1","epoch":"e1","bridgeSeq":9,"busy":true,"partial":{"role":"assistant","content":[{"type":"text","text":"stale prefix"}]},"tools":[]}"""
-            projection.acceptFrame(stale, GatewayWireDecoder.decode(stale), "s-equal-seed")
-            assertEquals(
-                listOf("question", "prefix suffix"),
-                projection.snapshot().conversation.map { it.text }
-            )
-        } finally {
-            projection.close()
-        }
     }
 
     @Test
@@ -197,9 +60,7 @@ class AndroidGatewayProjectionTest {
         assertEquals(3, items.size)
         assertEquals(2, items.count { it.text == "same" })
         assertTrue(items.filter { it.text == "same" }.all { it.id in ids && it.title == "通知" && !it.isError })
-        assertTrue(items.filter { it.text == "same" }.all { it.kind == ConversationItemKind.NOTICE })
         assertTrue(items.any { it.text == "消息过大，已省略" })
-        assertEquals(ConversationItemKind.SYSTEM, items.single { it.text == "消息过大，已省略" }.kind)
         projection.close()
     }
 
@@ -1598,33 +1459,6 @@ class AndroidGatewayProjectionTest {
         )
         assertEquals("history-adapter-failed", replaceRegression.snapshot().lastError)
         replaceRegression.close()
-    }
-
-    @Test
-    fun extensionStatusPushReachesSnapshotWithoutInventingErrorsOrActivity() {
-        val projection = AndroidGatewayProjection()
-        projection.selectSession("session-status")
-        val state = """{"kind":"state","sessionId":"session-status","isStreaming":true,"isCompacting":false}"""
-        projection.acceptFrame(state, GatewayWireDecoder.decode(state), "session-status")
-
-        // 真实链：wire 文本 + 解码后的帧 + 关联会话一起交给投影。
-        val raw =
-            """{"kind":"extension-status","sessionId":"session-status","statuses":[{"key":"subagents","text":"1 agent running"}]}"""
-        projection.acceptFrame(raw, GatewayWireDecoder.decode(raw), "session-status")
-        val snapshot = projection.snapshot()
-        assertEquals(
-            "1 agent running",
-            snapshot.extensionStatuses.getValue("session-status").single().text
-        )
-        assertNull(snapshot.lastError)
-        // 状态只是显示提示：不改会话忙闲，也不当作任何请求的错误/应答。
-        assertEquals(true, snapshot.sessionStates.getValue("session-status").isStreaming)
-
-        // 空数组清除。
-        val cleared = """{"kind":"extension-status","sessionId":"session-status","statuses":[]}"""
-        projection.acceptFrame(cleared, GatewayWireDecoder.decode(cleared), "session-status")
-        assertTrue(projection.snapshot().extensionStatuses.isEmpty())
-        projection.close()
     }
 
     @Test

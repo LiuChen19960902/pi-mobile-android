@@ -17,9 +17,7 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 
 ADB="$ANDROID_HOME/platform-tools/adb"
 GATEWAY_PORT="${GATEWAY_PORT:-3080}"  # 与 App 默认 endpoint 一致
-# 应用身份带 Preview 后缀，Activity 类名仍使用源码 namespace。
-PACKAGE="com.finecat.pimobile.android.preview"
-ACTIVITY="com.finecat.pimobile.android.MainActivity"
+PACKAGE="com.finecat.pimobile.android"
 
 cd "$(dirname "$0")/.."
 
@@ -37,7 +35,7 @@ echo "目标设备：$DEVICE"
 ./gradlew :androidApp:installDebug
 "$ADB" -s "$DEVICE" reverse "tcp:$GATEWAY_PORT" "tcp:$GATEWAY_PORT" > /dev/null
 "$ADB" -s "$DEVICE" logcat -c
-"$ADB" -s "$DEVICE" shell am start -n "$PACKAGE/$ACTIVITY" > /dev/null
+"$ADB" -s "$DEVICE" shell am start -n "$PACKAGE/.MainActivity" > /dev/null
 
-echo "Pi Mobile Preview 已安装并启动。"
+echo "已安装并启动。"
 echo "网关日志：adb -s $DEVICE logcat -s PiGateway:D '*:S'"

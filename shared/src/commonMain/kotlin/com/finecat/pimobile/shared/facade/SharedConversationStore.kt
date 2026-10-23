@@ -25,9 +25,7 @@ data class SharedConversationPatch(
     val operations: List<ConversationProjectionOperation> = emptyList(),
     val replacesAll: Boolean = false,
     val replacementItems: List<ConversationItem>? = null,
-    val lastSequence: Int = -1,
-    /** 快照前缀接流：只追加当前流，不推进水位，后续真实事件仍按原 seq 进入。 */
-    val seedsStream: Boolean = false
+    val lastSequence: Int = -1
 )
 
 /** KMP 持有逐 session projector；平台只 dispatch 原始事件并订阅增量 UI patch。 */
@@ -73,63 +71,7 @@ class SharedConversationStore(
         patch
     }
 
-    /**
-     * 把 bridge 快照里的“当前流式中段”接进已有投影，不推进 live 水位。
-     *
-     * 快照没有 pi 的 message_start，后续真实 delta 会从同一 turn/step 继续；
-     * 若把前缀只放在临时 overlay，delta 就会另起一个流。这里把前缀按当前
-     * lastSequence 折进投影，下一帧真实事件（seq 更大）仍能追加到同一 key。
-     * 只接受 assistant/chunk：其他事件有正式历史/实时入口，不能借这里绕过水位。
-     */
-    fun seedStream(sessionId: String, eventsJson: String): SharedMviDispatchResult = dispatch("seed") {
-        require(sessionId.isNotBlank()) { "sessionId must not be blank" }
-        val records = wireJson.decodeFromString<List<SessionEvent>>(eventsJson)
-        require(records.all { it.sessionId == sessionId }) { "seeded stream contains another session" }
-        require(records.all { it.event.type == "assistant/chunk" }) { "seeded stream accepts assistant chunks only" }
-        val projector = projectors.getOrPut(sessionId) { ConversationProjector(labels) }
-        val sequence = projector.lastSequence
-        val snapshot = projector.snapshot()
-        val operations = projector.foldWithOperations(records.map { it.copy(seq = sequence) })
-        if (operations.isEmpty()) return@dispatch null
-        val patch = SharedConversationPatch(
-            sessionId = sessionId,
-            operations = operations,
-            lastSequence = projector.lastSequence,
-            seedsStream = true
-        )
-        try {
-            wireJson.encodeToString(patch)
-        } catch (error: Throwable) {
-            projector.restore(snapshot)
-            throw error
-        }
-        patch
-    }
-
-    /** 只丢弃指定流式 key；用于 bridge 重放快照前缀，不清其它 live 条目。 */
-    fun clearStreams(sessionId: String, keys: List<String>): SharedMviDispatchResult = dispatch("clear-streams") {
-        require(sessionId.isNotBlank()) { "sessionId must not be blank" }
-        if (keys.isEmpty()) return@dispatch null
-        val projector = projectors[sessionId] ?: return@dispatch null
-        val snapshot = projector.snapshot()
-        val operations = projector.discardStreams(keys)
-        if (operations.isEmpty()) return@dispatch null
-        val patch = SharedConversationPatch(
-            sessionId = sessionId,
-            operations = operations,
-            lastSequence = projector.lastSequence,
-            seedsStream = true
-        )
-        try {
-            wireJson.encodeToString(patch)
-        } catch (error: Throwable) {
-            projector.restore(snapshot)
-            throw error
-        }
-        patch
-    }
-
-    fun replaceSession(sessionId: String, eventsJson: String, minimumSequence: Int? = null): SharedMviDispatchResult =
+    fun replaceSession(sessionId: String, eventsJson: String): SharedMviDispatchResult =
         dispatch("replace") {
             require(sessionId.isNotBlank()) { "sessionId must not be blank" }
             val records = wireJson.decodeFromString<List<SessionEvent>>(eventsJson)
@@ -140,13 +82,7 @@ class SharedConversationStore(
             val normalized = records.associateBy { record ->
                 sessionEventIdentity(record) ?: "seq:${record.seq}"
             }.values.sortedBy(SessionEvent::seq)
-            val projector = ConversationProjector(labels).apply {
-                rebuild(normalized)
-                // bridge 可删掉旧chunk，但已消费水位不能随剩余历史尾号回退。
-                if (minimumSequence != null && minimumSequence > lastSequence) {
-                    restore(snapshot().copy(lastSequence = minimumSequence))
-                }
-            }
+            val projector = ConversationProjector(labels).apply { rebuild(normalized) }
             projectors[sessionId] = projector
             SharedConversationPatch(
                 sessionId = sessionId,

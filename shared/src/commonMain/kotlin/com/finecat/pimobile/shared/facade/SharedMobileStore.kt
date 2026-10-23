@@ -14,7 +14,6 @@ import com.finecat.pimobile.shared.protocol.GatewayQueuedMessages
 import com.finecat.pimobile.shared.protocol.GatewaySessionState
 import com.finecat.pimobile.shared.protocol.GatewayEvent
 import com.finecat.pimobile.shared.protocol.GatewaySessionSummary
-import com.finecat.pimobile.shared.protocol.GatewayStatusEntry
 import com.finecat.pimobile.shared.protocol.GatewayWireDecoder
 import com.finecat.pimobile.shared.protocol.JsonValue
 import com.finecat.pimobile.shared.protocol.SessionEvent
@@ -29,8 +28,6 @@ data class SharedMobileSnapshot(
     val modelCatalog: GatewayModelCatalog? = null,
     /** 每会话的 pi 会话级状态（model/thinkingLevel/contextUsage…），由 state/model-set 帧更新。 */
     val sessionStates: Map<String, GatewaySessionState> = emptyMap(),
-    /** 每会话的扩展状态行（Pi `ctx.ui.setStatus` 快照），只用于显示，不代表任务状态。 */
-    val extensionStatuses: Map<String, List<GatewayStatusEntry>> = emptyMap(),
     val selectedHistoryHasMore: Boolean = false,
     val selectedHistoryEarliestSequence: Int? = null,
     val selectedHistoryIsLoading: Boolean = false,
@@ -60,20 +57,13 @@ class SharedMobileStore(
     private var sessionListState = SessionListState()
     private val eventsBySession = mutableMapOf<String, List<SessionEvent>>()
     private var modelCatalog: GatewayModelCatalog? = null
-    private var modelCatalogSessionId: String? = null
-    private var bridgeMode = false
     private val sessionStates = mutableMapOf<String, GatewaySessionState>()
-    private val extensionStatuses = mutableMapOf<String, List<GatewayStatusEntry>>()
     private var lastFrameKind: String? = null
     private var lastError: String? = null
 
     fun snapshot(): SharedMobileSnapshot = makeSnapshot()
 
     fun selectSession(sessionId: String?): SharedMobileSnapshot {
-        if (modelCatalogSessionId != null && modelCatalogSessionId != sessionId) {
-            modelCatalog = null
-            modelCatalogSessionId = null
-        }
         sessionListState = SessionListReducer.reduce(sessionListState, SessionListAction.Select(sessionId))
         sessionId?.let {
             sessionListState = SessionListReducer.reduce(sessionListState, SessionListAction.MarkRead(it))
@@ -86,17 +76,8 @@ class SharedMobileStore(
             val frame = GatewayWireDecoder.decode(json)
             lastFrameKind = frame.kind
             lastError = null
-            // 扩展状态是完整快照：任何带 statuses 的帧（extension-status 推送、
-            // subscribed/session-restarted 应答）都整表替换该会话的状态行。
-            // 无 sessionId 时无法归属，忽略；extension-status 缺 sessionId 属违规帧。
-            frame.statuses?.takeUnless { bridgeMode }?.let { statuses ->
-                frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
-                    replaceExtensionStatuses(sessionId, statuses)
-                }
-            }
             when (frame.kind) {
                 "sessions" -> {
-                    val bridgeMode = frame.mode == "bridge"
                     val sessions = frame.items.orEmpty().mapNotNull { item ->
                         runCatching {
                             wireJson.decodeFromJsonElement(GatewaySessionSummary.serializer(), item.toJsonElement())
@@ -106,22 +87,6 @@ class SharedMobileStore(
                         sessionListState,
                         SessionListAction.RemoteSessionsReceived(sessions)
                     )
-                    if (bridgeMode) {
-                        // 桥接列表是权威：不在在线集合里的旧标记必须清掉，
-                        // 避免实例退出后仍显示“在线”。
-                        val onlineIds = sessions.filter { it.online == true }.mapTo(mutableSetOf()) { it.id }
-                        sessionListState.sessions.filter { it.id !in onlineIds && it.isOnline == true }
-                            .forEach { stale ->
-                                sessionListState = SessionListReducer.reduce(
-                                    sessionListState,
-                                    SessionListAction.OnlineChanged(stale.id, false)
-                                )
-                            }
-                    } else {
-                        // sdk 模式的 sessions 应答不带 online；切回 sdk 后不能
-                        // 继续显示上一轮桥接留下的“在线/离线”。
-                        clearOnlineMarks()
-                    }
                 }
                 "sent" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
                     sessionListState = SessionListReducer.reduce(
@@ -141,20 +106,11 @@ class SharedMobileStore(
                             model = frame.model,
                             thinkingLevel = frame.thinkingLevel,
                             contextUsage = frame.contextUsage,
-                            queuedMessages = queuedMessagesOf(frame.queuedMessages),
-                            // submitted 不含队列真值时，不抹掉此前快照确认的 pending。
-                            pendingMessages = frame.pendingMessages ?: if (frame.disposition == "submitted")
-                                sessionStates[sessionId]?.pendingMessages ?: false else false
+                            queuedMessages = queuedMessagesOf(frame.queuedMessages)
                         )
                     }
                 }
-                "models" -> {
-                    // 原生目录按会话归属；迟到的另一个 CLI 目录不能进入当前选择器。
-                    if ((!bridgeMode && frame.sessionId == null) || (frame.sessionId != null && frame.sessionId == sessionListState.selectedSessionId)) {
-                        modelCatalog = GatewayModelCatalog(frame.groups.orEmpty())
-                        modelCatalogSessionId = frame.sessionId
-                    }
-                }
+                "models" -> modelCatalog = GatewayModelCatalog(frame.groups.orEmpty())
                 // state/model-set 应答就是会话级状态快照；无 sessionId 的 model-set 无法归属，忽略。
                 // session-named（改名）/ compact-started（压缩受理）也回同一快照形状；
                 // session-named 另外刷新列表标题（网关应答带 name，单一数据流）。
@@ -162,7 +118,7 @@ class SharedMobileStore(
                 // 事件丢失，重连 catch-up 拉回的 history 帧是 isStreaming 的唯一纠正
                 // 机会——拉式 state 只在手动刷新/轮末来，长断连后 Working 会陈旧。
                 // session-restarted（重载配置）同样以 state 快照形状下发。
-                "history", "state", "model-set", "model-refreshed", "compact-started", "compact-finished", "branch-switched", "session-restarted" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
+                "history", "state", "model-set", "compact-started", "compact-finished", "branch-switched", "session-restarted" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
                     sessionStates[sessionId] = GatewaySessionState(
                         sessionId = sessionId,
                         isStreaming = frame.isStreaming == true,
@@ -170,57 +126,8 @@ class SharedMobileStore(
                         model = frame.model,
                         thinkingLevel = frame.thinkingLevel,
                         contextUsage = frame.contextUsage,
-                        queuedMessages = queuedMessagesOf(frame.queuedMessages),
-                        pendingMessages = frame.pendingMessages == true
+                        queuedMessages = queuedMessagesOf(frame.queuedMessages)
                     )
-                }
-                // 桥接快照（PROTOCOL §4.31）是扩展侧真值：busy 即运行中，
-                // 收到即证明实例在线；pending 不伪造文本队列。
-                "host-mode" -> {
-                    val wasBridge = bridgeMode
-                    bridgeMode = frame.mode == "bridge"
-                    if (frame.changed == true || wasBridge != bridgeMode) {
-                        modelCatalog = null; modelCatalogSessionId = null
-                        extensionStatuses.clear()
-                    }
-                    if (!bridgeMode) {
-                    clearOnlineMarks()
-                    sessionStates.keys.toList().forEach { sessionId ->
-                        sessionStates[sessionId] = sessionStates.getValue(sessionId).copy(pendingMessages = false)
-                    }
-                }
-                }
-                "bridge-snapshot", "bridge-offline" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
-                    extensionStatuses.remove(sessionId)
-                    val previous = sessionStates[sessionId] ?: GatewaySessionState(sessionId = sessionId)
-                    val online = frame.kind == "bridge-snapshot"
-                    sessionStates[sessionId] = previous.copy(
-                        // bridge-offline 没有 busy 字段：离线就是空闲，不能沿用旧运行标记；
-                        // 压缩和服务器队列同样已失效，清掉后由独立恢复记录承载未确认提交。
-                        isStreaming = if (online) frame.isStreaming ?: frame.busy ?: previous.isStreaming else false,
-                        isCompacting = online && frame.isCompacting == true,
-                        contextUsage = if (online) frame.contextUsage else null,
-                        model = frame.model ?: previous.model,
-                        thinkingLevel = frame.thinkingLevel ?: previous.thinkingLevel,
-                        // 桥接只有是否待执行的真值，不能沿用 SDK 的旧队列正文。
-                        queuedMessages = GatewayQueuedMessages(),
-                        pendingMessages = online && (frame.pending ?: previous.pendingMessages)
-                    )
-                    sessionListState = SessionListReducer.reduce(
-                        sessionListState,
-                        SessionListAction.OnlineChanged(sessionId, online)
-                    )
-                    syncSessionActivity(sessionId)
-                }
-                "event" -> if (frame.instanceId != null && frame.isStreaming != null && frame.isCompacting != null) {
-                    frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
-                        val previous = sessionStates[sessionId] ?: GatewaySessionState(sessionId = sessionId)
-                        sessionStates[sessionId] = previous.copy(
-                            isStreaming = frame.isStreaming,
-                            isCompacting = frame.isCompacting,
-                            contextUsage = frame.contextUsage ?: previous.contextUsage
-                        )
-                    }
                 }
                 "aborted", "dequeued" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
                     // 新网关在 idle ACK 中带权威快照；旧网关裸 ACK 不证明队列已清空。
@@ -228,10 +135,7 @@ class SharedMobileStore(
                     sessionStates[sessionId] = previous.copy(
                         isStreaming = frame.isStreaming ?: if (frame.kind == "aborted") false else previous.isStreaming,
                         isCompacting = frame.isCompacting ?: if (frame.kind == "aborted") false else previous.isCompacting,
-                        contextUsage = frame.contextUsage ?: previous.contextUsage,
                         queuedMessages = if (frame.queuedMessages != null) queuedMessagesOf(frame.queuedMessages) else previous.queuedMessages,
-                        pendingMessages = frame.pendingMessages
-                            ?: if (frame.queuedMessages != null) false else previous.pendingMessages,
                     )
                 }
                 "session-named" -> frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
@@ -292,7 +196,6 @@ class SharedMobileStore(
         eventsBySession.clear()
         modelCatalog = null
         sessionStates.clear()
-        extensionStatuses.clear()
         lastFrameKind = null
         lastError = null
         return makeSnapshot()
@@ -308,13 +211,8 @@ class SharedMobileStore(
             // 不 return：照常进 reducer/事件存储。
             "turn/start", "turn/end" -> {
                 val streaming = record.event.type == "turn/start"
-                val previous = sessionStates[record.sessionId] ?: GatewaySessionState(sessionId = record.sessionId)
-                sessionStates[record.sessionId] = previous.copy(
-                    isStreaming = streaming,
-                    // turn/end 只来自 agent_settled，公开契约保证没有待续队列。
-                    pendingMessages = streaming && previous.pendingMessages,
-                    queuedMessages = if (streaming) previous.queuedMessages else null,
-                )
+                sessionStates[record.sessionId] = (sessionStates[record.sessionId]
+                    ?: GatewaySessionState(sessionId = record.sessionId)).copy(isStreaming = streaming)
             }
             "compact/start" -> {
                 updateCompacting(record.sessionId, true)
@@ -331,8 +229,7 @@ class SharedMobileStore(
                 )
                 sessionStates[record.sessionId] = (sessionStates[record.sessionId]
                     ?: GatewaySessionState(sessionId = record.sessionId)).copy(
-                    queuedMessages = if (queued.isEmpty) null else queued,
-                    pendingMessages = false,
+                    queuedMessages = if (queued.isEmpty) null else queued
                 )
                 return
             }
@@ -355,16 +252,6 @@ class SharedMobileStore(
             ?: GatewaySessionState(sessionId = sessionId)).copy(isCompacting = value)
     }
 
-    /** 清掉所有桥接在线标记（切回 sdk 模式或 sdk 列表应答后调用）。 */
-    private fun clearOnlineMarks() {
-        sessionListState.sessions.filter { it.isOnline != null }.forEach { stale ->
-            sessionListState = SessionListReducer.reduce(
-                sessionListState,
-                SessionListAction.OnlineChanged(stale.id, null)
-            )
-        }
-    }
-
     private fun syncSessionActivity(sessionId: String) {
         val state = sessionStates[sessionId] ?: return
         sessionListState = SessionListReducer.reduce(
@@ -381,18 +268,6 @@ class SharedMobileStore(
         return GatewayQueuedMessages(steering = steering, followUp = followUp)
     }
 
-    /** 替换该会话的扩展状态完整列表：丢弃空白文本、按 key 去重（后者覆盖前者、
-     *  位置不变），空列表即清除该会话条目（对齐 Pi 的 setStatus(key, undefined)）。 */
-    private fun replaceExtensionStatuses(sessionId: String, statuses: List<GatewayStatusEntry>) {
-        val entries = mutableMapOf<String, GatewayStatusEntry>()
-        statuses.forEach { entry ->
-            if (entry.key.isBlank() || entry.text.isBlank()) return@forEach
-            entries[entry.key] = entry
-        }
-        if (entries.isEmpty()) extensionStatuses.remove(sessionId)
-        else extensionStatuses[sessionId] = entries.values.toList()
-    }
-
     private fun makeSnapshot(): SharedMobileSnapshot {
         val selected = sessionListState.selectedSessionId
         return SharedMobileSnapshot(
@@ -401,7 +276,6 @@ class SharedMobileStore(
             conversation = selected?.let { ConversationProjector.make(eventsBySession[it].orEmpty()) }.orEmpty(),
             modelCatalog = modelCatalog,
             sessionStates = sessionStates.toMap(),
-            extensionStatuses = extensionStatuses.toMap(),
             lastFrameKind = lastFrameKind,
             lastError = lastError
         )

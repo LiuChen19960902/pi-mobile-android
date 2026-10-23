@@ -156,8 +156,6 @@ internal data class ConversationProcessGroup(
 
     val reasonings: List<ConversationItem> = items.filter { it.kind == ConversationItemKind.REASONING }
 
-    val notices: List<ConversationItem> = items.filter { it.kind == ConversationItemKind.NOTICE }
-
     val tools: List<ConversationProcessTool> = pairProcessTools(items)
 
     val durationSeconds: Double
@@ -171,7 +169,7 @@ internal data class ConversationProcessGroup(
 
     val title: String
         get() {
-            if (contexts.isNotEmpty() && tools.isEmpty() && notices.isEmpty()) {
+            if (contexts.isNotEmpty() && tools.isEmpty()) {
                 return if (contexts.size == 1) "上下文" else "${contexts.size} 项上下文"
             }
             val base = when {
@@ -186,7 +184,6 @@ internal data class ConversationProcessGroup(
                 if (contexts.isNotEmpty()) add("${contexts.size} 项上下文")
                 if (reasonings.isNotEmpty()) add("${reasonings.size} 段思考")
                 if (tools.isNotEmpty()) add("${tools.size} 次工具调用")
-                if (notices.isNotEmpty()) add("${notices.size} 条通知")
             }
             return if (details.isEmpty()) base else "$base · ${details.joinToString(" · ")}"
         }
@@ -211,10 +208,6 @@ internal sealed interface ConversationProcessSegment {
         override val id: String get() = item.id
     }
 
-    data class Notice(val item: ConversationItem) : ConversationProcessSegment {
-        override val id: String get() = item.id
-    }
-
     /** 连续的工具调用/结果（think、context 出现即分段），段内完成配对。 */
     data class ToolRun(val tools: List<ConversationProcessTool>) : ConversationProcessSegment {
         override val id: String get() = tools.first().id
@@ -222,8 +215,11 @@ internal sealed interface ConversationProcessSegment {
 }
 
 /**
- * 思考、上下文和通知保持原序，连续工具项成段。通知可插在 call/result 之间，
- * 因此配对查找全组未完成调用（精确 ID 优先、FIFO 兜底），不能把结果拆成孤儿项。
+ * 组内按原事件顺序切分渲染段：REASONING/CONTEXT 单项成段，连续工具项聚成
+ * ToolRun 并在段内配对（toolCallId 精确优先，FIFO 兜底，孤儿 result 单行）。
+ * pi 事件序下 result 紧随其 call（中间只有会被 finalize 摘除的流式行），段内
+ * 配对与全组配对等价；跨段的孤儿 result 防御性落在本段末尾为无 call 行，
+ * 不前挂、不丢弃。
  */
 internal fun ConversationProcessGroup.orderedSegments(): List<ConversationProcessSegment> {
     val segments = mutableListOf<ConversationProcessSegment>()
@@ -241,20 +237,10 @@ internal fun ConversationProcessGroup.orderedSegments(): List<ConversationProces
     }
 
     fun attachResult(item: ConversationItem) {
-        val exact = if (item.toolCallId == null) -1 else segments.indexOfFirst { segment ->
-            segment is ConversationProcessSegment.ToolRun && segment.tools.any {
-                it.result == null && it.call?.toolCallId == item.toolCallId
-            }
-        }
-        val index = if (exact >= 0) exact else segments.indexOfFirst { segment ->
-            segment is ConversationProcessSegment.ToolRun && segment.tools.any {
-                it.result == null && (item.toolCallId == null || it.call?.toolCallId == null)
-            }
-        }
-        val run = segments.getOrNull(index) as? ConversationProcessSegment.ToolRun
+        val run = segments.lastOrNull() as? ConversationProcessSegment.ToolRun
         val updated = run?.let { pairToolResult(it.tools, item) }
         if (run != null && updated != null) {
-            segments[index] = run.copy(tools = updated)
+            segments[segments.lastIndex] = run.copy(tools = updated)
         } else {
             segments += ConversationProcessSegment.ToolRun(
                 listOf(ConversationProcessTool(id = item.id, call = null, result = item))
@@ -269,9 +255,6 @@ internal fun ConversationProcessGroup.orderedSegments(): List<ConversationProces
 
             ConversationItemKind.CONTEXT ->
                 segments += ConversationProcessSegment.Context(item)
-
-            ConversationItemKind.NOTICE ->
-                segments += ConversationProcessSegment.Notice(item)
 
             ConversationItemKind.TOOL,
             ConversationItemKind.JSON_TOOL -> appendRunTool(item)
@@ -309,7 +292,6 @@ private fun pairToolResult(
  * 归并规则（对照投影数据序：正文 ASSISTANT 先于其工具项 TOOL，原型视觉是
  * 步骤组在上、正文在下，组内输出按此排序）：
  * - 工具步骤项并入上一回合（末项为正文、或纯步骤组等待正文）；
- * - 含通知的组不前移到已有正文之前，避免后台完成结果倒置到“已派发”回复上方；
  * - 助手正文并入上一「纯步骤组」（组成回合）；否则自成回合；
  * - USER/STATUS/SYSTEM 结束回合。
  */
@@ -329,7 +311,6 @@ internal fun groupAssistantRounds(
         val last = rounds.lastOrNull()
         val joins = when (entry) {
             is ConversationDisplayEntry.Process -> last != null && !last.any(::isUserOrSystem) &&
-                entry.group.notices.isEmpty() &&
                 (last.all { it is ConversationDisplayEntry.Process } || isAssistant(last.last()))
             is ConversationDisplayEntry.Message ->
                 isAssistant(entry) && last != null && last.all { it is ConversationDisplayEntry.Process }
@@ -394,7 +375,6 @@ internal fun makeConversationDisplayEntries(
             ConversationItemKind.CONTEXT,
             ConversationItemKind.TOOL,
             ConversationItemKind.JSON_TOOL,
-            ConversationItemKind.NOTICE,
             ConversationItemKind.TOOL_RESULT -> processItems += item
 
             ConversationItemKind.USER,

@@ -1,7 +1,6 @@
 package com.finecat.pimobile.android.ui
 
 import androidx.compose.material3.Text
-import androidx.compose.material3.LocalTextStyle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -10,7 +9,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -36,8 +34,7 @@ internal val PI_SPINNER_FRAMES = listOf("⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 internal fun PiSpinner(
     color: Color,
     fontSize: TextUnit = 14.sp,
-    modifier: Modifier = Modifier,
-    style: TextStyle = LocalTextStyle.current,
+    modifier: Modifier = Modifier
 ) {
     var frame by remember { mutableIntStateOf(0) }
     LaunchedEffect(Unit) {
@@ -50,7 +47,6 @@ internal fun PiSpinner(
         PI_SPINNER_FRAMES[frame],
         color = color,
         fontSize = fontSize,
-        style = style,
         modifier = modifier
     )
 }

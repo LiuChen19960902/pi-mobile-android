@@ -103,45 +103,6 @@ class FineCatSettingsF08DeviceTest {
         transportRef = null
     }
 
-    @Test
-    fun rejectedHostModeSwitchShowsNoticeAboveSettingsAndKeepsMode() {
-        val transport = connectAndOpenSettings(
-            seedEntries = false,
-            hello = """{"kind":"hello","authenticated":true,"protocol":3,"capabilities":["host-mode","host-mode-put","bridge"]}""",
-        )
-        transport.receive("""{"kind":"host-mode","mode":"bridge","switchable":true}""")
-        compose.waitUntil(5_000) { holder!!.gatewayState.hostMode == "bridge" }
-        compose.onNodeWithTag("finecat.hostMode").performScrollTo().performClick()
-        compose.waitUntil(5_000) { transport.payloadsOfType("host-mode-put").size == 1 }
-        assertEquals("sdk", transport.payloadsOfType("host-mode-put").single()["mode"]!!.jsonPrimitive.content)
-
-        val beforeNotice = compose.onRoot().captureToImage().asAndroidBitmap()
-        transport.receive("""{"kind":"error","requestType":"host-mode-put","code":"mode-switch-blocked"}""")
-        val expected = "会话仍在运行或有排队消息，暂时无法切换"
-        compose.waitUntil(5_000) { holder!!.transientNotice == expected }
-        // 正文提示仍在背景语义树里，只查同文或 finecat.notice 会假通过。
-        compose.onNodeWithTag("finecat.settingsScreen").assertIsDisplayed()
-        compose.onNodeWithTag("finecat.noticeOverlay").assertTextEquals(expected).assertIsDisplayed()
-        val noticeBounds = tagBounds("finecat.noticeOverlay")
-        val withNotice = compose.onRoot().captureToImage().asAndroidBitmap()
-        assertEquals(beforeNotice.width, withNotice.width)
-        assertEquals(beforeNotice.height, withNotice.height)
-        var changedPixel = false
-        for (y in noticeBounds.top.roundToInt().coerceAtLeast(0) until
-            noticeBounds.bottom.roundToInt().coerceAtMost(withNotice.height)) {
-            for (x in noticeBounds.left.roundToInt().coerceAtLeast(0) until
-                noticeBounds.right.roundToInt().coerceAtMost(withNotice.width)) {
-                if (withNotice.getPixel(x, y) != beforeNotice.getPixel(x, y)) {
-                    changedPixel = true
-                    break
-                }
-            }
-            if (changedPixel) break
-        }
-        assertTrue("提示区域必须实际绘制在不透明设置页之上，不能只存在于背景语义树", changedPixel)
-        assertEquals("bridge", holder!!.gatewayState.hostMode)
-    }
-
     // ------------------------------------------------------------------
     // 1. S11 整页结构：头部/小节/卡片/发丝线/输入行/编号/动作/配对块/Provider 行
     // ------------------------------------------------------------------
@@ -469,8 +430,6 @@ class FineCatSettingsF08DeviceTest {
         val scan = tagBounds("finecat.openScanner")
         val manual = tagBounds("finecat.openManualPairing")
         assertTrue("手动入口与扫码在设置页同级，不嵌套扫描相机", manual.top >= scan.bottom)
-        scrollTagIntoView("finecat.pairingMode")
-        compose.onNodeWithTag("finecat.pairingMode").performClick()
         scrollTagIntoView("finecat.pairingInput")
         // 空输入：提交不可用（Disabled 语义）
         assertTrue(
@@ -1246,7 +1205,6 @@ transport.receive(PROVIDER_SAVED_AFTER_PULL_FRAME)
     private fun connectAndOpenSettings(
         seedEntries: Boolean,
         requestTimeout: Long? = 120_000L,
-        hello: String = HELLO,
     ): FakeTransport {
         val transport = FakeTransport()
         // seed：在 graph 启动前写入本地快照（endpoint=首项，连接落点与 UI 标记一致），
@@ -1280,7 +1238,7 @@ transport.receive(PROVIDER_SAVED_AFTER_PULL_FRAME)
         runBlocking {
             waitUntil { transport.specs.isNotEmpty() }
             transport.open()
-            transport.receive(hello)
+            transport.receive(HELLO)
             waitUntil { h.gatewayState.connection.name == GatewayConnectionState.CONNECTED.name }
         }
         compose.setContent {

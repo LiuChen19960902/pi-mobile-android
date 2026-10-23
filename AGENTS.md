@@ -14,7 +14,7 @@ androidApp/   Compose UI 与 Android 平台能力
   src/main/         ui/（页面）、android/（状态门面）、platform/（transport、Keystore、DataStore）
   src/test/         JVM 单测，含跨仓库 GatewayConformanceTest
   src/androidTest/  设备用例
-  src/debug/        Preview 调试构建的测试宿主
+  src/debug/        仅 debug 构建的测试宿主与试用入口
 Docs/         连接拓扑、Pi 兼容边界、发布、第三方声明
 scripts/      开发脚本
 .agents/notes/  Agent Notes：设计决策与易错机制的记录
@@ -26,7 +26,7 @@ scripts/      开发脚本
 ./gradlew :shared:testAndroidHostTest      # 共享逻辑测试（首选，快）
 ./gradlew :androidApp:testDebugUnitTest    # Android JVM 单测，含跨仓库一致性测试
 ./gradlew :shared:check                    # shared 完整检查
-./gradlew :androidApp:assembleDebug        # 出 Preview 调试包
+./gradlew :androidApp:assembleDebug        # 出 debug 包
 ```
 
 环境前提、跨仓库测试的网关位置（同级目录或 `PI_GATEWAY_DIR`）和 CI 定义见 [CONTRIBUTING.md](CONTRIBUTING.md)。只运行与改动相关的检查，报告中只列实际执行过的命令。
@@ -69,8 +69,6 @@ scripts/      开发脚本
 - **非平凡改动必须在同一提交或 PR 中新增或更新 Agent Note**：改变行为、协议或持久化格式、跨文件约定、测试策略、流程，或做了维护者以后可能重新讨论的取舍。纯机械或局部修改可以不写。同一决策更新原记录；决策被推翻时新建记录并互相链接（[规则](.agents/notes/AGENTS.md)）。
 
 ## 提交与隐私
-
-- 正式发版前的日常调试与真机验收统一使用 Preview；`debug` 构建类型只产出独立应用身份的 Preview，渠道与签名规则见 [构建说明](Docs/releasing.md#preview-调试渠道)。
 
 - 一个提交只做一件事，协议、UI、依赖升级分开提交；提交信息说清“改了什么 + 为什么”。
 - 不提交本机环境信息；示例地址用 `<LAN_IP>`、`<TS_HOST>` 这类记号并给出获取方法。

@@ -1,6 +1,6 @@
 # Pi 支持边界
 
-Pi Mobile 通过网关使用 Pi SDK，提供手机界面。默认不镜像正在运行的 Pi 终端；`bridge` 模式例外，但前提是电脑上的 Pi 已加载桥接扩展（见下）。支持范围以网关锁定的 SDK、已实现的协议和客户端投影为准。当前配套网关锁定的依赖为 `@earendil-works/pi-coding-agent 1.3.0`，不能用另一版本 CLI 的表现代替兼容性验证。
+Pi Mobile 通过网关使用 Pi SDK，提供手机界面；它不镜像正在运行的 Pi 终端。支持范围以网关锁定的 SDK、已实现的协议和客户端投影为准。当前配套网关锁定的依赖为 `@earendil-works/pi-coding-agent 1.3.0`，不能用另一版本 CLI 的表现代替兼容性验证。
 
 ## 按公开契约接入
 
@@ -12,22 +12,17 @@ Pi Mobile 通过网关使用 Pi SDK，提供手机界面。默认不镜像正在
 | 模型、思考档位、模型范围、会话树 | 使用 Pi 对应的配置和会话语义；手机已有入口不要求复制 CLI 快捷键。现有树界面不代表全部 TUI 树操作都已提供 |
 | Skills、自定义 Prompt | 使用 SDK 发现与展开规则。Package 提供的资源也可被发现；Package 是资源分发形式，不是统一禁止的功能类别。输入处理器可能先消费命令，候选存在不保证一定启动模型 |
 | `@` | 对齐 CLI 编辑器里的文件/目录补全，插入路径引用；不等同于启动参数 `pi @file` 的文件内容读取 |
-| 可见的 `custom_message` | 仅 `display=true` 时可见（缺省或 false 均隐藏），收进对话的操作组，可展开查看完整通知文本；不执行扩展自定义 TUI renderer |
+| 可见的 `custom_message` | 仅 `display=true` 时可见（缺省或 false 均隐藏），以通用通知样式展示文本内容；不执行扩展自定义 TUI renderer |
 | `custom` 持久化条目 | 默认视为扩展内部数据，不直接渲染 JSON、推测业务状态或当成错误消息。它与 `custom_message` 不同 |
 | 工具进度与嵌套工具 | 实时调用按 SDK 调用 ID、父调用关系和结束事件配对；普通顶层最终结果以 `toolResult` 为准，嵌套调用用 `end` 收尾。partial 进度尚不提供专门 UI；历史没有独立子调用结果时不编造恢复数据 |
-| 原生 Pi 接入（`bridge` 模式） | 连接电脑上**已加载桥接扩展**的原生 Pi 实例：同一进程、同一 `sessionId`，可看进行中的输出与工具并继续操作。未加载扩展的 CLI 不在发现范围内，也不能被手机接管；socket 暂时不可达不等于进程退出。网关宣告 `bridge-start` 时，手机可对离线会话请求在宿主机后台启动一个带扩展的 Pi，并用网关给出的附着提示回到该终端；启动结果未知时只提示刷新，不自动重试 |
-| 桥接模式的写操作 | 支持已有会话的发送、停止、队列取回，配套扩展的上下文占用与压缩/取消（`bridge-context-v1`），以及模型/思考选择（`bridge-model-controls-v1`，目录取该 CLI 当前 scope），回执只到“已提交”，终态以事件/快照为准。配套扩展 0.5+ 可浏览/筛选/复制/标注树、改名与跳转（`bridge-tree-controls-v1`）；只操作在线的已打开实例，运行或有排队消息时需先停止再跳转。配套扩展 0.6+ 支持当前实例的 Skills/Prompt 候选及原生展开、`@` 路径补全（`bridge-input-v1`），不执行任意第三方扩展命令；首页新建会话与模型预选在该模式不可用；同一会话被另一个实例持有时只读。电脑上已有其他 custom editor 时桥接不覆盖它，队列取回按不可用处理。停止请求失败时，已从队列取出并回传的文本只为匹配的停止操作退回一次，不覆盖之后输入的新草稿 |
-| 扩展状态行 | 只桥接 Pi 公开的 `ctx.ui.setStatus(key, text)`：手机把文本显示在输入区上方，只读、不解析内容。状态是显示提示，不证明任务结束，不能用来推断是否在运行 |
-| 扩展弹窗、通知与 widget | 除状态行外没有扩展 UI 桥接：选择/输入返回取消值、确认返回否，`ctx.ui.notify` 与 widget 不显示。可见 `custom_message` 仍按上表展示 |
-| 插件私有后台任务面板 | 不读取插件私有文件、事件总线或管理器来拼专用面板；现有消息流没有传递的后台状态，手机无法据此还原。扩展自己通过 `ctx.ui.setStatus` 公开的状态行只显示文本，不据此拼面板 |
+| 扩展弹窗、通知与 widget | 当前网关没有提供扩展 UI 桥接。官方 RPC 的部分 UI 能力在技术上可以另行接入，但本版没有这个能力 |
+| 插件私有后台任务面板 | 不读取插件私有文件、事件总线或管理器来拼专用面板；现有消息流没有传递的后台状态，手机无法据此还原 |
 
 因此，“在 Pi 终端可运行”不足以保证手机具备相同的全部功能。需要核对它是否依赖 TUI，以及输出是否经过手机已接入的公开契约。
 
 ## 当前实现的限制
 
-网关通过 SDK 创建 `AgentSession`，调用 `bindExtensions({mode: "rpc"})`，传入的 `uiContext` 只实现 `setStatus`：状态行按会话保存、以完整快照推给手机。其余扩展 UI 仍是 no-op，选择/输入返回取消值，确认返回否，`ctx.ui.notify` 与 widget 不显示。这个绑定方式不等于已经实现官方 `extension_ui_request/response` 协议。
-
-状态行是显示提示，不是任务契约：空快照不表示任务完成，非空快照也不表示仍在运行；扩展崩溃或忘记清除时状态可能残留。手机只在 hello 宣告 `extension-status` 时显示状态区，旧网关不显示空占位。
+网关通过 SDK 创建 `AgentSession`，调用 `bindExtensions({mode: "rpc"})`，但没有传入 `uiContext`。SDK 在这个用法下使用 no-op UI：选择/输入返回取消值，确认返回否，状态栏/widget 不显示。这个绑定方式不等于已经实现官方 `extension_ui_request/response` 协议。
 
 `prompt-disposition-v1` 网关提供输入回执及权威活动快照，客户端分开记录等待回执的输入与实际运行；SDK 未给出处置值时不猜测。旧网关未声明能力时保留原路径，不能由新手机包单方面补齐回执语义。
 
@@ -40,7 +35,3 @@ Pi Mobile 通过网关使用 Pi SDK，提供手机界面。默认不镜像正在
 当前输入回执没有逐条请求 ID，同一连接、同一会话异常重复的合法回执仍有归属限制。普通请求的关联与非法回执守卫不能消除这项协议限制。
 
 官方 RPC 支持部分对话框、通知和文本 widget；依赖终端的组件仍有限制，组件工厂不能直接搬到手机。参见 [Pi 扩展文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)和 [RPC Extension UI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc-extension-ui.md)。这些链接指向上游当前文档，具体接入仍须核对网关锁定版本。
-
-原生工作区支持桥接能力 `bridge-workspace-v1`：手机可新建原生会话或 Fork 到目标目录并启动新的原生 Pi，源 CLI 保留；已有会话通过既有入口打开。需要目标项目信任，Fork 要求源空闲且无队列；不迁移原 CLI 的私有启动参数或第三方内存任务。机制见[原生工作区记录](../.agents/notes/implemented/architecture/2026-10-22-native-workspaces.md)。
-
-桥接 Provider 保存后可刷新当前在线原生会话的同名模型配置；忙或刷新失败单独提示，不改变已落盘保存结果。scope-model 保存供下次原生启动生效，不能覆盖当前 CLI 的范围。原生扩展状态缺少公开独立读取接口，桥接不替换终端 footer。机制见[原生配置刷新](../.agents/notes/implemented/architecture/2026-10-22-native-config-refresh.md)。
