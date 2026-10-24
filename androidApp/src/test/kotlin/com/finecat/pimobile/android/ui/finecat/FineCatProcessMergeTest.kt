@@ -5,12 +5,19 @@ import com.finecat.pimobile.android.ui.displayRoundKey
 import com.finecat.pimobile.android.ui.groupAssistantRounds
 import com.finecat.pimobile.android.ui.makeConversationDisplayEntries
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatSteps
+import com.finecat.pimobile.android.ui.finecat.conversation.fineCatWorkingGroupId
 import com.finecat.pimobile.android.ui.finecat.conversation.mergeFineCatProcessEntries
 import com.finecat.pimobile.android.ui.finecat.conversation.timeSeparatorsByRoundKey
 import com.finecat.pimobile.android.ui.finecat.conversation.turnTimes
 import com.finecat.pimobile.shared.projection.ConversationItem
 import com.finecat.pimobile.shared.projection.ConversationItemKind
+import com.finecat.pimobile.shared.projection.ConversationProjector
+import com.finecat.pimobile.shared.protocol.GatewayEvent
 import com.finecat.pimobile.shared.protocol.GatewayImageAttachment
+import com.finecat.pimobile.shared.protocol.JsonValue
+import com.finecat.pimobile.shared.protocol.SessionEvent
+import com.finecat.pimobile.shared.protocol.ToolCall
+import com.finecat.pimobile.shared.protocol.ToolDelta
 import org.junit.Assert.*
 import org.junit.Test
 import java.time.ZoneId
@@ -50,18 +57,110 @@ class FineCatProcessMergeTest {
             ConversationItemKind.TOOL, ConversationItemKind.TOOL_RESULT) }, merged.group.items)
     }
 
-    @Test fun visibleProseIsABarrierBeforeRoundSorting() {
+    @Test fun visibleProseRemainsBetweenItsPrecedingAndFollowingSteps() {
         val raw = makeConversationDisplayEntries(listOf(
             item("c1", ConversationItemKind.TOOL, "first"),
             item("a", ConversationItemKind.ASSISTANT, "visible prose"),
             item("c2", ConversationItemKind.TOOL, "second"),
         ))
-        // Existing round sorting makes these two processes visually adjacent.
-        val sorted = groupAssistantRounds(raw).single()
-        assertTrue(sorted[0] is ConversationDisplayEntry.Process)
-        assertTrue(sorted[1] is ConversationDisplayEntry.Process)
-        assertEquals("Do not merge across real prose just because rounds are sorted", raw,
-            mergeFineCatProcessEntries(raw))
+        val merged = mergeFineCatProcessEntries(raw)
+        val round = groupAssistantRounds(merged).single()
+        assertEquals(raw, merged)
+        assertEquals(merged, round)
+        assertTrue(round[0] is ConversationDisplayEntry.Process)
+        assertEquals("a", round[1].id)
+        assertTrue(round[2] is ConversationDisplayEntry.Process)
+    }
+
+    @Test fun runningOperationsStayAfterTheProseThatPrecededThem() {
+        val displayed = entries(listOf(
+            item("u", ConversationItemKind.USER, "request"),
+            item("a", ConversationItemKind.ASSISTANT, "I will inspect the files"),
+            item("r", ConversationItemKind.REASONING, "check the details"),
+            item("call", ConversationItemKind.TOOL, "read README.md", toolId = "t"),
+        ))
+        val rounds = groupAssistantRounds(displayed)
+        assertEquals(displayed, rounds.flatten())
+        assertEquals(listOf("a", "process:a:0"), rounds.last().map { it.id })
+        assertEquals("a", displayRoundKey(rounds.last()))
+        assertEquals(rounds.last().last().id, fineCatWorkingGroupId(displayed, isStreaming = true))
+        assertEquals(listOf("check the details", "read README.md"),
+            fineCatSteps(groups(displayed).single().group).map { it.detail ?: it.command })
+    }
+
+    @Test fun projectedHistoryKeepsReasoningThenProseThenToolInTheRootDisplayChain() {
+        val projected = ConversationProjector.make(listOf(
+            SessionEvent("history", -2, 100.0, GatewayEvent(
+                "assistant/message", text = "I will inspect the files", reasoning = "first think",
+                toolCalls = listOf(ToolCall("t", "read", JsonValue.StringValue("README.md"))),
+            ), entryId = "assistant"),
+            SessionEvent("history", -1, 101.0, GatewayEvent(
+                "tool/result", callId = "t", preview = "file contents",
+            ), entryId = "result"),
+        ))
+        val displayed = entries(projected)
+        val round = groupAssistantRounds(displayed).single()
+        assertEquals(displayed, round)
+        assertEquals(3, round.size)
+        assertEquals("first think", fineCatSteps((round[0] as ConversationDisplayEntry.Process).group).single().detail)
+        assertEquals("I will inspect the files", (round[1] as ConversationDisplayEntry.Message).item.text)
+        val tool = fineCatSteps((round[2] as ConversationDisplayEntry.Process).group).single()
+        assertEquals("file contents", tool.detail)
+        assertTrue(tool.completed)
+    }
+
+    @Test fun projectedLiveStepsStayAfterEarlierProseThroughStreamFinalization() {
+        val projector = ConversationProjector()
+        projector.fold(listOf(
+            SessionEvent("live", 1, 100.0, GatewayEvent("user/message", text = "request")),
+            SessionEvent("live", 2, 101.0, GatewayEvent(
+                "assistant/chunk", turn = 1, step = 0, chunkType = "text-delta", text = "Before tools",
+            )),
+            SessionEvent("live", 3, 102.0, GatewayEvent(
+                "assistant/message", turn = 1, step = 0, text = "Before tools",
+            )),
+        ))
+        projector.fold(listOf(
+            SessionEvent("live", 4, 103.0, GatewayEvent(
+                "assistant/chunk", turn = 1, step = 1, chunkType = "reasoning-delta", text = "Inspect files",
+            )),
+            SessionEvent("live", 5, 104.0, GatewayEvent(
+                "assistant/chunk", turn = 1, step = 1, chunkType = "tool-call-delta",
+                tool = ToolDelta("t", "read", "README.md"),
+            )),
+        ))
+        val streaming = entries(projector.items)
+        val streamingRound = groupAssistantRounds(streaming).last()
+        assertEquals(streaming, groupAssistantRounds(streaming).flatten())
+        assertEquals("Before tools", (streamingRound.first() as ConversationDisplayEntry.Message).item.text)
+        val runningGroup = streamingRound.last() as ConversationDisplayEntry.Process
+        assertEquals(runningGroup.id, fineCatWorkingGroupId(streaming, isStreaming = true))
+        assertEquals(listOf("Inspect files", "README.md"),
+            fineCatSteps(runningGroup.group).map { it.detail ?: it.command })
+
+        projector.fold(listOf(
+            SessionEvent("live", 6, 105.0, GatewayEvent(
+                "assistant/message", turn = 1, step = 1, reasoning = "Inspect files",
+                toolCalls = listOf(ToolCall("t", "read", JsonValue.StringValue("README.md"))),
+            )),
+            SessionEvent("live", 7, 106.0, GatewayEvent(
+                "tool/call", callId = "t", name = "read", arguments = JsonValue.StringValue("README.md"),
+            )),
+            SessionEvent("live", 8, 107.0, GatewayEvent("tool/result", callId = "t", preview = "file contents")),
+        ))
+        val completed = entries(projector.items)
+        val completedRound = groupAssistantRounds(completed).last()
+        assertEquals(completed, groupAssistantRounds(completed).flatten())
+        assertEquals("Before tools", (completedRound.first() as ConversationDisplayEntry.Message).item.text)
+        assertEquals(displayRoundKey(streamingRound), displayRoundKey(completedRound))
+        val completedGroup = completedRound.last() as ConversationDisplayEntry.Process
+        assertEquals(runningGroup.id, completedGroup.id)
+        val steps = fineCatSteps(completedGroup.group)
+        assertEquals(2, steps.size)
+        assertEquals("Inspect files", steps.first().detail)
+        assertEquals("file contents", steps.last().detail)
+        assertTrue(steps.last().completed)
+        assertNull(fineCatWorkingGroupId(completed, isStreaming = false))
     }
 
     @Test fun userSystemAndStatusEachStopMerging() {

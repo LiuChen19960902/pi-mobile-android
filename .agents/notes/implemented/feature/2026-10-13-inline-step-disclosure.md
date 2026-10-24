@@ -16,7 +16,7 @@ Status: implemented
 - 思考与通知的全文详情共用低权重外观：淡底圆角、左侧细线、小字号、行高和内边距，工具保留命令/结果的代码块。`FcStepDetail.useThoughtStyle` 同时控制容器、内边距、选择区和文字样式。只把新类型加进文本显示分支，会遗漏这些按类型判断的外观条件，让通知退回正文大字和无底色；新增文字类步骤时必须整套复用，并核对长内容的高度与滚动边界。
 - 单项详情最大 240dp，短内容按自然高度。`heightIn` 必须在 `verticalScroll` 之前，为同向嵌套滚动提供有限视口。工具详情中的代码块不再单独封顶，命令和结果共用详情这一层滚动。
 - 详情内起手的手势在到达边缘后不传给会话列表：在内部 `verticalScroll` 外侧加局部 `nestedScroll`，`onPostScroll` 消费剩余的 y、`onPostFling` 消费剩余速度。会话列表的“到顶加载更早历史”从 `onPreScroll` 移到 `onPostScroll`，只看子项消费后真正到达列表的剩余量，否则详情内的下拉会误触历史加载。
-- 连续的步骤组在展示层合并（`mergeFineCatProcessEntries`）：`makeConversationDisplayEntries` 会在每条 ASSISTANT 处切开批次，即使正文为空。合并保留第一组 ID，相邻步骤按原序合并；空的助手消息对象保留，供定位、历史加载和时间分隔使用。可见正文、图片、错误、USER、SYSTEM、STATUS 是合并边界。合并必须在 `groupAssistantRounds` 之前做：该函数会把回合内的步骤排到所有消息之前，排序后再按视觉相邻合并会越过真实正文。
+- 连续的步骤组在展示层合并（`mergeFineCatProcessEntries`）：`makeConversationDisplayEntries` 会在每条 ASSISTANT 处切开批次，即使正文为空。合并保留第一组 ID，相邻步骤按原序合并；空的助手消息对象保留，供定位、历史加载和时间分隔使用。可见正文、图片、错误、USER、SYSTEM、STATUS 是合并边界。合并在 `groupAssistantRounds` 之前做；回合分组保留投影顺序，步骤不得跨过可见正文。先前“把回合内步骤统一排在消息前”的规则已由[正文与步骤顺序修正](../bug-fix/2026-10-24-assistant-step-order.md)取代，其余内联展开、合并边界和滚动决定保留。
 - 正在生成且尾项仍是步骤的组直接显示，进入正文或结束后恢复为折叠的计数头；直显不修改显式展开集合。底部的 Working 由真实忙状态控制，步骤组内不再重复显示 Working。
 - 紧凑行高时，局部 `LocalViewConfiguration.minimumTouchTargetSize` 同时作用于组头和条目，否则默认 48dp 的触控扩张会让边缘点击命中相邻组；用 `defaultMinSize` 让大字号自然撑高，不用固定 height 截字。
 

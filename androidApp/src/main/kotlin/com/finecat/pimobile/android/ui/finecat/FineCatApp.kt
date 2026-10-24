@@ -442,7 +442,7 @@ private fun FineCatAppContent(
                 }
             }.toMap()
         }
-        // F02 回合分组：步骤组与其后正文同回合一组（组内 12dp），回合间 24dp
+        // 相邻步骤与正文组成展示回合，保留原顺序；间距由相邻条目的类型决定。
         val displayRounds = remember(displayEntries) {
             groupAssistantRounds(displayEntries)
         }
@@ -955,8 +955,7 @@ private fun FineCatAppContent(
                                 }
                                 // 加载提示嵌在最旧一条消息的内容上方，与消息同属一个稳定
                                 // keyed item，不再单独占一行；id 唯一故只会命中首项。
-                                // 最旧 displayEntry 可能位于回合中部（组内步骤组排前），按成员匹配而不是
-                                // 只比回合首项，否则带工具步骤的最旧消息回合不渲染加载提示。
+                                // 按成员匹配最旧 displayEntry，不假定它处于回合首项。
                                 if (showHistoryLoadingRow && round.any { it.id == oldestEntryId }) {
                                     HistoryOlderLoadingText()
                                 }
