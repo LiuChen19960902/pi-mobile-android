@@ -74,7 +74,7 @@ pi-mobile-gateway（电脑，Node.js）
 
    网关默认按局域网 IPv4 推断手机可达地址；推断不到时会直接拒绝配对并提示补 `--public-url ws://<手机可达 IP>:3082/ws/mobile`（走 Tailscale 就填 tailnet 地址）。
 
-2. **手机装 App**：体验本文的原生 Pi 实验模式，请下载 [1.2.0 Preview](https://github.com/LiuChen19960902/pi-mobile-android/releases/tag/v1.2.0-preview.85)，配套本文的网关版本；[正式版 Latest](https://github.com/LiuChen19960902/pi-mobile-android/releases/latest) 保持 1.1.0，使用其发行页注明的配套网关。Preview 可与正式版同时安装，两者分别配对；构建与签名见[发布说明](Docs/releasing.md)。
+2. **手机装 App**：从 [正式版 Latest](https://github.com/LiuChen19960902/pi-mobile-android/releases/latest) 下载 1.2.0 长期签名 APK，使用本文的配套网关；原生 Pi 仍属于实验性功能。开发和验收可使用 [1.2.0 Preview](https://github.com/LiuChen19960902/pi-mobile-android/releases/tag/v1.2.0-preview.85)，与正式版同时安装，两者分别配对；构建与签名见[发布说明](Docs/releasing.md)。
 
 3. **配对**：打开 App → 左上角会话列表按钮 → 抽屉顶部设置图标 → 设置页网关卡 → 「扫码配对」或「手动配对」。
 
