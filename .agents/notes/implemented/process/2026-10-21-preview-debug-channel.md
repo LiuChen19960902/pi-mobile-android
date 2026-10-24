@@ -20,7 +20,7 @@ Status: implemented
 
 ## 影响
 
-正式版和 Preview 可以并存，Preview 首次使用需要独立配对。Gradle 任务及内部输出目录仍叫 debug，分发文件按 Preview 命名。最终签名与 R8 的行为仍须用 Release 验证，不能由 Preview 的结果代替。
+实验性功能与构建渠道分别标记：正式版也可提供明确声明边界的实验性能力，不能因此把整包当成 Preview。正式版和 Preview 可以并存，Preview 首次使用需要独立配对。Gradle 任务及内部输出目录仍叫 debug，分发文件按 Preview 命名。最终签名与 R8 的行为仍须用 Release 验证，不能由 Preview 的结果代替。
 
 ## 核对入口
 
