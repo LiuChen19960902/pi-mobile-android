@@ -51,7 +51,7 @@ class FineCatConversationSpacingTest {
         assertTrue(fineCatEntryHasVisibleBody(steps("a")))
     }
 
-    @Test fun whitespaceAssistantKeepsBatchAndFinalBodyInSeparateRounds() {
+    @Test fun whitespaceAssistantKeepsBatchBoundariesAndInputOrderBeforeMerge() {
         val messages = (0..1).flatMap { index ->
             listOf(
                 body.item.copy(id = "blank-$index", text = " \n"),
@@ -59,12 +59,16 @@ class FineCatConversationSpacingTest {
                 body.item.copy(id = "result-$index", kind = ConversationItemKind.TOOL_RESULT, toolCallId = "call-$index"),
             )
         } + body.item
-        val rounds = groupAssistantRounds(makeConversationDisplayEntries(messages))
+        val entries = makeConversationDisplayEntries(messages)
+        val rounds = groupAssistantRounds(entries)
         assertEquals(3, rounds.size)
         assertEquals(listOf(2, 2, 1), rounds.map { it.size })
-        assertTrue(rounds[0][0] is ConversationDisplayEntry.Process)
-        assertTrue(rounds[1][0] is ConversationDisplayEntry.Process)
+        assertEquals(entries, rounds.flatten())
+        assertEquals("blank-0", rounds[0].first().id)
+        assertEquals("blank-1", rounds[1].first().id)
+        assertTrue(rounds[0].last() is ConversationDisplayEntry.Process)
+        assertTrue(rounds[1].last() is ConversationDisplayEntry.Process)
         assertEquals("body", rounds[2].single().id)
-        assertEquals(4, fineCatEntryGap(rounds[1].first(), rounds[2].first(), 24))
+        assertEquals(4, fineCatEntryGap(rounds[1].last(), rounds[2].first(), 24))
     }
 }

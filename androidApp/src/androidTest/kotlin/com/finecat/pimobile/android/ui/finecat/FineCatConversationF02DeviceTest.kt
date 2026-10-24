@@ -283,7 +283,7 @@ class FineCatConversationF02DeviceTest {
     }
 
     @Test
-    fun spacing_stepsToTextAndAcrossRounds_4dp_measuredByBounds() {
+    fun spacing_textToFollowingStepsAndAcrossRounds_4dp_measuredByBounds() {
         injectConversation(sameTextTwice = false, twoRounds = true)
         compose.setContent { FineCatTheme { FineCatApp(stateHolder = holder) } }
         compose.waitForIdle()
@@ -295,31 +295,31 @@ class FineCatConversationF02DeviceTest {
 
         val density = compose.density.density
 
-        // 第一回合：组0（步骤组）→ 正文0
+        // 第一回合先有正文，随后才执行工具；布局必须保持这一顺序。
         scrollListToTag("finecat.steps.${groupIds[0]}")
         val group0 = compose.onNodeWithTag("finecat.steps.${groupIds[0]}")
             .fetchSemanticsNode().boundsInRoot
         val text0 = compose.onNodeWithTag("finecat.ai.${assistantMessageIdAt(0)}")
             .fetchSemanticsNode().boundsInRoot
-        val innerGap = (text0.top - group0.bottom) / density
-        assertTrue("步骤组→同组正文应4dp±1（实测 ${innerGap}dp）", innerGap in 3f..5f)
+        val innerGap = (group0.top - text0.bottom) / density
+        assertTrue("正文→后续步骤组应4dp±1（实测 ${innerGap}dp）", innerGap in 3f..5f)
         saveShot("f02-spacing.png")
 
-        // 正文0（底）→ 组1（顶）、组1 → 正文1均4dp
+        // 组0→下一回合正文1、正文1→组1都保持紧凑间距。
         scrollListToTag("finecat.steps.${groupIds[1]}")
-        val text0b = compose.onNodeWithTag("finecat.ai.${assistantMessageIdAt(0)}")
+        val group0b = compose.onNodeWithTag("finecat.steps.${groupIds[0]}")
+            .fetchSemanticsNode().boundsInRoot
+        val text1 = compose.onNodeWithTag("finecat.ai.${assistantMessageIdAt(1)}")
             .fetchSemanticsNode().boundsInRoot
         val group1 = compose.onNodeWithTag("finecat.steps.${groupIds[1]}")
             .fetchSemanticsNode().boundsInRoot
-        val groupGap = (group1.top - text0b.bottom) / density
+        val groupGap = (text1.top - group0b.bottom) / density
         assertTrue(
-            "正文→下一回合步骤组应4dp±1（实测 ${groupGap}dp）",
+            "步骤组→下一回合正文应4dp±1（实测 ${groupGap}dp）",
             groupGap in 3f..5f,
         )
-        val text1 = compose.onNodeWithTag("finecat.ai.${assistantMessageIdAt(1)}")
-            .fetchSemanticsNode().boundsInRoot
-        val innerGap2 = (text1.top - group1.bottom) / density
-        assertTrue("第二回合组内也应4dp±1（实测 ${innerGap2}dp）", innerGap2 in 3f..5f)
+        val innerGap2 = (group1.top - text1.bottom) / density
+        assertTrue("第二回合正文→后续步骤组也应4dp±1（实测 ${innerGap2}dp）", innerGap2 in 3f..5f)
     }
 
     // ------------------------------------------------------------------
@@ -465,8 +465,8 @@ class FineCatConversationF02DeviceTest {
                 .fetchSemanticsNode().boundsInRoot
             val text0 = compose.onNodeWithTag("finecat.ai.${assistantMessageIdAt(0)}")
                 .fetchSemanticsNode().boundsInRoot
-            val innerGap = (text0.top - group0.bottom) / density
-            assertTrue("fs1.3 组内间距仍应4dp±1（实测 ${innerGap}dp）", innerGap in 3f..5f)
+            val innerGap = (group0.top - text0.bottom) / density
+            assertTrue("fs1.3 正文→后续步骤间距仍应4dp±1（实测 ${innerGap}dp）", innerGap in 3f..5f)
             saveShot("f02-matrix-360fs13-spacing.png")
         } finally {
             restoreDeviceConfig()
@@ -529,12 +529,12 @@ class FineCatConversationF02DeviceTest {
     /**
      * 注入对话事件流（pi 原生形状）。
      * sameTextTwice=true：两条**同文**助手消息（多段落+代码+表格，复制不串对象用）。
-     * twoRounds=true：回合1 只有步骤组（t1-1/t1-2），回合2 纯正文。
+     * twoRounds=true：每回合先输出正文，再执行对应工具。
      */
     private fun injectConversation(sameTextTwice: Boolean, twoRounds: Boolean = false) {
         setUpConnectedSession()
         if (twoRounds) {
-            // 回合1：步骤组（t1-1/t1-2）+ 正文；回合2：步骤组（t2-1）+ 正文
+            // 回合1：正文→t1-1/t1-2；回合2：正文→t2-1。
             transport.receive(event("""{"type":"agent_start"}"""))
             transport.receive(textDelta("第一回合的正文。"))
             transport.receive(

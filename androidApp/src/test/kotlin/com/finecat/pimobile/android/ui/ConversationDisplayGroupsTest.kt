@@ -414,10 +414,10 @@ class ConversationDisplayGroupsTest {
 
 
 
-    // ---- F02：助手回合分组（步骤组提到正文前合成回合；回合间 24dp 由渲染层落） ----
+    // ---- 助手回合分组：保留正文与步骤的投影顺序 ----
 
     @Test
-    fun groupAssistantRounds_processLiftedBeforeItsAssistant_oneRound() {
+    fun groupAssistantRounds_processAfterItsAssistant_keepsOrderInOneRound() {
         val rounds = groupAssistantRounds(
             makeConversationDisplayEntries(
                 listOf(
@@ -429,12 +429,11 @@ class ConversationDisplayGroupsTest {
                 )
             )
         )
-        // 投影序 [u1, a1, tools] → 回合 [u1] / [tools(提上), a1] / [u2]
+        // 投影序 [u1, a1, tools] → 回合 [u1] / [a1, tools] / [u2]
         assertEquals(3, rounds.size)
         assertEquals(1, rounds[0].size)
-        // 回合内顺序：Process（工具步骤组）在前、正文在后；Process.id 是组 id
-        assertTrue(rounds[1][0] is ConversationDisplayEntry.Process)
-        assertEquals("a1", (rounds[1][1] as ConversationDisplayEntry.Message).item.id)
+        assertEquals("a1", (rounds[1][0] as ConversationDisplayEntry.Message).item.id)
+        assertTrue(rounds[1][1] is ConversationDisplayEntry.Process)
         assertEquals(1, rounds[2].size)
     }
 
@@ -472,12 +471,12 @@ class ConversationDisplayGroupsTest {
                 )
             )
         )
-        // 回合1=[tool-1(提上), a1]，回合2=[tool-2(提上), a2]
+        // 每个回合都保留正文先于后续工具的顺序。
         assertEquals(2, rounds.size)
-        assertTrue(rounds[0][0] is ConversationDisplayEntry.Process)
-        assertEquals("a1", (rounds[0][1] as ConversationDisplayEntry.Message).item.id)
-        assertTrue(rounds[1][0] is ConversationDisplayEntry.Process)
-        assertEquals("a2", (rounds[1][1] as ConversationDisplayEntry.Message).item.id)
+        assertEquals("a1", (rounds[0][0] as ConversationDisplayEntry.Message).item.id)
+        assertTrue(rounds[0][1] is ConversationDisplayEntry.Process)
+        assertEquals("a2", (rounds[1][0] as ConversationDisplayEntry.Message).item.id)
+        assertTrue(rounds[1][1] is ConversationDisplayEntry.Process)
     }
 
     @Test
@@ -491,10 +490,10 @@ class ConversationDisplayGroupsTest {
                 )
             )
         )
-        // [u1] / [a1+tool（组内步骤在前）]
+        // [u1] / [a1, tool]
         assertEquals(2, rounds.size)
-        assertTrue(rounds[1][0] is ConversationDisplayEntry.Process)
-        assertEquals("a1", (rounds[1][1] as ConversationDisplayEntry.Message).item.id)
+        assertEquals("a1", (rounds[1][0] as ConversationDisplayEntry.Message).item.id)
+        assertTrue(rounds[1][1] is ConversationDisplayEntry.Process)
     }
 
     @Test

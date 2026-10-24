@@ -110,7 +110,7 @@ internal fun fineCatWorkingGroupId(entries: List<ConversationDisplayEntry>, isSt
         fineCatEntryHasVisibleBody(it) || (it is ConversationDisplayEntry.Message && it.item.isError)
     } as? ConversationDisplayEntry.Process)?.id else null
 
-/** 在回合排序前合并没有可见正文隔开的步骤，保留空消息的定位和时间戳。 */
+/** 在回合分组前合并没有可见正文隔开的步骤，保留空消息的定位和时间戳。 */
 internal fun mergeFineCatProcessEntries(entries: List<ConversationDisplayEntry>): List<ConversationDisplayEntry> {
     val result = mutableListOf<ConversationDisplayEntry>()
     var firstProcessIndex: Int? = null

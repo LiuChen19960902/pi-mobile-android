@@ -302,16 +302,9 @@ private fun pairToolResult(
 }
 
 /**
- * 助手回合分组（F02，原型 msgBlock 结构 app.js:187-192）：时间分隔在回合外顶部，
- * 回合 = `.msg ai` [步骤组 --margin 12dp-- 正文+复制]，消息（回合）间 = `.msg`
- * margin-bottom 24dp。
- *
- * 归并规则（对照投影数据序：正文 ASSISTANT 先于其工具项 TOOL，原型视觉是
- * 步骤组在上、正文在下，组内输出按此排序）：
- * - 工具步骤项并入上一回合（末项为正文、或纯步骤组等待正文）；
- * - 含通知的组不前移到已有正文之前，避免后台完成结果倒置到“已派发”回复上方；
- * - 助手正文并入上一「纯步骤组」（组成回合）；否则自成回合；
- * - USER/STATUS/SYSTEM 结束回合。
+ * 把相邻助手正文与步骤组成展示回合，供稳定 key、间距和时间分隔使用。
+ * 分组只改变布局边界，不改变投影顺序：正文之后发生的工具/思考仍在正文之后，
+ * 正文之前的思考也保留原位。通知、USER/STATUS/SYSTEM 保留原分组边界。
  */
 internal fun groupAssistantRounds(
     entries: List<ConversationDisplayEntry>
@@ -341,15 +334,12 @@ internal fun groupAssistantRounds(
             rounds += mutableListOf(entry)
         }
     }
-    // 组内视觉序：步骤组在前、正文在后（原型 .msg 内 steps → prose）
-    return rounds.map { round ->
-        round.sortedBy { if (it is ConversationDisplayEntry.Message) 1 else 0 }
-    }
+    return rounds.map { it.toList() }
 }
 
 /**
- * 回合在 LazyColumn 的稳定 key：回合含正文时用正文消息 id——流式中工具项并入、
- * 组内排序调整都不会改变 key，item 身份（滚动锚点、可见附件上报）从正文出现起
+ * 回合在 LazyColumn 的稳定 key：回合含正文时用正文消息 id——流式中工具项并入
+ * 不改变 key，item 身份（滚动锚点、可见附件上报）从正文出现起
  * 稳定；纯步骤组或单条消息回合用 "round:" + 首项 id 兜底。
  */
 internal fun displayRoundKey(round: List<ConversationDisplayEntry>): String =
