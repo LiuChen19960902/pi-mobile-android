@@ -62,6 +62,14 @@ internal fun restoreWorktreePending(raw: String?, hostKey: String): WorktreeUiSt
 }.getOrNull()
 
 internal fun worktreeErrorText(code: String?): String = when (code) {
+    "bridge-offline" -> "原生 Pi 未在线，请先启动"
+    "bridge-stale-runtime" -> "原生会话已变化，请刷新"
+    "bridge-unavailable" -> "请更新网关和桥接扩展"
+    "session-owned" -> "会话已被另一 Pi 实例持有"
+    "mode-switch-blocked" -> "连接模式正在切换，请稍候"
+    "worktree-source-empty" -> "源会话尚未保存，暂不能 Fork"
+    "bridge-start-failed" -> "后台 Pi 启动失败，请查看宿主 tmux"
+    "launch-result-unknown" -> "启动未确认，请刷新会话列表"
     "worktree-busy" -> "任务进行中，暂不能 Fork 会话"
     "worktree-queued" -> "先处理待发消息，再 Fork 会话"
     "worktree-target-unavailable" -> "目标目录已失效"

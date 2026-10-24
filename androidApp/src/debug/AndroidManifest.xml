@@ -6,21 +6,10 @@
         android:usesCleartextTraffic="true"
         tools:replace="android:usesCleartextTraffic">
 
-        <activity
-            android:name=".FineCatTrialActivity"
-            android:exported="true"
-            android:label="FineCat 试用"
-            android:theme="@style/Theme.PiMobile.Starting">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
         <!-- P1 组件陈列宿主，仅 debug 变体；无 intent-filter 不进启动器。
              exported=true 是有意保留：API34 上 shell 无法启动 non-exported 组件，
              adb am start 是本宿主的主要入口；无 filter 时 launcher 不可见，暴露面可接受。
-             adb: am start -n com.finecat.pimobile.android/.ui.finecat.FineCatGalleryActivity -->
+             adb: am start -n com.finecat.pimobile.android.preview/com.finecat.pimobile.android.ui.finecat.FineCatGalleryActivity -->
         <activity
             android:name="com.finecat.pimobile.android.ui.finecat.FineCatGalleryActivity"
             android:exported="true"

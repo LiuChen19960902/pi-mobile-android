@@ -30,6 +30,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineStart
 import com.finecat.pimobile.shared.facade.SharedMobileSnapshot
 import com.finecat.pimobile.shared.facade.SharedMobileStore
+import com.finecat.pimobile.shared.gateway.GatewayBridgeSubscriptionStamp
 import com.finecat.pimobile.shared.gateway.GatewayConnectionState
 import com.finecat.pimobile.shared.gateway.GatewayPairingPayloadException
 import com.finecat.pimobile.shared.gateway.GatewayRuntimeEvent
@@ -155,7 +156,6 @@ class AndroidSharedStateHolder(
     private var pendingNewSessionCwd: String? by mutableStateOf(null)
     /** 带图发送的本地预览条（仅 UI 层；正式回显到达前对话尾部的占位气泡）。 */
     internal var outgoingPreviews: List<OutgoingImagePreview> by mutableStateOf(emptyList())
-        private set
     private val outgoingPreviewTracker = OutgoingImagePreviewTracker()
     /** 实发 attachmentId 生成器：每次实发新分配（选图的 UUID 会被重复发送复用）。 */
     internal var nextOutgoingAttachmentId: () -> String = { "img-" + UUID.randomUUID().toString() }
@@ -196,10 +196,12 @@ class AndroidSharedStateHolder(
     private var activeWorktreeQuery: String? = null
     private var worktreeQuerySessionId: String? = null
     private var worktreeQueryCwd: String? = null
+    private var worktreeNativeIdentity: Triple<String, String, String>? = null
     private var worktreeSessionsLoadJob: Job? = null
     private var activeWorktreeSessionsLoad: String? = null
     private val continuedSessionCwds = mutableMapOf<String, String>()
-    internal val supportsWorktrees: Boolean get() = "worktree-v1" in gatewayState.capabilities
+    internal val supportsWorktrees: Boolean get() = "worktree-v1" in gatewayState.capabilities &&
+            (gatewayState.hostMode != "bridge" || "bridge-workspace-v1" in gatewayState.capabilities)
     internal val currentSessionDirectory: String? get() = snapshot.selectedSessionId?.let { id ->
         continuedSessionCwds[id] ?: snapshot.sessions.firstOrNull { it.id == id }?.cwd
     }
@@ -351,13 +353,70 @@ class AndroidSharedStateHolder(
     private val compactStartupWatchMillis = 8_000L
     private val compactSeenEvents = mutableSetOf<String>()
 
-    fun canStartManualCompact(): Boolean {
-        val sessionId = snapshot.selectedSessionId ?: return false
-        return supportsRequest("compact") &&
-            (gatewayState.connection == GatewayConnectionState.CONNECTED || compactGateForceOpenForTest) &&
-            sessionId !in compactPendingSessions &&
-            snapshot.sessionStates[sessionId]?.isCompacting != true &&
-            !selectedSessionRecalling() && !selectedSessionStopping()
+    /**
+     * 手动压缩被拦下时命中的第一个原因（REL120-01）。
+     * 按钮可用性与提示文案同源：`canStartManualCompact == (reason == null)`，
+     * 避免可点性与解释冲突；判定顺序即安全闸门顺序。
+     */
+    enum class ManualCompactBlocked {
+        /** 网关能力缺失（旧网关不发 compact，或桥接缺 bridge-context-v1）。 */
+        UNSUPPORTED,
+
+        /** 没有选中会话：压缩以会话为单位。 */
+        NO_SESSION,
+
+        /** 原生实例离线/无原生身份：桥接会话必须由在线实例执行压缩。 */
+        INSTANCE_OFFLINE,
+
+        /** 未连接网关（测试缝可强制打开）。 */
+        DISCONNECTED,
+
+        /** 压缩请求已发出、原生尚未报告压缩中：启动等待，不能与"正在压缩"混说。 */
+        COMPACT_STARTING,
+
+        /** 原生已在压缩中。 */
+        COMPACTING,
+
+        /** 正在撤回排队消息或停止运行。 */
+        RECALL_OR_STOP,
+    }
+
+    /**
+     * 压缩动作的实际目标会话：会话切换中的新选择优先，与可点性、执行闸门、
+     * 撤回/停止判据同源，避免"按钮按 A 判定、执行按 B 落地"。
+     */
+    private fun compactTargetSessionId(): String? = pendingSelectedSessionId ?: snapshot.selectedSessionId
+
+    fun manualCompactBlockedReason(): ManualCompactBlocked? {
+        if (!supportsRequest("compact")) return ManualCompactBlocked.UNSUPPORTED
+        val sessionId = compactTargetSessionId() ?: return ManualCompactBlocked.NO_SESSION
+        if (gatewayState.hostMode == "bridge") {
+            if ("bridge-context-v1" !in gatewayState.capabilities) return ManualCompactBlocked.UNSUPPORTED
+            if (graph?.gatewayRuntime?.bridgeIdentity(sessionId) == null) return ManualCompactBlocked.INSTANCE_OFFLINE
+            if (snapshot.sessions.firstOrNull { it.id == sessionId }?.isOnline == false) {
+                return ManualCompactBlocked.INSTANCE_OFFLINE
+            }
+        }
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED && !compactGateForceOpenForTest) {
+            return ManualCompactBlocked.DISCONNECTED
+        }
+        if (sessionId in compactPendingSessions) return ManualCompactBlocked.COMPACT_STARTING
+        if (snapshot.sessionStates[sessionId]?.isCompacting == true) return ManualCompactBlocked.COMPACTING
+        if (selectedSessionRecalling() || selectedSessionStopping()) return ManualCompactBlocked.RECALL_OR_STOP
+        return null
+    }
+
+    fun canStartManualCompact(): Boolean = manualCompactBlockedReason() == null
+
+    /** 阻塞原因的短文案：/compact、浮层禁用提示与执行闸门共用同一份文字。 */
+    fun manualCompactBlockedNotice(reason: ManualCompactBlocked): String = when (reason) {
+        ManualCompactBlocked.UNSUPPORTED -> "网关不支持手动压缩，请升级网关"
+        ManualCompactBlocked.NO_SESSION -> "请先选择或新建一个会话，再压缩上下文"
+        ManualCompactBlocked.INSTANCE_OFFLINE -> "原生 Pi 实例不在线，暂不能压缩"
+        ManualCompactBlocked.DISCONNECTED -> "尚未连接网关，请连接后再压缩"
+        ManualCompactBlocked.COMPACT_STARTING -> "压缩请求已发出，正在启动，请稍候"
+        ManualCompactBlocked.COMPACTING -> "正在压缩上下文，请稍候"
+        ManualCompactBlocked.RECALL_OR_STOP -> "正在撤回或停止，请稍后再压缩"
     }
 
     internal var compactGateForceOpenForTest: Boolean = false
@@ -427,7 +486,7 @@ class AndroidSharedStateHolder(
             stateRequestsAfterCompactionForTest.add(sessionId)
             return
         }
-        appGraph.gatewayScope.launch { appGraph.gatewayRuntime.requestState(sessionId) }
+        appGraph.gatewayScope.launch { appGraph.gatewayRuntime.requestState(sessionId, automaticRefresh = true) }
     }
 
     /** 测试缝（R2）：记录收尾后实际发出的 state 补拉目标（含无 graph 测试路径）。 */
@@ -464,11 +523,35 @@ class AndroidSharedStateHolder(
         private set
     private var commandsLoading = false
     val inputAssist = InputAssistState()
+    private var inputAssistNativeIdentity: Pair<String, String>? = null
+
+    private suspend fun nativeInputRequest(request: com.finecat.pimobile.shared.gateway.GatewayRequest): Pair<com.finecat.pimobile.shared.gateway.GatewayRequest?, String?> =
+        withContext(Dispatchers.Main.immediate) {
+            if (gatewayState.hostMode == null && "bridge" in gatewayState.capabilities) return@withContext null to "正在确认连接模式"
+            val sessionId = request.targetSessionId
+            if (gatewayState.hostMode != "bridge" || sessionId == null) return@withContext request to null
+            if ("bridge-input-v1" !in gatewayState.capabilities) return@withContext null to "请更新网关和桥接扩展"
+            if (snapshot.sessions.firstOrNull { it.id == request.targetSessionId }?.isOnline == false) return@withContext null to "原生 Pi 实例不在线"
+            val identity = graph?.gatewayRuntime?.bridgeIdentity(sessionId)
+                ?: return@withContext null to "请先打开在线的原生会话"
+            GatewayRequests.forBridgeInput(request, request.correlationId ?: java.util.UUID.randomUUID().toString(), identity.first, identity.second) to null
+        }
+
+    private fun sendInputAssist(request: com.finecat.pimobile.shared.gateway.GatewayRequest) {
+        val appGraph = graph ?: return
+        appGraph.gatewayScope.launch {
+            val (bound, error) = nativeInputRequest(request)
+            if (bound == null || !appGraph.gatewayRuntime.sendRequest(bound)) withContext(Dispatchers.Main.immediate) {
+                inputAssist.fail(request.requestType, request.correlationId, error ?: "加载失败，点击重试")
+            }
+        }
+    }
 
     fun setInputAssistContext(sessionId: String?, cwd: String?) {
         val next = InputAssistContext(sessionId, if (sessionId == null) cwd else null)
         if (inputAssist.context == next) return
         inputAssist.reset(next)
+        inputAssistNativeIdentity = if (gatewayState.hostMode == "bridge") next.sessionId?.let { graph?.gatewayRuntime?.bridgeIdentity(it) } else null
         refreshInputResources()
     }
 
@@ -477,7 +560,7 @@ class AndroidSharedStateHolder(
             "input-resources" !in gatewayState.capabilities
         ) return
         val request = inputAssist.resourcesRequest() ?: return
-        graph?.gatewayScope?.launch { graph.gatewayRuntime.sendRequest(request) }
+        sendInputAssist(request)
     }
 
     fun requestInputCompletions(token: String) {
@@ -485,7 +568,7 @@ class AndroidSharedStateHolder(
             "input-completions" !in gatewayState.capabilities
         ) return
         val request = inputAssist.completionsRequest(token) ?: return
-        graph?.gatewayScope?.launch { graph.gatewayRuntime.sendRequest(request) }
+        sendInputAssist(request)
     }
 
     var successfulMessageSendCount: Long by mutableLongStateOf(0L)
@@ -637,21 +720,26 @@ class AndroidSharedStateHolder(
                                 if (!isStreamingChunk) {
                                     if (event.frame.kind == "sent") {
                                         event.frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
-                                            handleSentSession(appGraph, sessionId)
+                                            handleSentSession(appGraph, sessionId, event.bridgeSubscriptionStamp)
                                         }
                                     }
                                     // sent 帧的预览收敛统一在 handleWorkspaceFrame
                                     //（acceptFrame 的 afterPublish 会调用它，与 wire 注入同路径，
                                     // 均在 Main 执行）；user 回显同样走 afterPublish（见上）。
-                                    // turn/end 后排队消息可能已被消费（steer 本轮消化、
-                                    // followUp 转正式消息）：拉一次 state 刷新吸附显示。
+                                    // 桥接不暴露 queue_update；user 回显说明开始消费输入，
+                                    // 补拉真实 pending，不能把提交回执当作队列已执行。
+                                    // turn/end 仍走既有收尾补拉；这里不重复 sent 后的 state。
                                     if (event.frame.kind == "event" &&
-                                        event.normalizedEvents.any { it.event.type == "turn/end" }
+                                        event.normalizedEvents.any {
+                                            it.event.type == "turn/end" ||
+                                                (it.event.type == "user/message" &&
+                                                    appGraph.gatewayRuntime.state.value.hostMode == "bridge")
+                                        }
                                     ) {
                                         event.frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
                                             // 不在 collector 里直调：requestState 要拿 runtime 锁，
                                             // 生产者持锁等队列空间时即死锁。fire-and-forget 只管刷新。
-                                            launch { appGraph.gatewayRuntime.requestState(sessionId) }
+                                            launch { appGraph.gatewayRuntime.requestState(sessionId, automaticRefresh = true) }
                                         }
                                     }
                                 }
@@ -663,8 +751,12 @@ class AndroidSharedStateHolder(
                             is GatewayRuntimeEvent.RequestCancelled -> {
                                 withContext(Dispatchers.Main.immediate) {
                                     finishBranchDraftRequest(event.requestType, event.targetSessionId)
-                                    if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
+                                    if (event.requestType == "abort") finishAbortRequest(event.targetSessionId, event.correlationId, resultUnknown = true)
                                     if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
+                                    if (event.requestType == "bridge-start") {
+                                        event.targetSessionId?.let { bridgeStartsInFlight.remove(it) }
+                                        platformError = "启动结果未知，请刷新在线状态"
+                                    }
                                     if (event.requestType == "compact") {
                                         finishManualCompactRequest(event.requestType, event.targetSessionId, "压缩请求未确认，请重连后核对")
                                     }
@@ -672,6 +764,7 @@ class AndroidSharedStateHolder(
                                     handleWorkspaceRequestCancelled(event)
                                     finishModelCatalogFailure(event.requestType, "模型加载已中断，请重试")
                                     inputAssist.fail(event.requestType, event.correlationId, "加载已中断")
+                                    if (event.requestType == "commands") { commandsLoading = false; slashCommands = null }
                                     failSessionName(event.requestType, event.targetSessionId, "保存未确认，请重新打开核对")
                                     if (event.requestType == "ping" && pingStarted != null &&
                                         (event.correlationId == null || event.correlationId == activePingId)) finishPing(
@@ -725,10 +818,17 @@ class AndroidSharedStateHolder(
                                 }
                             }
                             is GatewayRuntimeEvent.RequestTimedOut -> {
+                                if (event.requestType == "refresh-model") withContext(Dispatchers.Main.immediate) {
+                                    showTransientNotice("配置已保存，原生模型刷新未确认")
+                                }
                                 withContext(Dispatchers.Main.immediate) { finishWorktreeRequest(event.requestType, event.correlationId, unconfirmed = true) }
                                 withContext(Dispatchers.Main.immediate) {
                                     finishBranchDraftRequest(event.requestType, event.targetSessionId)
-                                    if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
+                                    if (event.requestType == "bridge-start") {
+                                        event.targetSessionId?.let { bridgeStartsInFlight.remove(it) }
+                                        platformError = "启动结果未知，请刷新在线状态"
+                                    }
+                                    if (event.requestType == "abort") finishAbortRequest(event.targetSessionId, event.correlationId, resultUnknown = true)
                                     if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
                                     if (event.requestType == "compact") {
                                         finishManualCompactRequest(event.requestType, event.targetSessionId, "压缩请求未确认，请重连后核对")
@@ -737,6 +837,10 @@ class AndroidSharedStateHolder(
                                         if (event.requestType == "directories") "请求超时，请重试"
                                         else "创建未确认，请重新打开核对"
                                     finishModelCatalogFailure(event.requestType, "请求超时，请重试")
+                                    if (event.requestType == "set-model") {
+                                        showTransientNotice("切换结果未确认，请重新打开核对")
+                                        refreshSessionControls()
+                                    }
                                     inputAssist.fail(event.requestType, event.correlationId, "请求超时，请重试")
                                     failSessionName(event.requestType, event.targetSessionId, "保存未确认，请重新打开核对")
                                     if (event.requestType == "ping" && pingStarted != null &&
@@ -784,12 +888,35 @@ class AndroidSharedStateHolder(
                             }
                             is GatewayRuntimeEvent.RequestRejected -> {
                                 withContext(Dispatchers.Main.immediate) {
+                                    // 错配回执不结束发送；等匹配回执或超时，不诱导用户重复发送。
+                                    if (isNonterminalMessageProtocolRejection(event)) return@withContext
+                                    if (isPassiveRecoveryRejection(event)) return@withContext
+                                    if (event.reason == "worktree-trust-required" && event.requestType in setOf("set-model", "label-put", "switch-branch", "name")) {
+                                        val id = event.targetSessionId
+                                        val cwd = snapshot.sessions.firstOrNull { it.id == id }?.cwd
+                                        if (id != null && cwd != null && snapshot.selectedSessionId == id) {
+                                            worktreeUi = WorktreeUiState(open = true, sourceSessionId = id, sourceCwd = cwd,
+                                                targetPath = cwd, navigationEpoch = composerNavigationEpoch, mode = WorktreeMode.NEW,
+                                                action = "resume", phase = WorktreePhase.TRUST, operationId = UUID.randomUUID().toString())
+                                        }
+                                    }
                                     if (event.requestType.startsWith("worktree-")) {
                                         rejectWorktreeRequest(event.requestType, event.correlationId, event.reason)
                                         return@withContext
                                     }
                                     finishBranchDraftRequest(event.requestType, event.targetSessionId)
-                                    if (event.requestType == "abort") finishStoppingSession(event.targetSessionId)
+                                    if (event.requestType == "bridge-start") {
+                                        event.targetSessionId?.let { bridgeStartsInFlight.remove(it) }
+                                        platformError = GatewayErrorText.request("bridge-start", event.reason)
+                                    }
+                                    if (event.requestType == "abort") {
+                                        finishAbortRequest(
+                                            event.targetSessionId,
+                                            event.correlationId,
+                                            event.queuedText,
+                                            event.queuedDisposition,
+                                        )
+                                    }
                                     if (event.requestType == "dequeue") finishQueueRecall(event.targetSessionId, event.correlationId)
                                     if (event.requestType == "compact") {
                                         // 压缩请求被拒/启动失败（如未选模型）：收尾本地等待并给
@@ -798,6 +925,22 @@ class AndroidSharedStateHolder(
                                             event.requestType, event.targetSessionId,
                                             GatewayErrorText.request("compact", event.reason)
                                         )
+                                        return@withContext
+                                    }
+                                    if (event.requestType == "host-mode" || event.requestType == "host-mode-put") {
+                                        // 切换被拒（运行中/有队列）是常规动作结果，不进全局错误面。
+                                        showTransientNotice(
+                                            GatewayErrorText.request(event.requestType, event.reason)
+                                        )
+                                        return@withContext
+                                    }
+                                    if (event.requestType == "refresh-model" && !event.serverResponse) {
+                                        showTransientNotice("配置已保存，" + GatewayErrorText.request(event.requestType, event.reason))
+                                        return@withContext
+                                    }
+                                    if (event.requestType == "set-model") {
+                                        showTransientNotice(GatewayErrorText.request("set-model", event.reason))
+                                        refreshSessionControls()
                                         return@withContext
                                     }
                                     if (event.requestType == "models") {
@@ -996,6 +1139,7 @@ class AndroidSharedStateHolder(
         prepareComposerForNavigation(sessionId)
         if (sessionId != snapshot.selectedSessionId) clearTreeActions()
         sessionControlsRefresh.reset()
+        worktreeNativeIdentity = null
         graph?.diagnostics?.intent(GatewayDiagnosticAction.SELECT_SESSION, hasSession = true)
         pendingSelectedSessionId = sessionId
         pendingModelSelection = null
@@ -1061,7 +1205,7 @@ class AndroidSharedStateHolder(
                 appGraph.gatewayRuntime.subscribe(null)
                 // 新建页的模型菜单依赖模型目录；home 阶段没拉到就补一次。
                 if (snapshot.modelCatalog == null && supportsRequest("models")) {
-                    appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+                    modelCatalogRequest()?.let { appGraph.gatewayRuntime.sendRequest(it) }
                 }
             }
         }
@@ -1286,7 +1430,7 @@ class AndroidSharedStateHolder(
             return
         }
         val ui = worktreeUi
-        if (ui.action !in setOf("select", "open")) { retryWorktreeContinue(trustProject = true); return }
+        if (ui.action !in setOf("select", "open", "resume")) { retryWorktreeContinue(trustProject = true); return }
         val id = ui.operationId ?: return
         val path = ui.targetPath ?: return
         worktreeUi = ui.copy(phase = WorktreePhase.SWITCHING, error = null)
@@ -1307,8 +1451,29 @@ class AndroidSharedStateHolder(
         }
     }
 
-    private fun sendWorktreeRequest(request: com.finecat.pimobile.shared.gateway.GatewayRequest) {
+    internal fun nativeWorktreeRequest(request: com.finecat.pimobile.shared.gateway.GatewayRequest): com.finecat.pimobile.shared.gateway.GatewayRequest? {
+        if (gatewayState.hostMode == null && "bridge" in gatewayState.capabilities) return null
+        if (gatewayState.hostMode != "bridge") return request
+        if ("bridge-workspace-v1" !in gatewayState.capabilities) return null
+        val id = request.targetSessionId ?: return request // 目录信任/日志查询不访问原生会话。
+        val identity = graph?.gatewayRuntime?.bridgeIdentity(id) ?: return null
+        val token = request.correlationId ?: return null
+        return when (request.requestType) {
+            "worktree-list" -> GatewayRequests.forBridgeInput(request, token, identity.first, identity.second)
+            "worktree-continue" -> GatewayRequests.forBridgeSession(request, token, identity.first, identity.second)
+            else -> request
+        }
+    }
+
+    private fun sendWorktreeRequest(original: com.finecat.pimobile.shared.gateway.GatewayRequest) {
         val appGraph = graph ?: return
+        val request = nativeWorktreeRequest(original)
+        if (request == null) {
+            finishWorktreeRequest(original.requestType, original.correlationId, false)
+            if (original.requestType in setOf("worktree-list", "worktree-continue"))
+                worktreeUi = worktreeUi.copy(error = "无法确认原生 Pi 状态，请刷新后重试")
+            return
+        }
         val epoch = gatewayUiEpoch
         val uiAtSend = worktreeUi
         appGraph.gatewayScope.launch {
@@ -1322,6 +1487,14 @@ class AndroidSharedStateHolder(
                 appGraph.preferences.updateFields { it.copy(worktreePendingJson = worktreePendingJson(uiAtSend, worktreeHostKey(token))) }
             }
             if (epoch != gatewayUiEpoch) return@launch
+            if (request.targetInstanceId != null && request.targetSessionId?.let(appGraph.gatewayRuntime::bridgeIdentity) !=
+                (request.targetInstanceId to request.targetEpoch)) {
+                withContext(Dispatchers.Main.immediate) {
+                    finishWorktreeRequest(request.requestType, request.correlationId, false)
+                    worktreeUi = worktreeUi.copy(error = "原生会话已变化，请刷新后重试")
+                }
+                return@launch
+            }
             val sent = appGraph.gatewayRuntime.sendRequest(request)
             if (!sent) withContext(Dispatchers.Main.immediate) {
                 if (epoch == gatewayUiEpoch) finishWorktreeRequest(request.requestType, request.correlationId, unconfirmed = false)
@@ -1408,6 +1581,16 @@ class AndroidSharedStateHolder(
         if (frame.kind == "error" && frame.requestType?.startsWith("worktree-") == true) {
             rejectWorktreeRequest(frame.requestType.orEmpty(), frame.operationId, frame.code.orEmpty())
             return
+        }
+        if (frame.kind == "worktree-trust" && ui.action == "resume") {
+            if (frame.cwd?.trimEnd('/') != ui.targetPath?.trimEnd('/')) {
+                rejectWorktreeRequest("worktree-trust", ui.operationId, "invalid-worktree-response")
+                return
+            }
+            worktreeUi = ui.copy(open = false, operationId = null, action = null)
+            if (ui.sourceSessionId == snapshot.selectedSessionId && ui.navigationEpoch == composerNavigationEpoch)
+                showTransientNotice("目录已信任，请重试刚才的操作")
+            return // 信任确认只记目录，不自动发送或移动旧会话。
         }
         if (frame.kind == "worktree-trust" && ui.action == "open") {
             if (frame.cwd?.startsWith('/') != true || frame.cwd?.trimEnd('/') != ui.targetPath?.trimEnd('/')) { rejectWorktreeRequest("worktree-trust", ui.operationId, "invalid-worktree-response"); return }
@@ -1816,7 +1999,7 @@ class AndroidSharedStateHolder(
             appGraph.gatewayRuntime.requestSessions()
             // 旧网关不宣告 models 时不发必败请求（supportsRequest 对空 capabilities 放行）。
             if (supportsRequest("models")) {
-                appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+                modelCatalogRequest()?.let { appGraph.gatewayRuntime.sendRequest(it) }
             }
             if (supportsRequest("providers")) {
                 loadProviders()
@@ -1831,16 +2014,65 @@ class AndroidSharedStateHolder(
      * 一直看到旧值（provider 页因为每次进设置都重拉，所以那边同步正常，用户实测
      * 就是这个不对称）。网关读前有 (mtime,size) 门控，文件没变只花一次 statSync。
      */
+    private suspend fun modelCatalogRequest(): com.finecat.pimobile.shared.gateway.GatewayRequest? =
+        withContext(Dispatchers.Main.immediate) {
+            val current = graph?.gatewayRuntime?.state?.value ?: gatewayState
+            if (current.hostMode == null && "bridge" in current.capabilities) return@withContext null
+            if (current.hostMode != "bridge") return@withContext GatewayRequests.models()
+            val sessionId = snapshot.selectedSessionId
+            val identity = sessionId?.let { graph?.gatewayRuntime?.bridgeIdentity(it) }
+            val online = sessionId != null && identity != null && snapshot.sessions.firstOrNull { it.id == sessionId }?.isOnline != false
+            if (!online) {
+                if ("bridge-offline-controls-v1" !in current.capabilities) {
+                    modelCatalogError = "请更新网关后选择模型"
+                    return@withContext null
+                }
+                return@withContext GatewayRequests.forNativeRead(GatewayRequests.models(sessionId), UUID.randomUUID().toString())
+            }
+            if ("bridge-model-controls-v1" !in current.capabilities) {
+                modelCatalogError = "请更新网关和桥接扩展"
+                return@withContext null
+            }
+            GatewayRequests.models(sessionId, UUID.randomUUID().toString(), identity!!.first, identity.second)
+        }
+
+    private var modelCatalogLoadingSessionId: String? = null
+
+    private fun refreshSelectedNativeModel() {
+        val appGraph = graph ?: return
+        val sessionId = snapshot.selectedSessionId ?: return // 新原生启动自行读取配置。
+        if (gatewayState.hostMode != "bridge" || "bridge-model-refresh-v1" !in gatewayState.capabilities) {
+            showTransientNotice("配置已保存，请更新网关和桥接扩展后应用")
+            return
+        }
+        val binding = appGraph.gatewayRuntime.bridgeIdentity(sessionId)
+        if (binding == null || snapshot.sessions.firstOrNull { it.id == sessionId }?.isOnline == false) {
+            showTransientNotice("配置已保存，原生 Pi 上线后再应用")
+            return
+        }
+        val request = GatewayRequests.refreshNativeModel(sessionId, UUID.randomUUID().toString(), binding.first, binding.second)
+        appGraph.gatewayScope.launch {
+            appGraph.gatewayRuntime.sendRequest(request)
+        }
+    }
+
     fun refreshModelCatalog() {
         val appGraph = graph ?: return
         if (gatewayState.connection != GatewayConnectionState.CONNECTED || !supportsRequest("models")) return
+        if (gatewayState.hostMode == "bridge" && modelCatalogLoadingSessionId != snapshot.selectedSessionId) modelCatalogIsLoading = false
         if (modelCatalogIsLoading) return
+        modelCatalogLoadingSessionId = snapshot.selectedSessionId
         modelCatalogIsLoading = true
         modelCatalogError = null
         appGraph.gatewayScope.launch {
-            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+            val request = modelCatalogRequest()
+            if (request == null) {
+                withContext(Dispatchers.Main.immediate) { modelCatalogIsLoading = false }
+                return@launch
+            }
+            val accepted = appGraph.gatewayRuntime.sendRequest(request)
             if (!accepted) withContext(Dispatchers.Main.immediate) {
-                finishModelCatalogFailure("models", GatewayErrorText.request("models", "send-failed"))
+                finishModelCatalogFailure("models", modelCatalogError ?: GatewayErrorText.request("models", "send-failed"))
             }
         }
     }
@@ -2087,7 +2319,7 @@ class AndroidSharedStateHolder(
                 providerTestResult = outcome
                 if (supportsRequest("providers")) loadProviders()
                 if (supportsRequest("models")) appGraph.gatewayScope.launch {
-                    appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+                    modelCatalogRequest()?.let { appGraph.gatewayRuntime.sendRequest(it) }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -2135,6 +2367,20 @@ class AndroidSharedStateHolder(
         }
     }
 
+    // 过期帧没有对应用户动作；诊断已在collector入口记下，不能变成“操作失败”。
+    internal fun isPassiveRecoveryRejection(event: GatewayRuntimeEvent.RequestRejected): Boolean = when {
+        event.automaticRefresh && event.requestType in setOf("state", "sessions", "subscribe", "unsubscribe", "host-mode") -> true
+        event.serverResponse -> false
+        event.requestType in setOf("transport", "gateway") ->
+            event.reason in setOf("stale-frame", "no-active-request", "session-mismatch")
+        // 这些是无活动请求的响应类型，不是message/abort等用户动作的拒绝。
+        event.reason == "no-active-request" -> event.requestType in setOf(
+            "state", "sessions", "subscribed", "unsubscribed", "sent", "aborted", "dequeued",
+            "model-scope-saved", "provider-test-result", "bridge-started", "operation-status",
+        )
+        else -> false
+    }
+
     /** lane 挡回、瞬时未连接属于可自愈的预期内失败：给一条提示即可，不要弹"重新连接"模态窗。 */
     private fun isBenignRejection(reason: String?): Boolean =
         reason == "request-busy" || reason == "request-coalesced" || reason == "not-connected"
@@ -2143,7 +2389,11 @@ class AndroidSharedStateHolder(
     private fun switchBranchRejectionText(code: String?): String? = when (code) {
         "bad-request" -> SWITCH_REJECT_NOTICE
         "session-not-found" -> "会话已不可用，切换分支失败"
-        "internal" -> "节点跳转失败，请重试"
+        "internal", "navigation-failed" -> "节点跳转失败，请重试"
+        "navigation-cancelled" -> "已取消节点跳转"
+        "navigation-unconfirmed" -> "跳转结果未确认，请刷新会话树"
+        "busy" -> "请先停止当前任务再跳转"
+        "bridge-offline", "bridge-stale-runtime" -> "原生会话已变化，请刷新"
         else -> null
     }
 
@@ -2222,6 +2472,22 @@ class AndroidSharedStateHolder(
     fun supportsRequest(kind: String): Boolean {
         val capabilities = gatewayState.capabilities
         return capabilities.isEmpty() || kind in capabilities
+    }
+
+    /**
+     * 切换网关宿主连接模式（PROTOCOL §4.30）。拒绝（运行中/有待消费队列）
+     * 由 RequestRejected 统一收尾成瞬态提示，不在本地猜成功。
+     */
+    fun setHostMode(mode: String) {
+        val appGraph = graph ?: return
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED) return
+        if ("host-mode" !in gatewayState.capabilities) return
+        appGraph.gatewayScope.launch {
+            val accepted = appGraph.gatewayRuntime.setHostMode(mode)
+            if (!accepted) withContext(Dispatchers.Main.immediate) {
+                showTransientNotice("模式切换未能发送")
+            }
+        }
     }
 
     fun pingGateway() {
@@ -2316,23 +2582,10 @@ class AndroidSharedStateHolder(
                 // C07：/compact 引导直达真实动作（CTX02 接线）。压缩会中止当前
                 // 回答（浮层按钮上方有说明行）；不满足条件时按原因分支给文案（M2），
                 // 只有圆环路径确实可用时才指过去。
-                if (snapshot.selectedSessionId == null) {
-                    showTransientNotice("请先选择或新建一个会话，再压缩上下文")
-                } else if (canStartManualCompact()) {
-                    startManualCompact()
-                } else if (selectedSessionCompacting() ||
-                    snapshot.selectedSessionId in compactPendingSessions
-                ) {
-                    showTransientNotice("正在压缩上下文，请稍候")
-                } else if (gatewayState.connection != GatewayConnectionState.CONNECTED) {
-                    showTransientNotice("尚未连接网关，请连接后再压缩")
-                } else if (!supportsRequest("compact")) {
-                    showTransientNotice("网关不支持手动压缩，请升级网关")
-                } else if (selectedSessionRecalling() || selectedSessionStopping()) {
-                    showTransientNotice("正在撤回或停止，请稍后再压缩")
-                } else {
-                    showTransientNotice("请点上下文占用圆环，从详情里压缩")
-                }
+                // 与按钮可用性、执行闸门同源（REL120-01）：原因与实际目标会话一致，
+                // 文案也共用同一份短句，不在这里另写推断。
+                val blocked = manualCompactBlockedReason()
+                if (blocked == null) startManualCompact() else showTransientNotice(manualCompactBlockedNotice(blocked))
                 messageDraft = ""
                 return SlashCommandOutcome.CONSUMED
             }
@@ -2367,14 +2620,34 @@ class AndroidSharedStateHolder(
      *  旧网关无此能力时静默跳过（slashCommands 保持 null，联想入口隐藏）。 */
     fun refreshSlashCommands(sessionId: String) {
         if (commandsLoading) return
+        if (gatewayState.hostMode == null && "bridge" in gatewayState.capabilities) return
         if (!supportsRequest("commands")) return
         val appGraph = graph ?: return
         if (gatewayState.connection != GatewayConnectionState.CONNECTED) return
         commandsLoading = true
         appGraph.gatewayScope.launch {
-            appGraph.gatewayRuntime.sendRequest(GatewayRequests.commands(sessionId))
+            val (request, _) = nativeInputRequest(GatewayRequests.commands(sessionId))
+            if (request == null || !appGraph.gatewayRuntime.sendRequest(request)) withContext(Dispatchers.Main.immediate) {
+                commandsLoading = false
+            }
         }
     }
+
+    private suspend fun nativeTreeRequest(request: com.finecat.pimobile.shared.gateway.GatewayRequest): Pair<com.finecat.pimobile.shared.gateway.GatewayRequest?, String?> =
+        withContext(Dispatchers.Main.immediate) {
+            if (gatewayState.hostMode != "bridge") return@withContext request to null
+            val sessionId = request.targetSessionId
+            if ("bridge-tree-controls-v1" !in gatewayState.capabilities) return@withContext null to "请更新网关和桥接扩展"
+            val identity = sessionId?.let { graph?.gatewayRuntime?.bridgeIdentity(it) }
+            val offline = identity == null || snapshot.sessions.firstOrNull { it.id == sessionId }?.isOnline == false
+            if (offline) {
+                if ("bridge-offline-controls-v1" !in gatewayState.capabilities) return@withContext null to "请更新网关后使用会话树"
+                val id = UUID.randomUUID().toString()
+                return@withContext (if (request.requestType in setOf("tree", "entry-copy")) GatewayRequests.forNativeRead(request, id)
+                    else GatewayRequests.forNativeResume(request, id)) to null
+            }
+            GatewayRequests.forBridgeSession(request, UUID.randomUUID().toString(), identity!!.first, identity.second) to null
+        }
 
     /** 拉取会话分支树（PROTOCOL §4.18；树页进入/切换后刷新）。 */
     var treeViewOptions: com.finecat.pimobile.shared.protocol.GatewayTreeView? by mutableStateOf(null)
@@ -2401,7 +2674,11 @@ class AndroidSharedStateHolder(
         treeViewSessionId = sessionId
         val requestedView = treeViewOptions
         appGraph.gatewayScope.launch {
-            appGraph.gatewayRuntime.sendRequest(GatewayRequests.tree(sessionId, requestedView))
+            val (request, requestError) = nativeTreeRequest(GatewayRequests.tree(sessionId, requestedView))
+            if (request == null || !appGraph.gatewayRuntime.sendRequest(request)) withContext(Dispatchers.Main.immediate) {
+                treeLoading = false
+                treeError = requestError ?: "会话树暂不可用，请重试"
+            }
         }
     }
 
@@ -2442,9 +2719,11 @@ class AndroidSharedStateHolder(
         branchNavigation = navigation
         val appGraph = graph ?: return
         appGraph.gatewayScope.launch {
-            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.switchBranch(sessionId, entryId))
+            val (request, requestError) = nativeTreeRequest(GatewayRequests.switchBranch(sessionId, entryId))
+            val accepted = request != null && appGraph.gatewayRuntime.sendRequest(request)
             if (!accepted) withContext(Dispatchers.Main.immediate) {
                 if (branchNavigation === navigation) branchNavigation = null
+                if (requestError != null) showTransientNotice(requestError)
             }
         }
     }
@@ -2505,7 +2784,7 @@ class AndroidSharedStateHolder(
      *  与 tree-view-v1 同口径，不沿用 supportsRequest 的“能力表为空即支持”放宽：
      *  旧网关上直接隐藏入口，而不是点了再报 unknown-command。 */
     val treeActionsSupported: Boolean
-        get() = "tree-actions-v1" in gatewayState.capabilities
+        get() = "tree-actions-v1" in gatewayState.capabilities && (gatewayState.hostMode != "bridge" || "bridge-tree-controls-v1" in gatewayState.capabilities)
 
     internal fun beginTreeCopyRequest(sessionId: String, entryId: String) {
         check(pendingTreeCopy == null)
@@ -2540,11 +2819,12 @@ class AndroidSharedStateHolder(
                         epoch == gatewayUiEpoch && pendingTreeCopy === pending && snapshot.selectedSessionId == sessionId
                     }
                     if (!current) return@launch
-                    val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.entryCopy(sessionId, entryId))
+                    val (request, requestError) = nativeTreeRequest(GatewayRequests.entryCopy(sessionId, entryId))
+                    val accepted = request != null && appGraph.gatewayRuntime.sendRequest(request)
                     if (!accepted) {
                         withContext(Dispatchers.Main.immediate) {
                             if (epoch == gatewayUiEpoch && pendingTreeCopy === pending) {
-                                finishTreeCopy(sessionId, entryId, TreeCopyOutcome.Failed("复制请求未发出，请重试"))
+                                finishTreeCopy(sessionId, entryId, TreeCopyOutcome.Failed(requestError ?: "复制请求未发出，请重试"))
                             }
                         }
                     }
@@ -2583,13 +2863,12 @@ class AndroidSharedStateHolder(
                         epoch == gatewayUiEpoch && pendingTreeLabel === pending && snapshot.selectedSessionId == sessionId
                     }
                     if (!current) return@launch
-                    val accepted = appGraph.gatewayRuntime.sendRequest(
-                        GatewayRequests.labelPut(sessionId, entryId, normalized)
-                    )
+                    val (request, requestError) = nativeTreeRequest(GatewayRequests.labelPut(sessionId, entryId, normalized))
+                    val accepted = request != null && appGraph.gatewayRuntime.sendRequest(request)
                     if (!accepted) {
                         withContext(Dispatchers.Main.immediate) {
                             if (epoch == gatewayUiEpoch && pendingTreeLabel === pending) {
-                                finishTreeLabel(sessionId, entryId, "标签请求未发出，请重试")
+                                finishTreeLabel(sessionId, entryId, requestError ?: "标签请求未发出，请重试")
                             }
                         }
                     }
@@ -2668,9 +2947,9 @@ class AndroidSharedStateHolder(
         }
         graph?.let { appGraph ->
             appGraph.gatewayScope.launch {
-                appGraph.gatewayRuntime.sendRequest(
-                    GatewayRequests.setSessionName(sessionId, name.take(200))
-                )
+                val (request, requestError) = nativeTreeRequest(GatewayRequests.setSessionName(sessionId, name.take(200)))
+                if (request != null) appGraph.gatewayRuntime.sendRequest(request)
+                else withContext(Dispatchers.Main.immediate) { requestError?.let { showTransientNotice(it) } }
             }
         }
     }
@@ -2689,9 +2968,10 @@ class AndroidSharedStateHolder(
         val pending = PendingSessionName(sessionId, name.trim().take(200), onResult)
         pendingSessionName = pending
         appGraph.gatewayScope.launch {
-            if (!appGraph.gatewayRuntime.sendRequest(GatewayRequests.setSessionName(sessionId, pending.name))) {
+            val (request, requestError) = nativeTreeRequest(GatewayRequests.setSessionName(sessionId, pending.name))
+            if (request == null || !appGraph.gatewayRuntime.sendRequest(request)) {
                 withContext(Dispatchers.Main.immediate) {
-                    if (pendingSessionName === pending) finishSessionName("改名请求未受理，请重试")
+                    if (pendingSessionName === pending) finishSessionName(requestError ?: "改名请求未受理，请重试")
                 }
             }
         }
@@ -2700,31 +2980,18 @@ class AndroidSharedStateHolder(
     /** 圆环主入口。compact-started只表示受理，结束仍以Pi事件和最终state为准。
      *  请求身份保护迟到续体；压缩不清除当前草稿或附件。 */
     fun startManualCompact() {
-        val sessionId = snapshot.selectedSessionId
-        if (sessionId == null) {
-            showTransientNotice("当前没有选中的会话")
+        // 执行闸门与可点性/文案同源（REL120-01）：命中的原因直接给出同一句提示，
+        // 判定目标也统一取 compactTargetSessionId()，不另写一套条件。
+        val blocked = manualCompactBlockedReason()
+        if (blocked != null) {
+            showTransientNotice(manualCompactBlockedNotice(blocked))
             return
         }
-        if (!supportsRequest("compact")) {
-            showTransientNotice("网关不支持手动压缩，请升级网关")
-            return
-        }
-        if (gatewayState.connection != GatewayConnectionState.CONNECTED && !compactGateForceOpenForTest) {
-            showTransientNotice("尚未连接网关，请连接后重试")
-            return
-        }
-        if (sessionId in compactPendingSessions) {
-            showTransientNotice("压缩请求已发出，请稍候")
-            return
-        }
-        if (selectedSessionCompacting()) {
-            showTransientNotice("正在压缩上下文，请稍候")
-            return
-        }
-        if (selectedSessionRecalling() || selectedSessionStopping()) {
-            showTransientNotice("正在撤回或停止，请稍候")
-            return
-        }
+        val sessionId = requireNotNull(compactTargetSessionId())
+        val bridge = gatewayState.hostMode == "bridge"
+        // 闸门已保证桥接会话有原生身份；这里再取一次作为在途请求的代际绑定。
+        val binding = if (bridge) graph?.gatewayRuntime?.bridgeIdentity(sessionId) else null
+        val operationId = if (bridge) java.util.UUID.randomUUID().toString() else null
         val pending = PendingCompact()
         compactPendingSessions[sessionId] = pending
         val appGraph = graph ?: run {
@@ -2735,10 +3002,18 @@ class AndroidSharedStateHolder(
         val epoch = gatewayUiEpoch
         pending.send = appGraph.gatewayScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             val current = withContext(Dispatchers.Main.immediate) {
-                gatewayUiEpoch == epoch && compactPendingSessions[sessionId] === pending
+                gatewayUiEpoch == epoch && compactPendingSessions[sessionId] === pending &&
+                    (!bridge || appGraph.gatewayRuntime.bridgeIdentity(sessionId) == binding)
             }
-            if (!current) return@launch
-            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.compact(sessionId))
+            if (!current) {
+                withContext(Dispatchers.Main.immediate) {
+                    if (compactPendingSessions[sessionId] === pending) finishCompactPending(
+                        sessionId, if (bridge) "原生 Pi 已更新，请重试" else "会话状态已变化，请重试"
+                    )
+                }
+                return@launch
+            }
+            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.compact(sessionId, operationId, binding?.first, binding?.second))
             withContext(Dispatchers.Main.immediate) {
                 if (gatewayUiEpoch != epoch || compactPendingSessions[sessionId] !== pending) return@withContext
                 if (!accepted) {
@@ -2763,12 +3038,20 @@ class AndroidSharedStateHolder(
             return
         }
         graph?.let { appGraph ->
-            appGraph.gatewayScope.launch {
-                val accepted = appGraph.gatewayRuntime.sendRequest(
-                    GatewayRequests.setModel(sessionId, provider, modelId, thinkingLevel)
-                )
-                if (accepted) refreshSessionControls()
+            val bridge = gatewayState.hostMode == "bridge"
+            val identity = if (bridge) appGraph.gatewayRuntime.bridgeIdentity(sessionId) else null
+            val offline = bridge && (identity == null || snapshot.sessions.firstOrNull { it.id == sessionId }?.isOnline == false)
+            if (bridge && ("bridge-model-controls-v1" !in gatewayState.capabilities ||
+                (offline && "bridge-offline-controls-v1" !in gatewayState.capabilities))) {
+                showTransientNotice("请更新网关后选择模型")
+                return
             }
+            val id = UUID.randomUUID().toString()
+            val request = if (offline) GatewayRequests.forNativeResume(
+                GatewayRequests.setModel(sessionId, provider, modelId, thinkingLevel), id)
+            else GatewayRequests.setModel(sessionId, provider, modelId, thinkingLevel,
+                operationId = if (bridge) id else null, instanceId = identity?.first, epoch = identity?.second)
+            appGraph.gatewayScope.launch { appGraph.gatewayRuntime.sendRequest(request) }
         }
     }
 
@@ -2781,18 +3064,29 @@ class AndroidSharedStateHolder(
         }
     }
 
-    private suspend fun handleSentSession(appGraph: AndroidAppGraph, sessionId: String) {
-        appGraph.gatewayRuntime.subscribe(sessionId)
-        appGraph.gatewayRuntime.requestSessions()
-        requestSessionControls(appGraph, sessionId)
+    internal fun shouldFollowSentSession(sessionId: String): Boolean =
+        (pendingSelectedSessionId ?: snapshot.selectedSessionId) == sessionId
+
+    private fun handleSentSession(appGraph: AndroidAppGraph, sessionId: String, bridgeSubscriptionStamp: GatewayBridgeSubscriptionStamp?) {
+        // 唯一事件消费者不能等Runtime锁：入站生产者可能持锁等待有界队列空位。
+        appGraph.gatewayScope.launch {
+            withContext(Dispatchers.Main.immediate) {
+                appGraph.gatewayRuntime.requestSessions(automaticRefresh = true)
+                // 选择检查与subscribe入锁都在Main发起，迟到ACK不能改写用户的新订阅目标。
+                if (!shouldFollowSentSession(sessionId)) return@withContext
+                appGraph.gatewayRuntime.subscribe(sessionId, serverSubscriptionStamp = bridgeSubscriptionStamp, automaticRefresh = true)
+                if (shouldFollowSentSession(sessionId)) requestSessionControls(appGraph, sessionId)
+            }
+        }
     }
 
     private suspend fun requestSessionControls(appGraph: AndroidAppGraph, sessionId: String) {
         // pi 网关：模型/档位/上下文占用统一由 state 帧返回，无需额外的 sessionControl 流。
-        appGraph.gatewayRuntime.requestState(sessionId)
+        appGraph.gatewayRuntime.requestState(sessionId, automaticRefresh = true)
     }
 
     fun reset() {
+        worktreeNativeIdentity = null
         prepareComposerForNavigation(null, newPage = true)
         clearTreeActions()
         sessionControlsRefresh.reset()
@@ -2803,6 +3097,7 @@ class AndroidSharedStateHolder(
         outgoingPreviewTracker.clearAll()
         pendingExistingSessionTexts.clear()
         pendingComposerSends.clear()
+        bridgeStartsInFlight.clear()
         outgoingDraftRevisions.clear()
         stoppingSessionId = null
         pendingQueueRecall = null
@@ -2823,6 +3118,7 @@ class AndroidSharedStateHolder(
         cancelWorktreeSessionsLoad()
         worktreeUi = WorktreeUiState()
         worktreeLocation = null
+        worktreeNativeIdentity = null
         activeWorktreeQuery = null
         continuedSessionCwds.clear()
         sessionDrafts.clear()
@@ -2895,6 +3191,7 @@ class AndroidSharedStateHolder(
         outgoingPreviewTracker.clearAll()
         pendingExistingSessionTexts.clear()
         pendingComposerSends.clear()
+        bridgeStartsInFlight.clear()
         outgoingDraftRevisions.clear()
         stoppingSessionId = null
         pendingQueueRecall = null
@@ -2930,6 +3227,22 @@ class AndroidSharedStateHolder(
         }
     }
 
+    fun pairWithCode(endpoint: String, code: String, onFailure: (String) -> Unit = {}) {
+        val appGraph = graph ?: return
+        appGraph.diagnostics.intent(GatewayDiagnosticAction.PAIR)
+        platformError = null
+        appGraph.gatewayScope.launch {
+            val result = runCatching { appGraph.gatewayRuntime.pairWithCode(endpoint, code) }
+            withContext(Dispatchers.Main.immediate) {
+                if (result.isSuccess) {
+                    showTransientNotice("已提交配对，正在连接网关…")
+                } else {
+                    onFailure("配对信息无效，请检查地址和六位码")
+                }
+            }
+        }
+    }
+
     fun pair() {
         pair(pairingPayload)
     }
@@ -2946,7 +3259,6 @@ class AndroidSharedStateHolder(
             val result = runCatching { appGraph.gatewayRuntime.pair(payload) }
             withContext(Dispatchers.Main.immediate) {
                 if (result.isSuccess) {
-                    providerEditorDrafts.clear()
                     if (pairingPayload == payload) pairingPayload = ""
                     // 扫码/粘贴成功后给显式反馈：不然只有首页状态点隐式变绿，
                     // 用户会以为“扫了没反应”。连接结果仍由状态行呈现。
@@ -3018,10 +3330,31 @@ class AndroidSharedStateHolder(
         }
     }
 
-    fun refreshSessions() {
+    /** 请求网关在宿主机后台启动原生 Pi；入口只在 bridge 模式与 capability 同时可用时显示。 */
+    fun startBridgeSession(sessionId: String) {
+        val appGraph = graph ?: return
+        if (!supportsRequest("bridge-start")) {
+            platformError = "当前网关不支持后台启动"
+            return
+        }
+        if (gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            platformError = "请先连接 Pi 网关"
+            return
+        }
+        if (!bridgeStartsInFlight.add(sessionId)) return
+        appGraph.gatewayScope.launch {
+            val sent = appGraph.gatewayRuntime.startBridgeSession(sessionId, UUID.randomUUID().toString())
+            if (!sent) withContext(Dispatchers.Main.immediate) {
+                bridgeStartsInFlight.remove(sessionId)
+                platformError = "启动请求未发出，请重试"
+            }
+        }
+    }
+
+    fun refreshSessions(automaticRefresh: Boolean = false) {
         graph?.let { appGraph ->
             appGraph.diagnostics.intent(GatewayDiagnosticAction.REFRESH_SESSIONS)
-            appGraph.gatewayScope.launch { appGraph.gatewayRuntime.requestSessions() }
+            appGraph.gatewayScope.launch { appGraph.gatewayRuntime.requestSessions(automaticRefresh = automaticRefresh) }
         }
     }
 
@@ -3255,6 +3588,33 @@ class AndroidSharedStateHolder(
         // 与任何网络/模型动作，点击即可见（对齐 Pi 原生 TUI 的 message_start(user) 展示）。
         // 实发图片复制一份并分配新 attachmentId：预览/发送/缓存用副本，原
         // submission.images 快照保持不动（清草稿比较仍与输入区对象相等）。
+        if (gatewayState.hostMode == null && "bridge" in gatewayState.capabilities) {
+            sendInFlight = false
+            showTransientNotice("正在确认连接模式，草稿已保留")
+            onSettled(false)
+            return
+        }
+        if (submission.sessionId == null && gatewayState.hostMode == "bridge" &&
+            ("bridge-workspace-v1" !in gatewayState.capabilities)) {
+            sendInFlight = false
+            showTransientNotice("请更新网关及桥接扩展后新建会话")
+            onSettled(false)
+            return
+        }
+        val nativeNew = gatewayState.hostMode == "bridge" && submission.sessionId == null
+        // 连同稿件一起捕获运行器身份；缓存附件的挂起窗口后不得换成另一个实例。
+        val capturedBinding = submission.sessionId?.let { appGraph.gatewayRuntime.bridgeIdentity(it) }
+        val nativeResume = gatewayState.hostMode == "bridge" && submission.sessionId != null &&
+            (capturedBinding == null || snapshot.sessions.firstOrNull { it.id == submission.sessionId }?.isOnline == false)
+        if (nativeResume && "bridge-native-resume-v1" !in gatewayState.capabilities) {
+            sendInFlight = false
+            val offline = snapshot.sessions.firstOrNull { it.id == submission.sessionId }?.isOnline == false
+            showTransientNotice(if (offline) "请更新网关后续聊离线会话，草稿已保留"
+                else "正在确认原生会话状态，请稍后重试")
+            onSettled(false)
+            return
+        }
+        val binding = if (nativeResume) null else capturedBinding
         val outgoing = beginOutgoingSend(submission, createPreview)
         rememberNewSessionTextForReject(submission, outgoing, createPreview, clearInputOnSuccess)
         appGraph.gatewayScope.launch {
@@ -3277,7 +3637,14 @@ class AndroidSharedStateHolder(
                 sessionId = submission.sessionId,
                 cwd = submission.cwd,
                 model = submission.model,
-                mode = mode
+                mode = mode,
+                // 同一次发送的重试复用 sendToken；桥接写必须带回捕获时的
+                // instance/epoch，不能让旧界面悄悄写到 reload/new 后的实例。
+                operationId = outgoing.sendToken,
+                instanceId = binding?.first,
+                epoch = binding?.second,
+                nativeNew = nativeNew,
+                nativeResume = nativeResume
             )
             withContext(Dispatchers.Main.immediate) {
                 settleOutgoingSendLocally(submission, outgoing, sent, clearInputOnSuccess)
@@ -3390,8 +3757,11 @@ class AndroidSharedStateHolder(
         createPreview: Boolean
     ): PreparedOutgoingSend {
         val token = outgoingPreviewTracker.newSendToken()
+        // REL120-03：先按发起时点记住同上下文已明确 FAILED 的旧项，等这次提交被
+        // 可靠确认后再清；发起后新产生的失败、UNCONFIRMED 与其他会话都不在其内。
+        outgoingPreviewTracker.rememberFailedBeforeSend(token, submission.sessionId, newSessionEpoch)
         val outgoing = prepareOutgoingSend(submission, createPreview, token)
-        outgoingPreviewTracker.trackAwaiting(token, submission.sessionId)
+        outgoingPreviewTracker.trackAwaiting(token, submission.sessionId, newSessionEpoch)
         if (createPreview) pendingComposerSends[token] = submission
         // 既有会话纯文本没有占位气泡；只在发送等待期保留原稿，明确拒绝后
         // 复用失败恢复条。正常 sent 立即丢弃，不靠文字猜测正式回显身份。
@@ -3402,19 +3772,41 @@ class AndroidSharedStateHolder(
     }
 
     /**
-     * sent 帧（网关 preflight 受理，PROTOCOL §4.2）：按在途请求队列的队头
-     * token 确认预览并尽量绑定真实 sessionId（新会话在此得知归属）；预览
-     * 已被 echo 先行移除时仍消费队头（防旧 sent 串绑后续请求），且此刻
-     * 明确SDK受理时移除本次预览；旧网关无disposition才保留回显等待。
+     * submitted 只确认桥接实例已调用提交入口，不代表 Pi 已开始或完成运行。
+     * Runtime 已校验操作/会话/实例/代际；这里仍须匹配等待队头，迟到 ACK 不能清下一条草稿。
+     * 普通 send 没有逐条 settled 通道，匹配提交回执即结束发送等待；无回执仍走原恢复路径。
      */
-    internal fun recordOutgoingSent(frameSessionId: String?, sdkAccepted: Boolean = false) {
+    internal fun recordBridgeSubmitted(frameSessionId: String?, operationId: String?) {
+        val head = outgoingPreviewTracker.headAwaitingToken() ?: return
+        if (operationId == null || operationId != head) return
+        // 会话归属由 tracker 的实发身份校验；忙时带图追加没有本地预览/原稿快照，
+        // 也必须消费自己的队头，否则下一条合法 ACK 会被旧 token 挡住。
+        recordOutgoingSent(frameSessionId, submissionAcknowledged = true)
+    }
+
+    /**
+     * 匹配 sent 后仅完成对应请求的发送等待，不把提交回执当成运行完成。
+     * 已知 disposition 直接释放本地预览；旧网关无 disposition 才继续等待附件回显。
+     */
+    internal fun recordOutgoingSent(frameSessionId: String?, submissionAcknowledged: Boolean = false) {
         val head = outgoingPreviewTracker.headAwaitingToken()
-        val changedPreview = outgoingPreviewTracker.consumeSent(frameSessionId, elapsedRealtimeMs(), sdkAccepted)
+        val changedPreview = outgoingPreviewTracker.consumeSent(frameSessionId, elapsedRealtimeMs(), submissionAcknowledged)
         // 队头被受理后只清它对应的那一版，用户后写的文字或其它会话不受影响。
         if (head != null && head != outgoingPreviewTracker.headAwaitingToken()) {
             pendingComposerSends.remove(head)?.let { applyMessageSendResult(it, sent = true, outgoingSendToken = head) }
             pendingExistingSessionTexts.remove(head)
             if (pendingNewSessionText?.token == head) pendingNewSessionText = null
+            // 受理可能揭晓"这个新建页延续到了哪个会话"：同页未确认稿的恢复入口
+            // 可见范围随之变化，必须刷新持有的预览列表。
+            refreshOutgoingPreviews()
+        }
+        // 可靠提交确认（submitted/disposition 受理）后，本次提交发起前已明确 FAILED
+        // 的同会话旧项默认放弃：移除提示并释放恢复载荷。不是宣称旧消息已送达，也不动
+        // UNCONFIRMED 与当前输入框里的新草稿/附件。
+        if (submissionAcknowledged && head != null && head != outgoingPreviewTracker.headAwaitingToken() &&
+            outgoingPreviewTracker.clearFailedBeforeSend(head)
+        ) {
+            refreshOutgoingPreviews()
         }
         if (changedPreview != null) {
             refreshOutgoingPreviews()
@@ -3554,19 +3946,27 @@ class AndroidSharedStateHolder(
      * 自动回填仅保留在本地失败路径（settleLocalFailure）。生产入口是
      * Runtime 已关联的服务端 RequestRejected(message)，不按错误码白名单丢失新拒绝码。
      */
-    internal fun handleOutgoingServerReject() {
+    // Runtime 单 message lane 保证队头即当前请求；不按错 token 消费下一条草稿。
+    internal fun handleOutgoingServerReject(operationId: String? = null) {
         val head = outgoingPreviewTracker.headAwaitingToken() ?: return
+        if (operationId != null && operationId != head) return
         pendingComposerSends.remove(head)
         // 拒绝先于本地回写到达：回写不得再清空草稿（此刻草稿仍在输入框里）
         if (sendInFlight) rejectedBeforeSettleToken = head
         outgoingPreviewTracker.consumeFailure(asUnconfirmed = false)
         pendingExistingSessionTexts.remove(head)?.let { pending ->
             val submission = pending.submission
-            // 拒绝先于本地回写且原稿仍在输入框时，不另建重复的恢复条。
-            val stillInEditor = sendInFlight && inputGeneration == submission.generation &&
+            // 原稿仍完整留在输入框时，不另建同份"恢复草稿"副本。判据是输入区本身
+            // （编辑代次 + 会话 + 正文 + 无新图），不依赖本地发帧是否已回写：
+            // sendInFlight 在 settleOutgoingSendLocally 已复位，拿它判定会在服务端
+            // 迟到拒绝时给仍在输入框的原稿重复造一条失败条（REL120-03 静态疑点）。
+            val stillInEditor = inputGeneration == submission.generation &&
                 (pendingSelectedSessionId ?: snapshot.selectedSessionId) == submission.sessionId &&
                 messageDraft == submission.draft && preparedImages.isEmpty()
-            if (!stillInEditor) outgoingPreviewTracker.begin(
+            if (stillInEditor) {
+                // 原稿仍在输入框：只提示未受理，不另建恢复条（也不清草稿）。
+                showTransientNotice("消息未被受理，草稿已保留")
+            } else outgoingPreviewTracker.begin(
                 token = head,
                 sessionId = submission.sessionId,
                 newSessionEpoch = pending.newSessionEpoch,
@@ -3581,11 +3981,43 @@ class AndroidSharedStateHolder(
     }
 
     /** 来源由 Runtime 在关联成功后标记，避免本地 busy 拒绝误消费另一请求队头。 */
+    internal fun isNonterminalMessageProtocolRejection(event: GatewayRuntimeEvent.RequestRejected): Boolean =
+        event.requestType == "transport" && event.reason in setOf("session-mismatch", "invalid-message-ack") &&
+            outgoingPreviewTracker.headAwaitingToken() != null
+
     internal fun handleOutgoingMessageRejection(event: GatewayRuntimeEvent.RequestRejected) {
-        if (event.requestType == "message" && event.serverResponse) handleOutgoingServerReject()
+        if (event.requestType == "message" && event.serverResponse) {
+            if (event.reason in setOf("native-start-unconfirmed", "native-submit-unconfirmed")) {
+                val head = outgoingPreviewTracker.headAwaitingToken() ?: return
+                if (event.correlationId != head) return
+                val owner = pendingExistingSessionTexts[head]?.submission?.sessionId
+                    ?: pendingComposerSends[head]?.sessionId
+                if (owner == null || event.targetSessionId != owner) return
+                // RPC返回结果未知不等于模型肯定没执行，沿用未确认恢复规则。
+                handleOutgoingSendUnconfirmed()
+                return
+            }
+            val submission = event.correlationId?.let(pendingComposerSends::get)
+            val currentId = pendingSelectedSessionId ?: snapshot.selectedSessionId
+            val resumePath = submission?.sessionId?.let { id -> snapshot.sessions.firstOrNull { it.id == id }?.cwd }
+            if (event.reason == "worktree-trust-required" && submission?.sessionId != null && resumePath != null &&
+                currentId == submission.sessionId && inputGeneration == submission.generation) {
+                worktreeUi = WorktreeUiState(open = true, sourceSessionId = submission.sessionId, sourceCwd = resumePath,
+                    targetPath = resumePath, navigationEpoch = composerNavigationEpoch, mode = WorktreeMode.NEW,
+                    action = "resume", phase = WorktreePhase.TRUST, operationId = UUID.randomUUID().toString())
+            }
+            if (event.reason == "worktree-trust-required" && submission?.sessionId == null && submission?.cwd != null &&
+                snapshot.selectedSessionId == null && pendingSelectedSessionId == null && inputGeneration == submission.generation) {
+                worktreeUi = WorktreeUiState(open = true, sourceSessionId = null, sourceCwd = submission.cwd,
+                    targetPath = submission.cwd, navigationEpoch = composerNavigationEpoch, mode = WorktreeMode.NEW,
+                    action = "select", phase = WorktreePhase.TRUST, operationId = UUID.randomUUID().toString())
+            }
+            handleOutgoingServerReject(event.correlationId)
+        }
     }
 
     private data class PendingExistingSessionText(val submission: MessageSubmission, val newSessionEpoch: Long)
+    private val bridgeStartsInFlight = mutableSetOf<String>()
     private val pendingExistingSessionTexts = mutableMapOf<String, PendingExistingSessionText>()
     private val pendingComposerSends = mutableStateMapOf<String, MessageSubmission>()
     private val outgoingDraftRevisions = mutableMapOf<String, MessageSubmission>()
@@ -3782,7 +4214,7 @@ class AndroidSharedStateHolder(
 
     /** 当前会话是否在等 AI 回复（pi 的 isStreaming；决定发送走吸附还是直发）。 */
     internal fun selectedSessionCompacting(): Boolean =
-        (pendingSelectedSessionId ?: snapshot.selectedSessionId)?.let { sessionId ->
+        compactTargetSessionId()?.let { sessionId ->
             snapshot.sessionStates[sessionId]?.isCompacting == true
         } == true
 
@@ -3846,17 +4278,19 @@ class AndroidSharedStateHolder(
     }
 
     private var stoppingSessionId: String? by mutableStateOf(null)
+    /** 桥接 stop 的操作身份；用于晚到/错配回执不碰当前停止等待。 */
+    private var stoppingOperationId: String? = null
     private var pendingQueueRecall: Pair<String, String>? by mutableStateOf(null)
     private val stoppedQueueDrafts = mutableMapOf<String, String>()
 
     private fun selectedSessionRecalling(): Boolean = pendingQueueRecall?.first != null &&
-        pendingQueueRecall?.first == (pendingSelectedSessionId ?: snapshot.selectedSessionId)
+        pendingQueueRecall?.first == compactTargetSessionId()
 
     val canRecallQueuedMessages: Boolean
         get() = gatewayState.connection == GatewayConnectionState.CONNECTED &&
             "dequeue" in gatewayState.capabilities && pendingQueueRecall == null && stoppingSessionId == null &&
             !sendInFlight && dispatchInFlight == null &&
-            snapshot.selectedSessionId?.let { snapshot.sessionStates[it]?.queuedMessages?.isEmpty == false } == true
+            snapshot.selectedSessionId?.let { snapshot.sessionStates[it]?.hasQueuedMessages == true } == true
 
     internal fun beginQueueRecall(sessionId: String, requestId: String): Boolean {
         if (pendingQueueRecall != null || stoppingSessionId != null || sendInFlight || dispatchInFlight != null) return false
@@ -3894,17 +4328,50 @@ class AndroidSharedStateHolder(
     }
 
     private fun selectedSessionStopping(): Boolean = stoppingSessionId != null &&
-        stoppingSessionId == (pendingSelectedSessionId ?: snapshot.selectedSessionId)
+        stoppingSessionId == compactTargetSessionId()
 
     /** 停止等待期不再向同一会话提交，避免旧停止回执覆盖新的运行。 */
-    internal fun beginStoppingSession(sessionId: String): Boolean {
+    internal fun beginStoppingSession(sessionId: String, operationId: String? = null): Boolean {
         if (stoppingSessionId != null || pendingQueueRecall?.first == sessionId) return false
         stoppingSessionId = sessionId
+        stoppingOperationId = operationId
         return true
     }
 
     internal fun finishStoppingSession(sessionId: String?) {
-        if (stoppingSessionId == sessionId) stoppingSessionId = null
+        if (stoppingSessionId == sessionId) {
+            stoppingSessionId = null
+            stoppingOperationId = null
+        }
+    }
+
+    private fun stoppingMatches(sessionId: String?, operationId: String?): Boolean {
+        if (stoppingSessionId == null || stoppingSessionId != sessionId) return false
+        // 旧网关成功帧没有 operationId；新网关带身份，错配/迟到帧不能消费当前等待。
+        return stoppingOperationId == null || operationId == null || operationId == stoppingOperationId
+    }
+
+    /**
+     * abort 失败/超时/取消的终态；只有匹配当前停止操作才恢复已取文字，不伪造 idle。
+     * 失败回执也可能带三态：拿到文字就照常恢复；只报"去向未确认"时如实提示，
+     * 不因失败就把队列说成已交回电脑。
+     */
+    internal fun finishAbortRequest(
+        sessionId: String?,
+        operationId: String?,
+        queuedText: String? = null,
+        queuedDisposition: String? = null,
+        resultUnknown: Boolean = false,
+    ) {
+        if (!stoppingMatches(sessionId, operationId)) return
+        val text = queuedText?.takeIf(String::isNotBlank)
+        if (text != null && sessionId != null) restoreReturnedQueueText(sessionId, listOf(text))
+        if (text == null && queuedDisposition == "unknown") {
+            showTransientNotice("已停止；排队消息去向未确认，请在电脑查看")
+        } else if (text == null && resultUnknown) {
+            showTransientNotice("停止结果未确认，请在电脑查看")
+        }
+        finishStoppingSession(sessionId)
     }
 
     private fun restoreStoppedQueueDraft(sessionId: String) {
@@ -3916,9 +4383,36 @@ class AndroidSharedStateHolder(
     }
 
     private fun handleStoppedQueue(frame: GatewayFrame) {
+        if (frame.status == "submitted") return
         val sessionId = frame.sessionId ?: return
-        if (stoppingSessionId != sessionId) return
+        if (!stoppingMatches(sessionId, frame.operationId)) return
         finishStoppingSession(sessionId)
+        // 三态优先（新网关）：没执行才轮到 Pi 原生交还电脑；取回动作抛错且没捕获
+        // 文本时队列可能已被清掉，不能声明"已留在电脑输入框"。
+        when (frame.queuedDisposition) {
+            "captured" -> {
+                val returned = frame.queued ?: return // 未附文字就不从快照猜恢复。
+                restoreReturnedQueueText(sessionId, returned)
+                return
+            }
+            "left-on-desktop" -> {
+                // 桥接没动队列，由 Pi 原生 Esc 语义拼回电脑当前编辑器；手机不伪造
+                // 取回、不复制草稿、也不重发。压缩排队不在 hasPendingMessages 内，
+                // 这里只承诺本轮运行队列。
+                showTransientNotice("本轮排队消息已交回电脑输入框（压缩排队不含在内）")
+                return
+            }
+            "unknown" -> {
+                showTransientNotice("已停止；排队消息去向未确认，请在电脑查看")
+                return
+            }
+        }
+        if (frame.queuedRestoredToDesktop == true) {
+            // 旧网关只有布尔位：同样是交还电脑，但无法区分"没执行"与"结果不明"，
+            // 文案不承诺去向。
+            showTransientNotice("排队消息已交回电脑侧，但恢复结果未确认")
+            return
+        }
         val returned = frame.queued ?: return // 旧网关不证明已撤队列，不从快照猜恢复。
         restoreReturnedQueueText(sessionId, returned)
     }
@@ -3944,10 +4438,14 @@ class AndroidSharedStateHolder(
         // 与 Composer 的 canAbort 同口径（snapshot.selectedSessionId）：停止针对
         // 当前显示的会话，不用 pending 切换目标，避免切换在途时 abort 发错会话。
         val sessionId = snapshot.selectedSessionId ?: return
-        if (!beginStoppingSession(sessionId)) return
+        val binding = appGraph.gatewayRuntime.bridgeIdentity(sessionId)
+        val operationId = binding?.let { UUID.randomUUID().toString() }
+        if (!beginStoppingSession(sessionId, operationId)) return
         takeBackPendingDispatch(notifyWhenPreparing = false)
         appGraph.gatewayScope.launch {
-            val accepted = appGraph.gatewayRuntime.sendRequest(GatewayRequests.abort(sessionId))
+            val accepted = appGraph.gatewayRuntime.sendRequest(
+                GatewayRequests.abort(sessionId, operationId, binding?.first, binding?.second)
+            )
             if (!accepted) withContext(Dispatchers.Main.immediate) {
                 finishStoppingSession(sessionId)
                 platformError = "停止请求未发出，请重试"
@@ -4110,9 +4608,14 @@ class AndroidSharedStateHolder(
             !selectedSessionStopping() && !selectedSessionRecalling() &&
             (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) && !sendInFlight && dispatchInFlight == null && pendingComposerSends.isEmpty()
 
-    fun sendComposerDraft(requireDirectory: Boolean = false) {
+    fun sendComposerDraft(requireDirectory: Boolean = false, requireConnection: Boolean = false) {
         if (worktreeBlocksComposer) {
             showTransientNotice("工作区切换未确认，草稿已保留")
+            return
+        }
+        if (requireConnection && gatewayState.connection != GatewayConnectionState.CONNECTED) {
+            showTransientNotice(if (messageDraft.isNotBlank() || preparedImages.isNotEmpty() || imagePreparations.isNotEmpty())
+                "尚未连接，草稿已保留" else "尚未连接")
             return
         }
         if (consumeSlashCommand(messageDraft) != SlashCommandOutcome.NOT_A_COMMAND) return
@@ -4205,6 +4708,7 @@ class AndroidSharedStateHolder(
             frame.requestType in setOf("switch-branch", "history", "tree")) {
             finishBranchDraftRequest(frame.requestType, frame.sessionId)
         }
+        if (frame.kind == "bridge-offline") finishCompactPending(frame.sessionId, "原生 Pi 已离线，压缩结果未确认")
         if (frame.kind == "aborted") handleStoppedQueue(frame)
         if (frame.kind == "dequeued") handleRecalledQueue(frame)
         // compact-finished只更新权威状态，不认领当前等待：上一轮通知可能晚于下一轮点击。
@@ -4215,11 +4719,17 @@ class AndroidSharedStateHolder(
             // 迟到 ACK（会话已换）只按 frame.sessionId 归属处理，不碰当前会话。
             val ackSessionId = frame.sessionId
             if (ackSessionId != null && ackSessionId in compactPendingSessions) {
-                // 提示只在用户仍看该会话时弹（R5）；状态处理仍按归属。
-                if (snapshot.selectedSessionId == ackSessionId) {
+                // 失败确认就是这次请求的终态；兼容缺活动字段的 ACK，不留下永不释放的本地等待。
+                if (frame.status == "failed") {
+                    finishCompactPending(ackSessionId, "上下文压缩失败，请重试")
+                    requestStateAfterCompaction(appGraph, ackSessionId)
+                } else if (snapshot.selectedSessionId == ackSessionId) {
                     showTransientNotice("已请求压缩上下文")
                 }
-                observeCompactingStarted(ackSessionId)
+                if (frame.status == "settled" && frame.isCompacting == false) {
+                    finishCompactPending(ackSessionId)
+                    requestStateAfterCompaction(appGraph, ackSessionId)
+                } else observeCompactingStarted(ackSessionId)
                 compactPendingSessions[ackSessionId]?.let { pending ->
                     val watchScope = appGraph?.gatewayScope ?: compactWatchScopeForTest
                     watchScope?.let { watchCompactStartup(it, ackSessionId, pending) }
@@ -4239,7 +4749,7 @@ class AndroidSharedStateHolder(
                 if (compactPhase.event.type == "compact/start") {
                     observeCompactingStarted(compactPhase.sessionId)
                 } else if (compactSeenEvents.add(
-                        "${compactPhase.event.type}:${compactPhase.sessionId}:${compactPhase.seq}"
+                        "${compactPhase.event.type}:${compactPhase.sessionId}:${frame.instanceId}:${frame.epoch}:${frame.bridgeSeq ?: compactPhase.seq}"
                     )) {
                     finishCompactPending(compactPhase.sessionId)
                     requestStateAfterCompaction(appGraph, compactPhase.sessionId)
@@ -4260,10 +4770,14 @@ class AndroidSharedStateHolder(
         handleWorkspaceFrame(frame)
         sessionControlsRefresh.afterFrame(frame, snapshot.selectedSessionId)?.let { sessionId ->
             // 不能在投影发布/事件消费中等待 runtime 锁：生产者可能正等消费队列腾位。
-            appGraph?.gatewayScope?.launch { appGraph.gatewayRuntime.requestState(sessionId) }
+            appGraph?.gatewayScope?.launch { appGraph.gatewayRuntime.requestState(sessionId, automaticRefresh = true) }
         }
         if (appGraph != null) handleProviderFrame(appGraph, frame, frame.requestType)
         when (frame.kind) {
+            "model-refreshed" -> {
+                if (frame.sessionId == snapshot.selectedSessionId) refreshModelCatalog()
+                showTransientNotice("原生模型配置已刷新")
+            }
             "model-scope" -> if (modelScopeIsLoading) {
                 modelScopeIsLoading = false
                 modelScope = frame.scope
@@ -4277,6 +4791,7 @@ class AndroidSharedStateHolder(
                     modelScopeSavedRequestId = activeScopeRequestId
                     modelScopeError = null
                     refreshModelCatalog()
+                    if (gatewayState.hostMode == "bridge") showTransientNotice("已保存，下次启动原生 Pi 生效")
                 } else modelScopeError = "保存回执不完整，请重新加载核对"
                 activeScopeRequestId = null
             }
@@ -4326,8 +4841,89 @@ class AndroidSharedStateHolder(
     }
 
     private fun handleWorkspaceFrame(frame: GatewayFrame) {
+        if (frame.kind == "hello" || (frame.kind == "host-mode" && frame.changed == true) ||
+            (frame.kind == "bridge-offline" && frame.sessionId == snapshot.selectedSessionId)) {
+            worktreeNativeIdentity = null
+        }
+        if (gatewayState.hostMode == "bridge" && frame.kind == "bridge-snapshot" &&
+            frame.sessionId != null && frame.sessionId == snapshot.selectedSessionId &&
+            !frame.instanceId.isNullOrBlank() && !frame.epoch.isNullOrBlank()) {
+            val identity = Triple(requireNotNull(frame.sessionId), requireNotNull(frame.instanceId), requireNotNull(frame.epoch))
+            val cwd = frame.cwd ?: currentSessionDirectory
+            if (worktreeNativeIdentity != identity && supportsWorktrees && cwd != null &&
+                gatewayState.connection == GatewayConnectionState.CONNECTED) {
+                worktreeNativeIdentity = identity
+                // 首次目录查询可能早于原生身份；快照到达后重试，重复快照不重复查询。
+                refreshWorktreeLocation(cwd, frame.sessionId)
+            }
+        }
+        // 连接后先确认模式；桥接目录等权威实例快照建立后再取，不能先拉 SDK 全局目录。
+        if (frame.kind == "host-mode") {
+            // StateFlow 与 Frame 分别收集；本帧的模式必须先对刷新入口可见。
+            if (frame.mode == "sdk" || frame.mode == "bridge") gatewayState = gatewayState.copy(hostMode = frame.mode)
+            inputAssistNativeIdentity = null
+            inputAssist.reset()
+            slashCommands = null
+            commandsLoading = false
+            if (frame.mode == "sdk") { refreshInputResources(); snapshot.selectedSessionId?.let { refreshSlashCommands(it) } }
+            modelCatalogIsLoading = false
+            modelCatalogError = null
+            if (frame.mode == "sdk") refreshModelCatalog()
+        }
+        if (frame.kind == "bridge-snapshot" && frame.sessionId == inputAssist.context.sessionId &&
+            frame.instanceId != null && frame.epoch != null) {
+            val identity = requireNotNull(frame.instanceId) to requireNotNull(frame.epoch)
+            if (identity != inputAssistNativeIdentity) {
+                inputAssistNativeIdentity = identity
+                inputAssist.reset()
+                slashCommands = null
+                commandsLoading = false
+                refreshInputResources()
+                frame.sessionId?.let { refreshSlashCommands(it) }
+            }
+        }
+        if (frame.kind == "bridge-offline" && frame.sessionId == inputAssist.context.sessionId) {
+            inputAssistNativeIdentity = null
+            inputAssist.reset()
+            slashCommands = null
+            commandsLoading = false
+        }
+        if (frame.kind == "bridge-snapshot" && frame.sessionId == snapshot.selectedSessionId &&
+            snapshot.modelCatalog == null) refreshModelCatalog()
+
+        if (frame.kind == "bridge-started") {
+            frame.sessionId?.let { bridgeStartsInFlight.remove(it) }
+            notifyUser("后台 Pi 已启动")
+            refreshSessions(automaticRefresh = true)
+            return
+        }
+        if (frame.kind == "error" && frame.requestType == "bridge-start") {
+            frame.sessionId?.let { bridgeStartsInFlight.remove(it) }
+            platformError = GatewayErrorText.request(frame.requestType, frame.code)
+            return
+        }
+        if (frame.kind == "host-mode" && frame.changed == true) {
+            // 网关切换模式时会释放旧模式订阅；客户端对当前会话重新订阅，
+            // 桥接模式随后会收到新快照，SDK 模式则重新拉历史。
+            val appGraph = graph
+            val sessionId = snapshot.selectedSessionId
+            if (appGraph != null && sessionId != null) {
+                appGraph.gatewayScope.launch {
+                    appGraph.gatewayRuntime.subscribe(sessionId, automaticRefresh = true)
+                    appGraph.gatewayRuntime.requestHistory(sessionId, resetLeaf = true)
+                }
+            }
+            refreshSessions(automaticRefresh = true)
+        }
         receiveWorktreeFrame(frame)
-        if (frame.kind == "models") {
+        if (frame.kind == "event" && frame.sessionId == snapshot.selectedSessionId &&
+            frame.event?.objectValue?.get("type")?.stringValue in setOf("model_select", "thinking_level_select") &&
+            gatewayState.hostMode == "bridge") {
+            graph?.let { appGraph -> appGraph.gatewayScope.launch {
+                frame.sessionId?.let { appGraph.gatewayRuntime.requestState(it, automaticRefresh = true) }
+            } }
+        }
+        if (frame.kind == "models" && (frame.sessionId == null || frame.sessionId == snapshot.selectedSessionId)) {
             modelCatalogIsLoading = false
             modelCatalogError = null
         }
@@ -4336,7 +4932,7 @@ class AndroidSharedStateHolder(
             return
         }
         if (frame.kind == "error" && frame.requestType in setOf("input-resources", "input-completions")) {
-            inputAssist.fail(frame.requestType!!, frame.queryId, "加载失败，点击重试")
+            inputAssist.fail(frame.requestType!!, frame.queryId, GatewayErrorText.request(frame.requestType, frame.code))
             return
         }
         if (frame.kind == "session-restarted" && frame.sessionId == inputAssist.context.sessionId) {
@@ -4449,18 +5045,24 @@ class AndroidSharedStateHolder(
             "sent" -> {
                 // 明确SDK已开始/排队/处理即完成本次发送等待。SDK1.0.4会重建图片块，
                 // 不能再用附件ID回显作为发送确认；无disposition的旧网关保持原路径。
-                recordOutgoingSent(frame.sessionId, sdkAccepted = when (frame.disposition) {
-                    "started", "queued", "handled" -> true
-                    else -> false
-                })
+                // 桥接 submitted 也结束提交等待，但不伪造 Pi 的运行或完成状态。
+                if (frame.disposition == "submitted") {
+                    recordBridgeSubmitted(frame.sessionId, frame.operationId)
+                } else {
+                    recordOutgoingSent(frame.sessionId, submissionAcknowledged = when (frame.disposition) {
+                        "started", "queued", "handled" -> true
+                        else -> false
+                    })
+                }
             }
             "error" -> {
+                if (frame.requestType == "refresh-model") showTransientNotice("配置已保存，" + GatewayErrorText.request(frame.requestType, frame.code))
                 clearWorkspaceRequestLoading(frame.requestType)
                 // 服务端 error 帧（prompt-rejected 等，明确拒绝）：预览转失败，
                 // 新会话首条纯文本回填（带图不自动回填，见 handleOutgoingServerReject）；
                 // 正常 sent 已受理的不受影响。
                 if (frame.requestType == "message") {
-                    handleOutgoingServerReject()
+                    handleOutgoingServerReject(frame.operationId)
                 }
                 if (frame.requestType in WORKSPACE_REQUEST_TYPES) {
                     platformError = GatewayErrorText.request(frame.requestType, frame.code)
@@ -4529,9 +5131,10 @@ class AndroidSharedStateHolder(
                 // 保存后不再自动测试：用户要求“必须手动测试通过才能保存”，
                 // 自动测试会覆盖手测结论（曾表现为“手测正常、过一会儿自己变失败”）。
                 // 保存成功后刷新模型目录，新模型立即可选。
-                if (supportsRequest("models")) {
+                if (gatewayState.hostMode == "bridge") refreshSelectedNativeModel()
+                else if (supportsRequest("models")) {
                     appGraph.gatewayScope.launch {
-                        appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+                        modelCatalogRequest()?.let { appGraph.gatewayRuntime.sendRequest(it) }
                     }
                 }
             }
@@ -4566,7 +5169,7 @@ class AndroidSharedStateHolder(
                     providerTestResult = outcome
                     if (supportsRequest("providers")) loadProviders()
                     if (supportsRequest("models")) appGraph.gatewayScope.launch {
-                        appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+                        modelCatalogRequest()?.let { appGraph.gatewayRuntime.sendRequest(it) }
                     }
                 }
             }
@@ -4583,7 +5186,7 @@ class AndroidSharedStateHolder(
                 // 删除后同步刷新模型目录，已删 provider 的模型立即从选择器消失。
                 if (supportsRequest("models")) {
                     appGraph.gatewayScope.launch {
-                        appGraph.gatewayRuntime.sendRequest(GatewayRequests.models())
+                        modelCatalogRequest()?.let { appGraph.gatewayRuntime.sendRequest(it) }
                     }
                 }
             }

@@ -12,7 +12,9 @@ data class SessionSummary(
     /** pi 会话的项目目录（新会话落点用）。 */
     val cwd: String? = null,
     /** 当前会话已确认的 assistant/压缩失败；未知结果不造失败。 */
-    val hasFailure: Boolean = false
+    val hasFailure: Boolean = false,
+    /** 桥接实例是否在线；null = 未知（SDK 模式或旧网关）。 */
+    val isOnline: Boolean? = null
 )
 
 data class SessionListLabels(
@@ -42,7 +44,9 @@ sealed interface SessionListAction {
     ) : SessionListAction
     data class EventReceived(
         val event: SessionEvent,
-        val insertedAtEpochSeconds: Double
+        val insertedAtEpochSeconds: Double,
+        /** 该事件携带的运行状态是否仍权威；false 时只更新标题/时间/未读，不改 isRunning。 */
+        val statusAuthoritative: Boolean = true
     ) : SessionListAction
     data class MarkRead(val sessionId: String) : SessionListAction
     /** 来自会话快照/生命周期事件的 streaming || compacting，不等同于一轮聊天。 */
@@ -50,6 +54,9 @@ sealed interface SessionListAction {
 
     /** 会话改名（session-named 帧）：列表标题即时更新，选择态不动。 */
     data class Renamed(val sessionId: String, val name: String) : SessionListAction
+
+    /** 桥接在线状态变化（bridge-offline 或会话快照）；null 清除标记。 */
+    data class OnlineChanged(val sessionId: String, val isOnline: Boolean?) : SessionListAction
 }
 
 object SessionListReducer {
@@ -86,7 +93,8 @@ object SessionListReducer {
             state,
             action.event,
             labels,
-            action.insertedAtEpochSeconds
+            action.insertedAtEpochSeconds,
+            action.statusAuthoritative
         )
         is SessionListAction.MarkRead -> state.copy(
             sessions = state.sessions.map {
@@ -104,6 +112,11 @@ object SessionListReducer {
         is SessionListAction.Renamed -> state.copy(
             sessions = state.sessions.map {
                 if (it.id == action.sessionId) it.copy(title = action.name) else it
+            }
+        )
+        is SessionListAction.OnlineChanged -> state.copy(
+            sessions = state.sessions.map {
+                if (it.id == action.sessionId) it.copy(isOnline = action.isOnline) else it
             }
         )
     }
@@ -134,14 +147,16 @@ object SessionListReducer {
                 title = resolvedTitle,
                 lastActivityEpochSeconds = timestamp,
                 isRunning = item.running,
-                cwd = item.cwd ?: existing.cwd
+                cwd = item.cwd ?: existing.cwd,
+                isOnline = item.online ?: existing.isOnline
             ) ?: SessionSummary(
                 id = item.id,
                 title = if (item.blank) labels.blankTitle(item.id) else title,
                 lastActivityEpochSeconds = timestamp,
                 isRunning = item.running,
                 hasUnread = false,
-                cwd = item.cwd
+                cwd = item.cwd,
+                isOnline = item.online
             )
         }
         return state.copy(sessions = sessions.values
@@ -152,7 +167,8 @@ object SessionListReducer {
         state: SessionListState,
         record: SessionEvent,
         labels: SessionListLabels,
-        insertedAtEpochSeconds: Double
+        insertedAtEpochSeconds: Double,
+        statusAuthoritative: Boolean
     ): SessionListState {
         val event = record.event
         val title = when (event.type) {
@@ -170,9 +186,11 @@ object SessionListReducer {
             if (session.id != record.sessionId) return@map session
             session.copy(
                 lastActivityEpochSeconds = normalizeEpochSeconds(record.time),
-                isRunning = when (event.type) {
-                    "turn/start" -> true
-                    "turn/end" -> false
+                isRunning = when {
+                    // 旧事件的 turn/start|end 不代表更新的 state 结论：正文照收，运行态不动。
+                    !statusAuthoritative -> session.isRunning
+                    event.type == "turn/start" -> true
+                    event.type == "turn/end" -> false
                     else -> session.isRunning
                 },
                 hasUnread = if (event.type == "compact/start") session.hasUnread

@@ -107,6 +107,7 @@ import com.finecat.pimobile.android.ui.finecat.composer.*
 import com.finecat.pimobile.android.AndroidSharedStateHolder
 import com.finecat.pimobile.android.BuildConfig
 import com.finecat.pimobile.android.ui.ConversationDisplayEntry
+import com.finecat.pimobile.android.ui.ExtensionStatusBar
 import com.finecat.pimobile.android.ui.groupAssistantRounds
 import com.finecat.pimobile.android.ui.HeroCopyEditorDialog
 import com.finecat.pimobile.android.ui.SessionRenameDialog
@@ -305,6 +306,10 @@ private fun FineCatAppContent(
             stateHolder.setInputAssistContext(snapshot.selectedSessionId, assistContextCwd)
         }
         val assistToken = if (composerFocused) inputAssistToken(editorValue) else null
+        // 原生 /reload 的资源发现可晚于首份快照；打开候选时读取当前清单。
+        LaunchedEffect(assistToken?.isFile == false, assist.generation, connected) {
+            if (assistToken?.isFile == false && connected) stateHolder.refreshInputResources()
+        }
         val assistContextMatches = assist.context.sessionId == snapshot.selectedSessionId &&
             (!showHome || assist.context.cwd == assistContextCwd)
         val assistCommands = if (assistContextMatches && assistToken?.isFile == false) {
@@ -420,7 +425,6 @@ private fun FineCatAppContent(
         }
         // 每个会话一份列表状态：切会话不沿用旧会话的滚动位置（旧 UI remember(selectedSessionId) 同口径）。
         val listState = remember(snapshot.selectedSessionId) { LazyListState() }
-        val jumpVisible by derivedStateOf { listState.canScrollForward }
 
         val displayEntries = remember(snapshot.conversation) {
             mergeFineCatProcessEntries(makeConversationDisplayEntries(snapshot.conversation))
@@ -497,6 +501,10 @@ private fun FineCatAppContent(
         var pinnedToBottom by remember(snapshot.selectedSessionId) { mutableStateOf(true) }
         var programmaticScrolls by remember(snapshot.selectedSessionId) { mutableIntStateOf(0) }
         var initialBottomApplied by remember(snapshot.selectedSessionId) { mutableStateOf(false) }
+        // 输入区/IME 改变视口时可能暂时还能向下滚，不代表用户已离开底部。
+        val jumpVisible by remember(listState) {
+            derivedStateOf { !pinnedToBottom && listState.canScrollForward }
+        }
         LaunchedEffect(listState) {
             androidx.compose.runtime.snapshotFlow {
                 Triple(
@@ -1116,6 +1124,12 @@ private fun FineCatAppContent(
                         }
                     }
                 }
+                // 扩展状态行只显示当前会话的提示，不改变忙闲或发送状态。
+                ExtensionStatusBar(
+                    stateHolder = stateHolder,
+                    sessionId = snapshot.selectedSessionId,
+                    color = colors.text3,
+                )
                 // P4b：忙时点发送 → 草稿吸附条（注入本轮 / 排队下轮 / 取回）
                 stateHolder.pendingDispatch?.let { pending ->
                     if (pending.sessionId == snapshot.selectedSessionId) {
@@ -1126,27 +1140,40 @@ private fun FineCatAppContent(
                         )
                     }
                 }
-                // 服务端队列（与本地吸附条不同源，R4）：按旧口径 dim 行展示
-                sessionState?.queuedMessages?.takeIf { !it.isEmpty }?.let { queued ->
+                // 原生桥接没有队列明细；已确认的手机派发方式只标“已提交”，不猜条数/消费进度。
+                sessionState?.takeIf { it.hasQueuedMessages }?.let { queueState ->
+                    val queued = queueState.queuedMessages
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 20.dp)
                             .testTag("finecat.queued"),
                     ) {
-                        queued.steering.forEach { Text(
-                            text = "Steering: $it",
+                        if (queued?.isEmpty != false) {
+                            val modes = queueState.submittedQueueModes
+                            Text(
+                                text = if (modes.isEmpty()) "有消息等待执行" else modes.joinToString(" · ") {
+                                    if (it == "steer") "Steer 已提交" else "Follow-up 已提交"
+                                },
+                                style = LocalFineCatType.current.xs,
+                                color = colors.text3,
+                                modifier = Modifier.testTag("finecat.queued.pending"),
+                            )
+                        }
+                        queued?.steering.orEmpty().forEach { Text(
+                            text = "Steer: $it",
                             style = LocalFineCatType.current.xs,
                             color = colors.text3,
                         ) }
-                        queued.followUp.forEach { Text(
+                        queued?.followUp.orEmpty().forEach { Text(
                             text = "Follow-up: $it",
                             style = LocalFineCatType.current.xs,
                             color = colors.text3,
                         ) }
                         if ("dequeue" in stateHolder.gatewayState.capabilities) {
                             FcTextButton(
-                                text = if (queued.steering.size + queued.followUp.size > 1) "全部撤回到输入框" else "撤回到输入框",
+                                text = if (queueState.pendingMessages || queued?.let { it.steering.size + it.followUp.size > 1 } == true)
+                                    "全部撤回到输入框" else "撤回到输入框",
                                 onClick = stateHolder::recallQueuedMessages,
                                 enabled = stateHolder.canRecallQueuedMessages,
                                 modifier = Modifier.align(Alignment.End).testTag("finecat.queued.recall"),
@@ -1208,6 +1235,7 @@ private fun FineCatAppContent(
                     },
                     ),
                     homeStyle = showHome,
+                    sendReady = showHome || connected,
                     showDirectory = true,
                     directory = displayedCwd,
                     directoryBranch = stateHolder.worktreeLocation?.takeIf { stateHolder.supportsWorktrees && it.cwd == displayedCwd && it.repoRoot != null }?.let { location ->
@@ -1255,8 +1283,10 @@ private fun FineCatAppContent(
                     preparingPhotoUris = stateHolder.preparingPhotoUris,
                     onRemovePreparedImage = stateHolder::removePreparedImage,
                     onSend = {
-                        pinnedToBottom = true
-                        stateHolder.sendComposerDraft(requireDirectory = true)
+                        if (showHome || stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED) {
+                            pinnedToBottom = true
+                        }
+                        stateHolder.sendComposerDraft(requireDirectory = true, requireConnection = !showHome)
                     },
                     onStop = stateHolder::abortCurrent,
                     showAttach = true,
@@ -1430,11 +1460,9 @@ private fun FineCatAppContent(
                     },
                 )
             }
-            // 浮层之上的全局瞬态提示（审查 F2）：抽屉是不透明面板，会把
-            // 前面那几个 GlobalTransientNotice（在抽屉之前声明）盖住——长按组标题隐藏
-            // 目录的反馈就在抽屉开着时触发。这里在抽屉之后**再**渲染一份，保证浮层
-            // 开着时提示仍可见；用独立 tag 避免同 tag 双节点制造假绿（审查 G3）。
-            if (drawerOpen) {
+            // 抽屉与设置整页都会遮住正文提示，反馈必须绘制在这些覆盖层之后。
+            // 独立 tag 区分前景提示，避免测试命中被遮住的正文节点。
+            if (drawerOpen || gatewaySheetOpen) {
                 GlobalTransientNotice(
                     stateHolder = stateHolder,
                     modifier = Modifier
@@ -1508,19 +1536,13 @@ private fun FineCatAppContent(
                 )
             }
             contextAnchor?.takeIf { composerControlsExpanded }?.let { anchor ->
-                val compactReady = stateHolder.canStartManualCompact()
-                // 禁用原因（R6）：与 canStartManualCompact 的闸门同源，按序取首个命中的原因。
-                val compactDisabledReason = if (compactReady) null else if (
-                    stateHolder.gatewayState.connection != GatewayConnectionState.CONNECTED
-                ) {
-                    "连接网关后可压缩上下文"
-                } else if (!stateHolder.supportsRequest("compact")) {
-                    "网关不支持手动压缩，请升级网关"
-                } else if (snapshot.selectedSessionId == null) {
-                    "选择会话后可压缩上下文"
-                } else {
-                    "当前状态暂不能压缩（压缩中/在途/撤回停止中）"
-                }
+                // 禁用原因（R6/REL120-01）：直接读与 canStartManualCompact 同源的闸门原因，
+                // 不另写一套推断，避免"能点但提示在压缩中"或离线误报压缩中。
+                val compactBlocked = stateHolder.manualCompactBlockedReason()
+                val compactReady = compactBlocked == null
+                // 禁用原因与按钮/执行闸门同源（REL120-01）：用同一份短句，
+                // 避免"能点但提示在压缩中"或原因与动作目标会话不一致。
+                val compactDisabledReason = compactBlocked?.let(stateHolder::manualCompactBlockedNotice)
                 FcContextPopover(
                     anchor = anchor,
                     usage = sessionState?.contextUsage,

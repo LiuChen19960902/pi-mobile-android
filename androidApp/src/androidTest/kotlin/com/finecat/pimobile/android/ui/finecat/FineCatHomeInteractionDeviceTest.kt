@@ -7,19 +7,27 @@ import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.assertIsNotFocused
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.graphics.toPixelMap
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeUp
+import androidx.compose.ui.test.swipeDown
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.test.core.app.ApplicationProvider
@@ -33,6 +41,8 @@ import com.finecat.pimobile.android.FakeNetwork
 import com.finecat.pimobile.android.FakePreferences
 import com.finecat.pimobile.android.FakeTransport
 import com.finecat.pimobile.android.waitUntil
+import com.finecat.pimobile.shared.gateway.GatewayConnectionState
+import com.finecat.pimobile.android.ui.finecat.theme.FineCatMotion
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.jsonPrimitive
@@ -81,20 +91,82 @@ class FineCatHomeInteractionDeviceTest {
         compose.runOnIdle { holder.prepareNewSession() }
     }
 
-    private fun showHistory() {
+    private fun showHistory(messageCount: Int = 12) {
         showHome()
         runBlocking {
-            transport.receive("""{"kind":"sessions","items":[{"id":"history-ime","modified":"2026-10-07T00:00:00Z","running":false,"cwd":"/tmp/finecat-test","messageCount":12,"firstMessage":"历史消息 0"}]}""")
+            transport.receive("""{"kind":"sessions","items":[{"id":"history-ime","modified":"2026-10-07T00:00:00Z","running":false,"cwd":"/tmp/finecat-test","messageCount":$messageCount,"firstMessage":"历史消息 0"}]}""")
             holder.selectSession("history-ime")
             waitUntil { holder.snapshot.selectedSessionId == "history-ime" }
-            val messages = (0 until 12).joinToString(",") {
+            val messages = (0 until messageCount).joinToString(",") {
                 """{"role":"user","content":[{"type":"text","text":"历史消息 $it"}],"timestamp":${1_791_328_000_000L + it}}"""
             }
-            val ids = (0 until 12).joinToString(",") { "\"history-ime-$it\"" }
+            val ids = (0 until messageCount).joinToString(",") { "\"history-ime-$it\"" }
             transport.receive("""{"kind":"history","sessionId":"history-ime","messages":[$messages],"entryIds":[$ids],"hasMore":false,"oldestEntryId":"history-ime-0"}""")
-            waitUntil { holder.snapshot.conversation.size == 12 }
+            waitUntil { holder.snapshot.conversation.size == messageCount }
         }
         compose.waitForIdle()
+    }
+
+    @Test
+    fun conversationOfflineSendPreservesDraftAndRequiresANewTapAfterReconnect() {
+        showHistory()
+        runBlocking {
+            transport.fail()
+            waitUntil { holder.gatewayState.connection == GatewayConnectionState.FAILED }
+        }
+        compose.onNodeWithContentDescription("发送")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "尚未连接"))
+        compose.runOnIdle { holder.messageDraft = "离线保留的合成草稿" }
+        compose.onNodeWithContentDescription("发送")
+            .assertIsEnabled()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "尚未连接"))
+            .performClick()
+        compose.onNodeWithText("尚未连接，草稿已保留").assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals("离线保留的合成草稿", holder.messageDraft)
+            assertTrue(holder.outgoingPreviews.isEmpty())
+        }
+        assertEquals(0, transport.payloadsOfType("message").size)
+        runBlocking {
+            graph.gatewayRuntime.connect("ws://127.0.0.1:3080/ws/mobile")
+            transport.open()
+            transport.receive("""{"kind":"hello","protocol":1,"authenticated":true,"capabilities":["message","sessions","subscribe","state"]}""")
+            waitUntil { holder.gatewayState.connection == GatewayConnectionState.CONNECTED }
+        }
+        compose.onNodeWithContentDescription("发送")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, ""))
+        assertEquals("连接恢复不自动发送", 0, transport.payloadsOfType("message").size)
+        compose.onNodeWithContentDescription("发送").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("message").size == 1 } }
+    }
+
+    @Test
+    fun homeSendPresentationDoesNotAdoptConversationConnectionHint() {
+        showHome()
+        runBlocking {
+            transport.fail()
+            waitUntil { holder.gatewayState.connection == GatewayConnectionState.FAILED }
+        }
+        compose.runOnIdle { holder.messageDraft = "首页草稿" }
+        compose.onNodeWithContentDescription("发送")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, ""))
+    }
+
+    @Test
+    fun discardedRecoveryReplyCannotOpenOrOverwriteAUserErrorDialog() {
+        showHistory()
+        fun deliverAfterExpiredReply(busy: Boolean) = runBlocking {
+            graph.gatewayRuntime.requestState("history-ime")
+            transport.receive("""{"kind":"error","requestType":"expired-query","sessionId":"history-ime","code":"internal"}""")
+            transport.receive("""{"kind":"state","sessionId":"history-ime","isStreaming":$busy,"isCompacting":false}""")
+            waitUntil { holder.snapshot.sessionStates["history-ime"]?.isStreaming == busy }
+        }
+        deliverAfterExpiredReply(true)
+        compose.runOnIdle { assertEquals(null, holder.platformError) }
+        compose.onNodeWithText("操作失败，请重试").assertDoesNotExist()
+        compose.runOnIdle { holder.showPlatformError("image-preprocess-failed") }
+        deliverAfterExpiredReply(false)
+        compose.runOnIdle { assertEquals("图片无法读取，请重新选择", holder.platformError) }
     }
 
     @Test
@@ -186,6 +258,106 @@ class FineCatHomeInteractionDeviceTest {
         // 侧边留白，首页/历史页都避开顶栏与正文交互控件。
         compose.onRoot().performTouchInput { click(Offset(1f, height * 0.25f)) }
         compose.waitForIdle()
+    }
+
+    @Test fun expandingBottomComposerDoesNotFlashJumpDuringViewportChanges() {
+        showHistory(messageCount = 40)
+        compose.onNodeWithText("历史消息 39").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.jump").assertDoesNotExist()
+        val initialHeight = compose.onNodeWithTag("finecat.list").fetchSemanticsNode().boundsInWindow.height
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.onNodeWithTag("fc.composer.input").performTouchInput { click() }
+            val deadline = android.os.SystemClock.elapsedRealtime() + 5_000
+            var stableSince = 0L
+            var previousImeBottom = -1
+            var previousHeight = initialHeight
+            var transitionSettled = false
+            while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                compose.mainClock.advanceTimeByFrame()
+                assertTrue(
+                    "展开及 IME 变化期间不应显示回底箭头",
+                    compose.onAllNodesWithTag("finecat.jump").fetchSemanticsNodes().isEmpty(),
+                )
+                val height = compose.onNodeWithTag("finecat.list").fetchSemanticsNode().boundsInWindow.height
+                val imeBottom = ViewCompat.getRootWindowInsets(compose.activity.window.decorView)
+                    ?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (imeBottom <= 0 || height >= initialHeight ||
+                    imeBottom != previousImeBottom || height != previousHeight
+                ) stableSince = now
+                if (imeBottom > 0 && height < initialHeight && now - stableSince >= 200) {
+                    transitionSettled = true
+                    break
+                }
+                previousImeBottom = imeBottom
+                previousHeight = height
+                // IME 使用宿主时钟，给窗口动画推进时间，不能只推进 Compose 时钟。
+                android.os.SystemClock.sleep(16)
+            }
+            assertTrue("应实际观察到 IME 和变小后的列表视口稳定", transitionSettled)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+        compose.waitUntil(5_000) { imeVisible() }
+        compose.onNodeWithTag("fc.composer.input").assertIsFocused()
+        compose.onNodeWithTag("finecat.jump").assertDoesNotExist()
+        assertTrue(compose.onNodeWithTag("finecat.list").fetchSemanticsNode().boundsInWindow.height < initialHeight)
+        compose.onNodeWithText("历史消息 39").assertIsDisplayed()
+    }
+
+    @Test fun userCanStillReturnToBottomAfterExpandingWhileReadingHistory() {
+        showHistory(messageCount = 40)
+        compose.onNodeWithTag("finecat.list").performTouchInput { swipeDown() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("finecat.jump").assertIsDisplayed()
+        focusInput()
+        compose.onNodeWithTag("finecat.jump").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.jump").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("历史消息 39").assertIsDisplayed()
+        compose.onNodeWithTag("finecat.jump").assertDoesNotExist()
+    }
+
+    @Test fun emptyComposerCollapsesThroughIntermediateGeometryAndKeepsItsEditor() {
+        showHistory(messageCount = 40)
+        val inputId = compose.onNodeWithTag("fc.composer.input").fetchSemanticsNode().id
+        val capsule = compose.onNodeWithTag("fc.composer.card").fetchSemanticsNode().boundsInWindow
+        focusInput()
+        val expanded = compose.onNodeWithTag("fc.composer.card").fetchSemanticsNode().boundsInWindow
+        assertTrue(expanded.width > capsule.width && expanded.height > capsule.height)
+        // 首帧检查真实表面，不能只用layout bounds冒充可见轮廓。
+        val expandedPixels = compose.onNodeWithTag("fc.composer.card").captureToImage().toPixelMap()
+        val sampleX = expandedPixels.width / 2
+        val sampleY = expandedPixels.height * 3 / 4
+        val surface = expandedPixels[sampleX, sampleY]
+        compose.mainClock.autoAdvance = false
+        try {
+            outsideTap()
+            compose.mainClock.advanceTimeByFrame()
+            val firstPixels = compose.onNodeWithTag("fc.composer.card").captureToImage().toPixelMap()
+            // 固定展开态的卡片局部像素，不能随首帧缩小后的尺寸重新取3/4。
+            // 不取窗口绝对点：IME合法位移会带着整张卡片移动。
+            assertTrue("首帧可见卡片不能瞬间缩过展开态下半部", firstPixels.width > sampleX && firstPixels.height > sampleY)
+            assertEquals("首帧下半部仍应由卡片表面覆盖", surface, firstPixels[sampleX, sampleY])
+            compose.mainClock.advanceTimeBy(FineCatMotion().base.toLong() / 2)
+            val middle = compose.onNodeWithTag("fc.composer.card").fetchSemanticsNode().boundsInWindow
+            assertTrue("收回中应有中间宽度", middle.width > capsule.width && middle.width < expanded.width)
+            assertTrue("收回中应有中间高度", middle.height > capsule.height && middle.height < expanded.height)
+            assertEquals(inputId, compose.onNodeWithTag("fc.composer.input").fetchSemanticsNode().id)
+            compose.onNodeWithTag("finecat.jump").assertDoesNotExist()
+            compose.mainClock.advanceTimeBy(FineCatMotion().base.toLong() * 4)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+        compose.waitUntil(5_000) { !imeVisible() }
+        compose.waitForIdle()
+        val collapsed = compose.onNodeWithTag("fc.composer.card").fetchSemanticsNode().boundsInWindow
+        assertEquals(capsule.size, collapsed.size)
+        assertEquals(inputId, compose.onNodeWithTag("fc.composer.input").fetchSemanticsNode().id)
+        compose.onNodeWithTag("fc.composer.input").assertIsNotFocused()
+        compose.onNodeWithTag("finecat.jump").assertDoesNotExist()
+        compose.onNodeWithText("历史消息 39").assertIsDisplayed()
     }
 
     @Test fun historyViewportStaysVisibleWhenImeOpensClosesAndReopens() {

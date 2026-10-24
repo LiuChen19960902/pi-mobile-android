@@ -16,14 +16,14 @@ export ANDROID_HOME=/path/to/android-sdk
 ## 构建与运行
 
 ```bash
-./gradlew :androidApp:assembleDebug        # APK → androidApp/build/outputs/apk/debug/
-./gradlew :androidApp:installDebug         # 装到已连接设备
+./gradlew :androidApp:assembleDebug        # Preview APK → androidApp/build/outputs/apk/debug/
+./gradlew :androidApp:installDebug         # 安装 Preview 到已连接设备
 ./scripts/deploy.sh                        # 开发循环：构建安装 → adb reverse 端口 → 启动 App → 清 logcat
 ```
 
 `scripts/deploy.sh` 假设网关跑在本机（含 WSL）并监听 3080，通过 `adb reverse` 让手机的 `127.0.0.1:3080` 回到电脑——这也是 App 里默认 endpoint 取 `ws://127.0.0.1:3080/ws/mobile` 的原因。真机走局域网或 tailnet 地址时不需要 `adb reverse`。
 
-普通启动默认是 FineCat。debug 构建还包含试用入口，可通过 `debug_finecat_ui=false` 启动参数切回旧界面对照；正式版不开放此参数。Release 构建、长期签名与升级规则见 [Docs/releasing.md](Docs/releasing.md)。
+普通启动默认是 FineCat。日常调试与真机验收使用 Preview，`debug` 是其 Gradle 构建类型，包名、数据隔离和分发规则见 [Preview 调试渠道](Docs/releasing.md#preview-调试渠道)。Preview 可通过 `debug_finecat_ui=false` 启动参数切回旧界面对照；正式版不开放此参数。
 
 ## 测试
 
@@ -66,7 +66,7 @@ export ANDROID_HOME=/path/to/android-sdk
 
 ## 持续集成
 
-[Android CI](.github/workflows/ci.yml)在GitHub托管Linux上运行文档与脚本检查、共享层和Android JVM测试、debug构建，并要求网关一致性测试实际执行且没有跳过。配套网关固定到工作流中的提交，CI先安装其依赖。网关私有时需要名为GATEWAY_CI_SSH_KEY的只读单仓deploy key；公开后可删除该secret，使用普通公开检出。
+[Android CI](.github/workflows/ci.yml)在GitHub托管Linux上运行文档与脚本检查、共享层和Android JVM测试、Preview构建，并要求网关一致性测试实际执行且没有跳过。配套网关固定到工作流中的提交，CI先安装其依赖。网关私有时需要名为GATEWAY_CI_SSH_KEY的只读单仓deploy key；公开后可删除该secret，使用普通公开检出。
 
 网关仓的CI执行类型检查、lint与串行单测。两端有协议变化时同步维护配套提交与一致性用例。真实模型、真机、正式签名APK不属于普通PR检查；CI通过不代替这些验证。
 

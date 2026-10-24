@@ -17,14 +17,25 @@ import org.junit.Test
  * 失败/未确认的带图发送会把整段载荷留在内存里。
  */
 class OutgoingImagePreviewTrackerTest {
+
+    @Test
+    fun sendTokensAreUniqueAcrossTrackersAndProcessIncarnations() {
+        // 请求身份会经 sent 帧进入 operationId；两个 tracker 各自从 send-1 起号时，
+        // 不同进程/实例的请求会撞成同一个 operationId，网关只按操作 ID 去重。
+        val first = OutgoingImagePreviewTracker().newSendToken()
+        val second = OutgoingImagePreviewTracker().newSendToken()
+        assertTrue("sendToken 必须跨 tracker 唯一：$first / $second", first != second)
+        assertTrue("sendToken 需要带随机段：$first", Regex("^send-[0-9a-f]{12,}-1$").matches(first))
+    }
+
     @Test
     fun handledConsumesOnlyItsOwnPreviewWithoutWaitingForUserEcho() {
         val tracker = OutgoingImagePreviewTracker()
         for (token in listOf("handled", "other")) {
             tracker.begin(token, "s-1", 0L, "draft", images(token), restoreImages(token))
         }
-        tracker.trackAwaiting("handled", "s-1")
-        assertEquals("handled", tracker.consumeSent("s-1", 10L, sdkAccepted = true)?.sendToken)
+        tracker.trackAwaiting("handled", "s-1", 1L)
+        assertEquals("handled", tracker.consumeSent("s-1", 10L, submissionAcknowledged = true)?.sendToken)
         assertNull(tracker.headAwaitingToken())
         assertEquals(listOf("other"), tracker.previews.map { it.sendToken })
         assertNull(tracker.settleLocalFailure("handled"))
@@ -99,7 +110,7 @@ class OutgoingImagePreviewTrackerTest {
             token = "send-1", sessionId = "s-1", newSessionEpoch = 0L,
             draftText = "带图草稿", images = images("send-1"), restoreImages = restoreImages("send-1")
         )
-        tracker.trackAwaiting("send-1", "s-1")
+        tracker.trackAwaiting("send-1", "s-1", 1L)
         // 超时：只意味着未确认，token 已出队。
         assertEquals(
             OutgoingImagePreviewState.UNCONFIRMED,
@@ -111,7 +122,7 @@ class OutgoingImagePreviewTrackerTest {
             token = "send-2", sessionId = "s-2", newSessionEpoch = 0L,
             draftText = "带图草稿", images = images("send-2"), restoreImages = restoreImages("send-2")
         )
-        tracker.trackAwaiting("send-2", "s-2")
+        tracker.trackAwaiting("send-2", "s-2", 1L)
 
         // A 的迟到 sent：既不消费队头，也不把 B 绑到 s-1。
         assertNull(tracker.consumeSent("s-1", 20L))
@@ -134,14 +145,14 @@ class OutgoingImagePreviewTrackerTest {
             token = "send-1", sessionId = "s-1", newSessionEpoch = 0L,
             draftText = "带图草稿", images = images("send-1"), restoreImages = restoreImages("send-1")
         )
-        tracker.trackAwaiting("send-1", "s-1")
+        tracker.trackAwaiting("send-1", "s-1", 1L)
         tracker.consumeFailure(asUnconfirmed = true)
 
         tracker.begin(
             token = "send-2", sessionId = "s-1", newSessionEpoch = 0L,
             draftText = "带图草稿", images = images("send-2"), restoreImages = restoreImages("send-2")
         )
-        tracker.trackAwaiting("send-2", "s-1")
+        tracker.trackAwaiting("send-2", "s-1", 1L)
 
         val confirmed = tracker.consumeSent("s-1", 40L)
         assertEquals("send-2", confirmed?.sendToken)
@@ -157,7 +168,7 @@ class OutgoingImagePreviewTrackerTest {
             token = "send-1", sessionId = null, newSessionEpoch = 7L,
             draftText = "带图草稿", images = images("send-1"), restoreImages = restoreImages("send-1")
         )
-        tracker.trackAwaiting("send-1", null)
+        tracker.trackAwaiting("send-1", null, 1L)
 
         val confirmed = tracker.consumeSent("s-9", 10L)
         assertEquals("send-1", confirmed?.sendToken)

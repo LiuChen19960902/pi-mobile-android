@@ -12,11 +12,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -168,6 +171,23 @@ internal fun FineCatSettingsScreen(
                     },
                     modifier = Modifier.testTag("finecat.gwDisconnect"),
                 )
+                if (connected && "host-mode" in stateHolder.gatewayState.capabilities) {
+                    val hostMode = stateHolder.gatewayState.hostMode
+                    FcRowDivider()
+                    FcSettingRow(
+                        label = "连接模式",
+                        lead = FineCatIcons.Terminal,
+                        value = when (hostMode) {
+                            "bridge" -> "原生 Pi"
+                            "sdk" -> "网关会话"
+                            else -> "读取中…"
+                        },
+                        onClick = {
+                            stateHolder.setHostMode(if (hostMode == "bridge") "sdk" else "bridge")
+                        },
+                        modifier = Modifier.testTag("finecat.hostMode"),
+                    )
+                }
                 FcRowDivider()
                 FcSettingRow(
                     label = "扫码配对",
@@ -415,7 +435,7 @@ private fun FineCatGatewayEntriesSheet(
     }
 }
 
-/** 扫码与手动输入共用真实配对链路；失败保留输入，取消返回设置。 */
+/** 短码只存在当前弹层内存；扫码/长文本继续共用原有载荷链路。 */
 @Composable
 internal fun FineCatManualPairingSheet(
     stateHolder: AndroidSharedStateHolder,
@@ -424,6 +444,9 @@ internal fun FineCatManualPairingSheet(
     val colors = LocalFineCatColors.current
     val type = LocalFineCatType.current
     val connection = stateHolder.gatewayState.connection
+    var usePayload by remember { mutableStateOf(false) }
+    var address by remember { mutableStateOf(stateHolder.gatewayState.endpoint.orEmpty()) }
+    var shortCode by remember { mutableStateOf("") }
     var pairingError by remember { mutableStateOf<String?>(null) }
     var didAttemptPair by remember { mutableStateOf(false) }
     val pairingInFlight = connection in setOf(
@@ -431,7 +454,11 @@ internal fun FineCatManualPairingSheet(
         GatewayConnectionState.AUTHENTICATING,
         GatewayConnectionState.WAITING_FOR_NETWORK,
     )
-    val canPair = stateHolder.pairingPayload.isNotBlank() && !pairingInFlight
+    val canPair = !pairingInFlight && if (usePayload) stateHolder.pairingPayload.isNotBlank()
+        else address.isNotBlank() && shortCode.length == 6
+    LaunchedEffect(connection) {
+        if (didAttemptPair && connection == GatewayConnectionState.CONNECTED) shortCode = ""
+    }
     FcSheet(
         visible = true,
         title = "手动配对",
@@ -440,71 +467,77 @@ internal fun FineCatManualPairingSheet(
         onDismiss = onDismiss,
         modifier = Modifier.testTag("finecat.manualPairingSheet"),
     ) {
-        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp)) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
             FcSettingCard {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    BasicTextField(
-                        value = stateHolder.pairingPayload,
-                        onValueChange = {
-                            stateHolder.pairingPayload = it
-                            // 继续编辑即清除上次行内错误与提交标记
-                            pairingError = null
-                            didAttemptPair = false
-                        },
-                        singleLine = true,
-                        textStyle = type.sm.copy(fontFamily = FontFamily.Monospace, color = colors.text),
-                        cursorBrush = SolidColor(colors.brand),
-                        decorationBox = { inner ->
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                if (stateHolder.pairingPayload.isEmpty()) {
-                                    Text(
-                                        text = "配对信息",
-                                        style = type.sm.copy(fontFamily = FontFamily.Monospace),
-                                        color = colors.text3,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (usePayload) {
+                        PairingTextInput(
+                            value = stateHolder.pairingPayload,
+                            onValueChange = {
+                                stateHolder.pairingPayload = it
+                                pairingError = null
+                                didAttemptPair = false
+                            },
+                            placeholder = "配对文本",
+                            tag = "finecat.pairingInput",
+                        )
+                    } else {
+                        Text("网关地址", style = type.xs, color = colors.text3)
+                        PairingTextInput(
+                            value = address,
+                            onValueChange = { address = it; pairingError = null; didAttemptPair = false },
+                            placeholder = "IP:端口 或 wss://地址",
+                            tag = "finecat.pairingAddress",
+                            keyboardType = KeyboardType.Uri,
+                        )
+                        FcRowDivider(startInset = 0.dp)
+                        Text("六位配对码", style = type.xs, color = colors.text3)
+                        PairingTextInput(
+                            value = shortCode,
+                            onValueChange = {
+                                if (it.length <= 6 && it.all { char -> char in '0'..'9' }) {
+                                    shortCode = it
+                                    pairingError = null
+                                    didAttemptPair = false
                                 }
-                                inner()
-                            }
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("finecat.pairingInput"),
-                    )
+                            },
+                            placeholder = "000000",
+                            label = "六位配对码",
+                            tag = "finecat.pairingCode",
+                            keyboardType = KeyboardType.Number,
+                        )
+                    }
                     FcTextButton(
                         text = "配对",
                         enabled = canPair,
                         modifier = Modifier.testTag("finecat.pairingSubmit"),
                         onClick = {
-                            val trimmed = stateHolder.pairingPayload.trim()
-                            // 本地先解析：格式错直接行内报错，不发网、不清输入
-                            val validation = runCatching {
-                                GatewayPairingPayloadParser.parse(trimmed, System.currentTimeMillis())
-                            }
-                            if (validation.isFailure) {
-                                pairingError = validation.exceptionOrNull()?.message ?: "配对信息无效"
-                                didAttemptPair = true
+                            pairingError = null
+                            didAttemptPair = true
+                            if (usePayload) {
+                                val trimmed = stateHolder.pairingPayload.trim()
+                                val valid = runCatching {
+                                    GatewayPairingPayloadParser.parse(trimmed, System.currentTimeMillis())
+                                }.isSuccess
+                                if (!valid) pairingError = "配对信息无效"
+                                else stateHolder.pair(trimmed, reportFailureGlobally = false, onFailure = { pairingError = it })
                             } else {
-                                pairingError = null
-                                didAttemptPair = true
-                                stateHolder.pairingPayload = trimmed
-                                stateHolder.pair(
-                                    payload = trimmed,
-                                    reportFailureGlobally = false,
-                                    onFailure = { pairingError = it },
-                                )
+                                val endpoint = normalizeGatewayEndpoint(address)
+                                if (endpoint == null) pairingError = "网关地址无效"
+                                else stateHolder.pairWithCode(endpoint, shortCode, onFailure = { pairingError = it })
                             }
                         },
                     )
                 }
             }
+            FcTextButton(
+                text = if (usePayload) "使用六位码" else "粘贴配对文本",
+                modifier = Modifier.testTag("finecat.pairingMode"),
+                onClick = { usePayload = !usePayload; pairingError = null; didAttemptPair = false },
+            )
             pairingOutcomeText(
                 connection = connection,
                 didAttemptPair = didAttemptPair,
@@ -515,14 +548,39 @@ internal fun FineCatManualPairingSheet(
                     text = outcome.text,
                     style = type.xs,
                     color = if (outcome.isError) colors.err else colors.ok,
-                    modifier = Modifier
-                        .padding(vertical = 4.dp)
-                        .testTag("finecat.pairingOutcome"),
+                    modifier = Modifier.testTag("finecat.pairingOutcome"),
                 )
             }
-
         }
     }
+}
+
+@Composable
+private fun PairingTextInput(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    tag: String,
+    label: String = placeholder,
+    keyboardType: KeyboardType = KeyboardType.Text,
+) {
+    val colors = LocalFineCatColors.current
+    val type = LocalFineCatType.current
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        textStyle = type.sm.copy(fontFamily = FontFamily.Monospace, color = colors.text),
+        cursorBrush = SolidColor(colors.brand),
+        decorationBox = { inner ->
+            Box(Modifier.fillMaxWidth().heightIn(min = 48.dp), contentAlignment = Alignment.CenterStart) {
+                if (value.isEmpty()) Text(placeholder, style = type.sm, color = colors.text3)
+                inner()
+            }
+        },
+        modifier = Modifier.fillMaxWidth().testTag(tag).semantics { contentDescription = label },
+    )
 }
 
 /** 「新增 Provider」的哨兵 id（表单层据此判断是新建还是编辑既有）。 */

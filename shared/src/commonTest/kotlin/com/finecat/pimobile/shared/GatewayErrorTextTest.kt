@@ -20,12 +20,22 @@ class GatewayErrorTextTest {
             Triple("set-model", "not-connected", "网关未连接"),
             Triple("name", "bad-request", "会话名称无效"),
             Triple("provider-put", "internal", "Provider保存失败"),
+            Triple("dequeue", "editor-unavailable", "输入框被占用或不支持取回排队消息"),
+            Triple("dequeue", "dequeue-unconfirmed", "排队消息去向未确认，请在电脑查看"),
         )
         for ((request, code, expected) in cases) {
             val text = GatewayErrorText.request(request, code)
             assertEquals(expected, text)
             assertTrue(text.length <= 24)
         }
+    }
+
+    @Test
+    fun treeNavigationEditorFailureDoesNotPretendToBeAQueueFailure() {
+        val text = GatewayErrorText.request("switch-branch", "editor-unavailable")
+        assertEquals("会话编辑器暂不可用，请重载原生 Pi", text)
+        assertFalse(text.contains("排队"))
+        assertEquals("输入框被占用或不支持取回排队消息", GatewayErrorText.request("dequeue", "editor-unavailable"))
     }
 
     @Test
