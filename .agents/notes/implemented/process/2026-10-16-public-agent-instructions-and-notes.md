@@ -23,6 +23,7 @@ Status: implemented
 
 - 目录为 `{proposed,implemented,rejected}/{feature,bug-fix,simplification,architecture,process,testing}/yyyy-mm-dd-topic.md`，固定头部与章节，`考虑过的方案` 必填，规则见 [README](../../README.md)。只用中文，不维护集中索引。
 - 非平凡改动必须在同一提交或 PR 中新增或更新 Agent Note。
+- 未排期需求在私有Backlog维护，验收台账只保留迁移引用；公开Agent Notes记录决定与理由，不兼作任务清单。过期执行计划移出当前入口，删除前保留独有内容和原文归档。
 - 开发期的旧笔记不公开。仍有效的规则逐条改写进 `implemented/`：去掉内部编号、私有证据链接和过程叙述，保留机制、条件、取舍和核对入口；已删除功能的记录没有迁移。
 - 私有旧笔记目录由根 `.gitignore` 排除；已跟踪文件从 Git 索引移除但保留本机副本。忽略规则不清除旧提交，首次公开仍须使用[筛选后的无历史快照](2026-09-19-public-release-snapshot.md)。
 

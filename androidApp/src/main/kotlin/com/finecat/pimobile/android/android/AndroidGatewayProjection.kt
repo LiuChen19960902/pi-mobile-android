@@ -11,6 +11,7 @@ import com.finecat.pimobile.shared.facade.SharedMviEvent
 import com.finecat.pimobile.shared.facade.SharedMobileSnapshot
 import com.finecat.pimobile.shared.facade.SharedMobileStore
 import com.finecat.pimobile.shared.projection.ConversationItem
+import com.finecat.pimobile.shared.projection.ConversationItemKind
 import com.finecat.pimobile.shared.projection.sessionEventIdentity
 import com.finecat.pimobile.shared.projection.TrajectoryNode
 import com.finecat.pimobile.shared.projection.TrajectoryProjection
@@ -85,6 +86,27 @@ internal class AndroidGatewayProjection(
     // 如需该索引，重建时必须同步进 clearSessionBuffers。
     private val conversationItems = mutableMapOf<String, List<ConversationItem>>()
     private val conversationLastSequences = mutableMapOf<String, Int>()
+    /** 桥接实例代际：instanceId+epoch。变化时先丢弃旧代际实时投影，等新快照重建。 */
+    private val bridgeGenerations = mutableMapOf<String, String>()
+    /** 每代际最后消费的 bridgeSeq；同代际倒退说明是迟到帧。 */
+    private val bridgeLastSequences = mutableMapOf<String, Int>()
+    /** wire seq 每次订阅归零；本地已接收事件保持单调，避免覆盖旧记录。 */
+    private val bridgeProjectionSequences = mutableMapOf<String, Int>()
+    /** normalizer 每份快照归零，投影流键分配新范围，避免与已完成消息的键碰撞。 */
+    private val bridgeTurnOffsets = mutableMapOf<String, Int>()
+    private val bridgeLatestTurns = mutableMapOf<String, Int>()
+    /** 快照里的进行中正文/活动工具；事件或历史一到就被权威内容替换。 */
+    private val bridgeOverlays = mutableMapOf<String, BridgeOverlay>()
+    /** 当前快照流在本地投影里的 turn/step；输入坐标经快照偏移后落在同一键。 */
+    private val bridgeStreamPositions = mutableMapOf<String, Pair<Int, Int>>()
+    /** 已种进 ConversationStore 的快照流 key；新快照/历史重建后要能精确替换。 */
+    private val bridgeSeededStreamKeys = mutableMapOf<String, List<String>>()
+    /** 快照之后已到达但还没写进历史的 delta；历史重建后用它补回完整前缀。 */
+    private val bridgeStreamSuffixes = mutableMapOf<String, Pair<String, String>>()
+    /** 最近一次快照的 partial；历史重建会用同一前缀重新种流，不能只依赖一次性条目。 */
+    private val bridgeSnapshotPartials = mutableMapOf<String, JsonValue>()
+    /** 最新历史请求发出时的代际/本地前缀对象；迟到idle不能清替换后的新快照。 */
+    private val bridgeHistoryCheckpoints = mutableMapOf<String, Pair<String, JsonValue>>()
     private var controlSnapshot = mobileStore.snapshot()
     private var lastFrameKind: String? = null
     private var lastError: String? = null
@@ -98,7 +120,7 @@ internal class AndroidGatewayProjection(
             sessions = controlSnapshot.sessions.map { session ->
                 session.copy(hasFailure = !session.isRunning && session.id in failedSessionIds)
             },
-            conversation = controlSnapshot.selectedSessionId?.let(conversationItems::get).orEmpty(),
+            conversation = controlSnapshot.selectedSessionId?.let(::conversationFor).orEmpty(),
             selectedHistoryHasMore = controlSnapshot.selectedSessionId?.let(historyHasMore::get) == true,
             selectedHistoryEarliestSequence = controlSnapshot.selectedSessionId
                 ?.let(historyEvents::get)?.firstOrNull()?.seq,
@@ -213,6 +235,8 @@ internal class AndroidGatewayProjection(
         historyStore.clearSession(sessionId)
         conversationStore.clearSession(sessionId)
         historyEvents.remove(sessionId)
+        bridgeProjectionSequences.remove(sessionId)
+        bridgeHistoryCheckpoints.remove(sessionId)
         historySyntheticSeqs.remove(sessionId)
         historyOldestEntryIds.remove(sessionId)
         historyHasMore.remove(sessionId)
@@ -242,7 +266,37 @@ internal class AndroidGatewayProjection(
                 // 同样要进 mobileStore：重连 catch-up 时它就是唯一的状态纠正来源。
                 controlSnapshot = mobileStore.acceptFrame(rawJson)
             }
-            "event" -> acceptLive(frame, normalizedEvents)
+            "event" -> if (acceptBridgeEvent(frame)) {
+                // 归一一次，raw 状态字段与 normalized 事件在同一次 acceptFrame 里按
+                // 同一个"状态是否权威"结论消费：旧事件的 turn/compact/queue 不能
+                // 绕过门控把更新的 state 改回去，正文仍照常合并。
+                val events = bridgeProjectionEvents(frame, normalizedEvents)
+                controlSnapshot = mobileStore.acceptEventFrame(frame, events)
+                acceptLive(frame, events)
+            }
+            "bridge-snapshot" -> {
+                acceptBridgeSnapshot(frame)
+                controlSnapshot = mobileStore.acceptFrame(rawJson)
+            }
+            "bridge-offline" -> {
+                frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
+                    bridgeOverlays.remove(sessionId)
+                    // offline 没有后继快照：已种的前缀/后缀和位置全部作废，
+                    // 否则重连补拉历史时会把死实例的 partial 再种回来。
+                    val keys = buildSet {
+                        bridgeSeededStreamKeys.remove(sessionId)?.let(::addAll)
+                        bridgeStreamPositions[sessionId]?.let { (turn, step) ->
+                            add("text-$turn-$step"); add("reason-$turn-$step")
+                        }
+                    }.toList()
+                    conversationStore.clearStreams(sessionId, keys)
+                    historyStore.discardStreamChunks(sessionId, keys)
+                    bridgeStreamPositions.remove(sessionId)
+                    bridgeStreamSuffixes.remove(sessionId)
+                    bridgeSnapshotPartials.remove(sessionId)
+                }
+                controlSnapshot = mobileStore.acceptFrame(rawJson)
+            }
             "hello" -> Unit
             "sent" -> {
                 controlSnapshot = mobileStore.acceptFrame(rawJson)
@@ -285,6 +339,17 @@ internal class AndroidGatewayProjection(
         historyPendingSessionId = null
         conversationItems.clear()
         conversationLastSequences.clear()
+        bridgeGenerations.clear()
+        bridgeLastSequences.clear()
+        bridgeProjectionSequences.clear()
+        bridgeTurnOffsets.clear()
+        bridgeLatestTurns.clear()
+        bridgeStreamPositions.clear()
+        bridgeSeededStreamKeys.clear()
+        bridgeStreamSuffixes.clear()
+        bridgeSnapshotPartials.clear()
+        bridgeHistoryCheckpoints.clear()
+        bridgeOverlays.clear()
         controlSnapshot = mobileStore.reset()
         lastFrameKind = null
         lastError = null
@@ -311,11 +376,13 @@ internal class AndroidGatewayProjection(
     }
 
     fun historyTimedOut(sessionId: String) {
+        bridgeHistoryCheckpoints.remove(sessionId)
         historyStore.timedOut(sessionId)
         flushPendingLatestReload(sessionId)
     }
 
     fun historyCancelled(sessionId: String) {
+        bridgeHistoryCheckpoints.remove(sessionId)
         historyStore.cancelled(sessionId)
         flushPendingLatestReload(sessionId)
     }
@@ -354,6 +421,7 @@ internal class AndroidGatewayProjection(
             failHistoryLoad(null, "history-correlation-missing")
             return
         }
+        val bridgeCheckpoint = bridgeHistoryCheckpoints.remove(sessionId)
         val messages = frame.messages.orEmpty().mapNotNull { item ->
             runCatching {
                 historyMessageJson.decodeFromJsonElement(GatewayHistoryMessage.serializer(), item.toJsonElement())
@@ -386,10 +454,33 @@ internal class AndroidGatewayProjection(
             failHistoryLoad(sessionId, result.errorCode ?: "history-page-failed")
             return
         }
+        // 后台可能错过终态。只有本次最新历史确认空闲且仍持有请求时的同一
+        // 缓存前缀，才能退场；同轮delta不算新快照，替换后的前缀不能被迟到历史清掉。
+        if (frame.isStreaming == false && frame.isCompacting == false && bridgeCheckpoint != null &&
+            bridgeCheckpoint.first == bridgeGenerations[sessionId] &&
+            bridgeCheckpoint.second === bridgeSnapshotPartials[sessionId]
+        ) {
+            val keys = buildSet {
+                bridgeSeededStreamKeys.remove(sessionId)?.let(::addAll)
+                bridgeStreamPositions.remove(sessionId)?.let { (turn, step) ->
+                    add("text-$turn-$step"); add("reason-$turn-$step")
+                }
+            }.toList()
+            conversationStore.clearStreams(sessionId, keys)
+            historyStore.discardStreamChunks(sessionId, keys)
+            bridgeSnapshotPartials.remove(sessionId)
+            bridgeStreamSuffixes.remove(sessionId)
+            bridgeOverlays.remove(sessionId)
+        }
         historyFailures.remove(sessionId)
         historyHasMore[sessionId] = frame.hasMore == true
         updateFailureOutcome(sessionId, fromHistory = true)
-        conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()))
+        conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()), minimumSequence = bridgeProjectionSequences[sessionId])
+        // 不能用 remove 后再 seed：历史重建可能已把 live delta 带回来，
+        // seed 需要拿着旧 key 先摘掉它，才能按“快照前缀+live 后缀”重排。
+        val partial = bridgeSnapshotPartials[sessionId]
+        if (partial != null) seedBridgeStream(sessionId, partial)
+        else bridgeSeededStreamKeys.remove(sessionId)
         flushPendingLatestReload(sessionId)
     }
 
@@ -402,6 +493,7 @@ internal class AndroidGatewayProjection(
             ?: controlSnapshot.selectedSessionId?.takeIf(String::isNotBlank)
             ?: return
         historyFailures[resolved] = code
+        bridgeHistoryCheckpoints.remove(resolved)
         historyStore.cancelled(resolved)
         // 失败也会空出批次名额；不补发待取意图就会停在“无在途、无新页”的死窗口。
         flushPendingLatestReload(resolved)
@@ -470,7 +562,9 @@ internal class AndroidGatewayProjection(
                         val tokens = tokensBefore?.let { (it / 1000).toInt().coerceAtLeast(1) }
                         GatewayEvent(type = "compact/done", text = tokens?.let { "压缩前 ${it}k tokens" })
                     }
-                    null, "custom_message", "wire_oversized" -> PiEventNormalizer.textOf(message.content)
+                    "wire_oversized" -> PiEventNormalizer.textOf(message.content)
+                        .takeIf(String::isNotBlank)?.let { GatewayEvent(type = "notice/omitted", text = it) }
+                    null, "custom_message" -> PiEventNormalizer.textOf(message.content)
                         .takeIf(String::isNotBlank)?.let { GatewayEvent(type = "notice/custom", text = it) }
                     else -> null
                 }
@@ -491,17 +585,281 @@ internal class AndroidGatewayProjection(
         else -> timestamp
     }
 
+    /** 返回 false 表示同一代际的迟到/重复 bridgeSeq，整帧丢弃。 */
+    private fun acceptBridgeEvent(frame: GatewayFrame): Boolean {
+        val sessionId = frame.sessionId?.takeIf(String::isNotBlank) ?: return true
+        val generation = bridgeGeneration(frame)
+        if (generation != null) {
+            val previous = bridgeGenerations[sessionId]
+            if (previous != null && previous != generation) {
+                // 新代际的事件不能先把旧序号/快照翻回去；等 bridge-snapshot 建立
+                // 新代际后再接收。历史文件仍是同一会话，保留已加载历史。
+                return false
+            }
+            if (previous == null) bridgeGenerations[sessionId] = generation
+        }
+        val seq = frame.bridgeSeq
+        if (seq != null) {
+            val last = bridgeLastSequences[sessionId]
+            if (last != null && seq <= last) return false
+            bridgeLastSequences[sessionId] = seq
+        }
+        return true
+    }
+
+    private fun acceptBridgeSnapshot(frame: GatewayFrame) {
+        val sessionId = frame.sessionId?.takeIf(String::isNotBlank) ?: return
+        val generation = bridgeGeneration(frame)
+        val previousGeneration = bridgeGenerations[sessionId]
+        val previousSeq = bridgeLastSequences[sessionId]
+        val seq = frame.bridgeSeq
+        // 同代际更低水位快照是迟到重放，不能清掉投影位置和更长的正文；等水位是
+        // 同一实例重连后的合法完整快照，仍需按快照重置。Runtime 已先挡一层，这里独立防直接调用。
+        if (generation != null && generation == previousGeneration &&
+            seq != null && previousSeq != null && seq < previousSeq
+        ) return
+        // 快照是当前实时段的权威前缀；先清掉旧种子流和旧 turn/step 的活动流，
+        // 否则重连后等水位快照把位置重置到 0/0，旧 turn 的残留会和新的 delta 并存。
+        val oldKeys = buildSet {
+            bridgeSeededStreamKeys[sessionId]?.let(::addAll)
+            bridgeStreamPositions[sessionId]?.let { (turn, step) ->
+                add("text-$turn-$step")
+                add("reason-$turn-$step")
+            }
+        }
+        if (oldKeys.isNotEmpty()) {
+            conversationStore.clearStreams(sessionId, oldKeys.toList())
+            historyStore.discardStreamChunks(sessionId, oldKeys.toList())
+        }
+        if (generation != null) {
+            val previous = bridgeGenerations[sessionId]
+            if (previous != null && previous != generation) {
+                // 只替换实时段：历史来自同一会话文件，保留已加载气泡，避免
+                // /reload 后整页历史消失；后续分页仍按 entryId 去重。
+                bridgeLastSequences.remove(sessionId)
+                bridgeOverlays.remove(sessionId)
+                bridgeStreamPositions.remove(sessionId)
+                bridgeSeededStreamKeys.remove(sessionId)
+                bridgeStreamSuffixes.remove(sessionId)
+                bridgeSnapshotPartials.remove(sessionId)
+                // 旧代际的实时段（含已种进 ConversationStore 的前缀）不能跟着新实例
+                // 继续显示；历史来自同一会话文件，保留已加载基线，只丢 live 段。
+                conversationStore.replaceSession(
+                    sessionId,
+                    adapterJson.encodeToString(historyEvents[sessionId].orEmpty()),
+                    minimumSequence = bridgeProjectionSequences[sessionId]
+                )
+            }
+            bridgeGenerations[sessionId] = generation
+        }
+        bridgeLastSequences[sessionId] = frame.bridgeSeq ?: bridgeLastSequences[sessionId] ?: 0
+        bridgeSeededStreamKeys.remove(sessionId)
+        // normalizer 输入坐标每份快照归零，本地分配新范围，避免与已完成流键碰撞。
+        val base = (bridgeLatestTurns[sessionId]
+            ?: historyEvents[sessionId].orEmpty().mapNotNull { it.event.turn }.maxOrNull()
+            ?: -1) + 1
+        bridgeTurnOffsets[sessionId] = base
+        bridgeLatestTurns[sessionId] = base
+        bridgeStreamPositions[sessionId] = base to 0
+        bridgeStreamSuffixes[sessionId] = "" to ""
+        bridgeSnapshotPartials.remove(sessionId)
+        frame.partial?.let { bridgeSnapshotPartials[sessionId] = it }
+        val seeded = seedBridgeStream(sessionId, frame.partial)
+        val items = bridgeOverlayItems(sessionId, frame.partial, frame.tools.orEmpty()).filter { item ->
+            !(seeded && (item.kind == ConversationItemKind.ASSISTANT || item.kind == ConversationItemKind.REASONING))
+        }
+        if (items.isEmpty()) bridgeOverlays.remove(sessionId) else bridgeOverlays[sessionId] = BridgeOverlay(items)
+    }
+
+    /**
+     * 快照里的正文/思考是当前流的完整前缀，而重连后的 delta 没有 message_start。
+     * 先把它种进 ConversationStore 的同一 turn/step，后续 delta 才会追加而不是另起一段。
+     * 返回 false 时保留原 overlay，不能因为投影拒绝就让内容消失。
+     */
+    private fun seedBridgeStream(sessionId: String, partial: JsonValue?): Boolean {
+        val blocks = partial?.get("content")?.arrayValue ?: return false
+        val suffix = bridgeStreamSuffixes[sessionId] ?: ("" to "")
+        val text = blocks.mapNotNull { block ->
+            block["text"]?.stringValue?.takeIf { block["type"]?.stringValue == "text" }
+        }.joinToString("") + suffix.second
+        val reasoning = blocks.mapNotNull { block ->
+            block["thinking"]?.stringValue?.takeIf { block["type"]?.stringValue == "thinking" }
+        }.joinToString("") + suffix.first
+        val (turn, step) = bridgeStreamPositions[sessionId] ?: (0 to 0)
+        // 同代际重放/历史重建：先摘掉上一份快照流，避免前缀重复拼接。
+        bridgeSeededStreamKeys[sessionId]?.let { conversationStore.clearStreams(sessionId, it) }
+        bridgeSeededStreamKeys.remove(sessionId)
+        val keys = buildList {
+            if (reasoning.isNotEmpty()) add("reason-$turn-$step")
+            if (text.isNotEmpty()) add("text-$turn-$step")
+        }
+        val records = buildList {
+            if (reasoning.isNotEmpty()) add(
+                SessionEvent(
+                    sessionId = sessionId,
+                    seq = 0,
+                    time = 0.0,
+                    event = GatewayEvent(
+                        type = "assistant/chunk",
+                        turn = turn,
+                        step = step,
+                        chunkType = "reasoning-delta",
+                        text = reasoning
+                    )
+                )
+            )
+            if (text.isNotEmpty()) add(
+                SessionEvent(
+                    sessionId = sessionId,
+                    seq = 0,
+                    time = 0.0,
+                    event = GatewayEvent(
+                        type = "assistant/chunk",
+                        turn = turn,
+                        step = step,
+                        chunkType = "text-delta",
+                        text = text
+                    )
+                )
+            )
+        }
+        if (records.isEmpty()) return false
+        val accepted = conversationStore.seedStream(sessionId, adapterJson.encodeToString(records)).accepted
+        if (accepted) bridgeSeededStreamKeys[sessionId] = keys
+        return accepted
+    }
+
+    private fun bridgeGeneration(frame: GatewayFrame): String? {
+        val instanceId = frame.instanceId?.takeIf(String::isNotBlank) ?: return null
+        val epoch = frame.epoch?.takeIf(String::isNotBlank) ?: return null
+        return "$instanceId\u0000$epoch"
+    }
+
+    private fun conversationFor(sessionId: String): List<ConversationItem> {
+        val base = conversationItems[sessionId].orEmpty()
+        val overlay = bridgeOverlays[sessionId] ?: return base
+        val existingToolIds = base.filter { it.kind == ConversationItemKind.TOOL || it.kind == ConversationItemKind.JSON_TOOL }
+            .mapNotNull { it.toolCallId }.toSet()
+        val existingAssistantTexts = base.filter { it.kind == ConversationItemKind.ASSISTANT }.map { it.text }.toSet()
+        // 历史或事件已经给出本轮正式回复时，快照里的部分正文只是同一轮的旧切片；
+        // 按“最后一条 user 之后是否已有 assistant”去重，避免 message_end 与 partial 双气泡。
+        val lastUserIndex = base.indexOfLast { it.kind == ConversationItemKind.USER }
+        val liveTurnHasAssistant = lastUserIndex >= 0 &&
+            base.drop(lastUserIndex + 1).any { it.kind == ConversationItemKind.ASSISTANT }
+        return base + overlay.items.filter { item ->
+            when (item.kind) {
+                ConversationItemKind.ASSISTANT ->
+                    !liveTurnHasAssistant && item.text !in existingAssistantTexts
+                ConversationItemKind.REASONING ->
+                    !liveTurnHasAssistant && item.text !in existingAssistantTexts
+                else -> item.toolCallId == null || item.toolCallId !in existingToolIds
+            }
+        }
+    }
+
+    /** 把扩展快照的完整 partial/tools 变成可展示条目；只做读取投影，不伪造完成状态。 */
+    private fun bridgeOverlayItems(
+        sessionId: String,
+        partial: JsonValue?,
+        tools: List<JsonValue>
+    ): List<ConversationItem> {
+        val items = mutableListOf<ConversationItem>()
+        val blocks = partial?.get("content")?.arrayValue
+        val text = blocks.orEmpty().mapNotNull { block ->
+            block["text"]?.stringValue?.takeIf { block["type"]?.stringValue == "text" }
+        }.joinToString("")
+        val reasoning = blocks.orEmpty().mapNotNull { block ->
+            block["thinking"]?.stringValue?.takeIf { block["type"]?.stringValue == "thinking" }
+        }.joinToString("")
+        if (reasoning.isNotBlank()) {
+            items += ConversationItem(
+                id = "bridge-snapshot-$sessionId-reasoning",
+                kind = ConversationItemKind.REASONING,
+                title = "Think",
+                text = reasoning,
+                epochSeconds = 0.0
+            )
+        }
+        if (text.isNotBlank()) {
+            items += ConversationItem(
+                id = "bridge-snapshot-$sessionId-assistant",
+                kind = ConversationItemKind.ASSISTANT,
+                title = "Pi",
+                text = text,
+                epochSeconds = 0.0
+            )
+        }
+        tools.forEachIndexed { index, tool ->
+            val callId = tool["toolCallId"]?.stringValue ?: "snapshot-$index"
+            val name = tool["toolName"]?.stringValue ?: tool["name"]?.stringValue ?: "Tool"
+            val args = tool["args"] ?: tool["input"]
+            items += ConversationItem(
+                id = "bridge-snapshot-$sessionId-tool-$callId",
+                kind = ConversationItemKind.TOOL,
+                title = name,
+                text = args?.jsonDisplayText().orEmpty(),
+                epochSeconds = 0.0,
+                toolCallId = callId
+            )
+        }
+        return items
+    }
+
+    private data class BridgeOverlay(val items: List<ConversationItem>)
+
+    /** bridgeSeq 已验序；订阅内 seq 和 turn 只作输入坐标，不能覆写会话已有记录。 */
+    private fun bridgeProjectionEvents(frame: GatewayFrame, records: List<SessionEvent>): List<SessionEvent> {
+        val sessionId = frame.sessionId ?: return records
+        if (bridgeGeneration(frame) == null) {
+            bridgeProjectionSequences.remove(sessionId)
+            return records
+        }
+        return records.map { record ->
+            val nextSeq = maxOf(bridgeProjectionSequences[sessionId] ?: 0,
+                historyEvents[sessionId].orEmpty().lastOrNull()?.seq ?: 0) + 1
+            bridgeProjectionSequences[sessionId] = nextSeq
+            val turn = record.event.turn?.let { (bridgeTurnOffsets[sessionId] ?: 0) + it }
+            if (turn != null) bridgeLatestTurns[sessionId] = maxOf(bridgeLatestTurns[sessionId] ?: 0, turn)
+            record.copy(seq = nextSeq, event = if (turn == null) record.event else record.event.copy(turn = turn))
+        }
+    }
+
     private fun acceptLive(frame: GatewayFrame, normalizedEvents: List<SessionEvent>) {
         if (normalizedEvents.isEmpty()) return
         val sessionId = frame.sessionId
+        // 只有新 user 轮或运行结束才让快照段退场；工具/思考事件到达时
+        // assistant partial 没有等价权威条目，过早清空会让正文闪没。
+        if (!sessionId.isNullOrBlank() && normalizedEvents.any {
+                it.event.type == "user/message" || it.event.type == "turn/end" ||
+                    it.event.type == "assistant/message"
+            }
+        ) {
+            bridgeOverlays.remove(sessionId)
+            bridgeStreamSuffixes.remove(sessionId)
+            bridgeSeededStreamKeys.remove(sessionId)?.let { keys ->
+                conversationStore.clearStreams(sessionId, keys)
+                historyStore.discardStreamChunks(sessionId, keys)
+            }
+            bridgeSnapshotPartials.remove(sessionId)
+        }
         if (sessionId.isNullOrBlank()) {
             lastError = "live-event-invalid"
             return
         }
-        // 元数据事件（user/message、assistant/message、tool/*、turn/*）更新会话列表；
-        // chunk 已由 ConversationStore 增量处理，禁止进入全量投影路径。
-        controlSnapshot = mobileStore.acceptLiveEvents(normalizedEvents)
+        // 会话列表与状态已由上面的 acceptFrame(raw, events) 消费；这里只做对话/历史
+        // 投影，避免 normalized 事件被应用两次（第二次会绕过状态门控）。
         normalizedEvents.forEach { record ->
+            record.event.takeIf { it.type == "assistant/chunk" }?.let { event ->
+                event.turn?.let { turn ->
+                    bridgeStreamPositions[sessionId] = turn to (event.step ?: 0)
+                }
+                val delta = event.text.orEmpty()
+                val suffix = bridgeStreamSuffixes[sessionId] ?: ("" to "")
+                when (event.chunkType) {
+                    "text-delta" -> bridgeStreamSuffixes[sessionId] = suffix.first to suffix.second + delta
+                    "reasoning-delta" -> bridgeStreamSuffixes[sessionId] = suffix.first + delta to suffix.second
+                }
+            }
             val recordJson = adapterJson.encodeToString(record)
             // 与缓冲中同身份历史合成记录（负 seq）冲突的 live 正式记录：store 侧会丢掉
             // 合成记录改发 replace，conversation 侧也必须整窗重建——item id 已由
@@ -518,12 +876,12 @@ internal class AndroidGatewayProjection(
             }
             if (record.event.type in SESSION_OUTCOME_EVENTS) updateFailureOutcome(sessionId)
             if (supersedesSynthetic) {
-                conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()))
+                conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()), minimumSequence = bridgeProjectionSequences[sessionId])
                 return
             }
             val conversationResult = conversationStore.receiveEvent(recordJson)
             if (!conversationResult.accepted) {
-                conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()))
+                conversationStore.replaceSession(sessionId, adapterJson.encodeToString(historyEvents[sessionId].orEmpty()), minimumSequence = bridgeProjectionSequences[sessionId])
             }
         }
     }
@@ -569,8 +927,17 @@ internal class AndroidGatewayProjection(
         historyEnvelope.commit(event)
         if (event.kind == "error") lastError = event.errorCode ?: "history-store-error"
         plan.effects.forEach { effect ->
+            bridgeHistoryCheckpoints.remove(effect.sessionId)
+            val generation = bridgeGenerations[effect.sessionId]
+            val partial = bridgeSnapshotPartials[effect.sessionId]
+            if (effect.beforeEntryId == null && generation != null && partial?.objectValue != null) {
+                bridgeHistoryCheckpoints[effect.sessionId] = generation to partial
+            }
             runCatching { onHistoryPageRequested(effect.sessionId, effect.beforeEntryId, effect.resetLeaf) }
-                .onFailure { lastError = "history-effect-failed" }
+                .onFailure {
+                    bridgeHistoryCheckpoints.remove(effect.sessionId)
+                    lastError = "history-effect-failed"
+                }
         }
     }
 
@@ -643,6 +1010,20 @@ internal class AndroidGatewayProjection(
                     else nextSequences[patch.sessionId] = replacementTail
                     replacement
                 }
+                "discard-streams" -> {
+                    val replacement = requireNotNull(eventPatch.replacementEvents)
+                    require(eventPatch.record == null && eventPatch.index == null)
+                    val oldBySeq = old.associateBy(SessionEvent::seq)
+                    require(replacement.zipWithNext().all { (left, right) -> left.seq < right.seq })
+                    require(replacement.all { oldBySeq[it.seq] == it })
+                    val retained = replacement.mapTo(mutableSetOf()) { it.seq }
+                    require(old.filter { it.seq !in retained }.all { record ->
+                        record.event.type == "assistant/chunk" &&
+                            record.event.chunkType in setOf("text-delta", "reasoning-delta")
+                    })
+                    // 只删流式载荷，不回退已消费水位；下一帧仍须晚于旧水位。
+                    replacement
+                }
                 "append", "upsert" -> {
                     val record = requireNotNull(eventPatch.record)
                     require(eventPatch.replacementEvents == null && record.sessionId == patch.sessionId)
@@ -713,6 +1094,38 @@ internal class AndroidGatewayProjection(
         val next = conversationItems.toMutableMap()
         val nextSequences = conversationLastSequences.toMutableMap()
         val previousSequence = nextSequences[patch.sessionId] ?: -1
+        if (patch.seedsStream) {
+            require(!patch.replacesAll && patch.replacementItems == null)
+            require(patch.operations.isNotEmpty() && patch.lastSequence <= previousSequence)
+            val items = next[patch.sessionId].orEmpty().toMutableList()
+            patch.operations.forEach { operation ->
+                when (operation.kind) {
+                    "insert" -> {
+                        val item = requireNotNull(operation.item)
+                        require(operation.itemId == null && operation.delta == null)
+                        require(items.none { it.id == item.id })
+                        items += item
+                    }
+                    "append-text" -> {
+                        require(operation.item == null && !operation.itemId.isNullOrBlank() && operation.delta != null)
+                        val index = items.indexOfFirst { it.id == operation.itemId }
+                        require(index >= 0)
+                        items[index] = items[index].copy(
+                            text = items[index].text + operation.delta,
+                            epochSeconds = operation.epochSeconds ?: items[index].epochSeconds
+                        )
+                    }
+                    "remove" -> {
+                        require(operation.item == null && !operation.itemId.isNullOrBlank())
+                        require(operation.delta == null)
+                        items.removeAll { it.id == operation.itemId }
+                    }
+                    else -> error("seeded stream only appends or removes")
+                }
+            }
+            next[patch.sessionId] = items
+            return ConversationPlan(next, nextSequences)
+        }
         if (patch.replacesAll) {
             val replacement = requireNotNull(patch.replacementItems)
             require(patch.operations.isEmpty())

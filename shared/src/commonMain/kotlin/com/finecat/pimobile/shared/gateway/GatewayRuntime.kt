@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 
@@ -55,6 +56,8 @@ data class GatewayRuntimeState(
     val clientCount: Int? = null,
     val protocolVersion: Int? = null,
     val capabilities: Set<String> = emptySet(),
+    /** 网关宿主连接模式（PROTOCOL §4.30）：sdk / bridge；未知时 null。 */
+    val hostMode: String? = null,
     val reconnectAttempt: Int = 0,
     val activeTurnSessionIds: Set<String> = emptySet(),
     val hasUnassociatedTurn: Boolean = false,
@@ -64,6 +67,8 @@ data class GatewayRuntimeState(
         get() = activeTurnSessionIds.isNotEmpty() || hasUnassociatedTurn
 }
 
+data class GatewayBridgeSubscriptionStamp(val connectionGeneration: Long, val modeGeneration: Long)
+
 sealed interface GatewayRuntimeEvent {
     data class Frame(
         val rawJson: String,
@@ -72,6 +77,8 @@ sealed interface GatewayRuntimeEvent {
         /** pi event 帧经 PiEventNormalizer 归一后的内部视图事件（0..n 条）。 */
         val normalizedEvents: List<SessionEvent> = emptyList(),
         val gatewayRevision: Long = 0,
+        /** 仅经关联校验的桥接 sent 可证明本连接已有服务端流；排队消费时仍需验连接代际。 */
+        val bridgeSubscriptionStamp: GatewayBridgeSubscriptionStamp? = null,
     ) : GatewayRuntimeEvent {
         override fun toString(): String =
             "Frame(kind=${frame.kind}, correlatedSessionId=$correlatedSessionId, rawJson=<redacted>)"
@@ -96,6 +103,11 @@ sealed interface GatewayRuntimeEvent {
         val correlationId: String? = null,
         /** 已通过在途关联的服务端拒绝；本地 busy 等拒绝由发送返回值按自身 token 收尾。 */
         val serverResponse: Boolean = false,
+        /** abort 已取出的队列文字；只用于匹配操作的恢复记录，不代表任务已结束。 */
+        val queuedText: String? = null,
+        /** 失败回执上的取回三态（captured/left-on-desktop/unknown）；失败不等于已恢复。 */
+        val queuedDisposition: String? = null,
+        val automaticRefresh: Boolean = false,
     ) : GatewayRuntimeEvent
 }
 
@@ -133,6 +145,21 @@ class GatewayRuntime(
     private var pendingAttachmentFetch: PendingAttachmentFetch? = null
     /** 每会话一个 pi 事件归一器（合成的 turn 计数依赖会话内顺序）。 */
     private val eventNormalizers = mutableMapOf<String, PiEventNormalizer>()
+    /** 桥接代际 instanceId+epoch；仅桥接帧写入，供发送请求绑定目标实例。 */
+    private val bridgeIdentities = mutableMapOf<String, Pair<String, String>>()
+    /**
+     * 每会话桥接帧水位，正文与状态分开记：
+     * - [BridgeWatermark.eventSeq]：已投影正文的事件水位，只有事件本身（以及带正文的
+     *   history 补齐、建立权威前缀的快照）能推进。拉式 `state` 只有状态，不能推进它。
+     * - [BridgeWatermark.stateSeq]：已应用状态的水位，`state` 与快照推进它，用来拒绝
+     *   更旧的 `state`，并判断一条事件携带的状态字段是否已被更新的状态覆盖。
+     *
+     * 字段名沿用历史命名（值不再是单个 Int）：验收探针按名字反射初始化这张表，
+     * 改名会让那份门禁直接失效。
+     */
+    private val bridgeEventSeqs = mutableMapOf<String, BridgeWatermark>()
+
+    private data class BridgeWatermark(val eventSeq: Int?, val stateSeq: Int?)
     private val deferredRequests = ArrayDeque<GatewayRequest>()
     // 新协议计数仅代表等待sent的输入；实际运行与压缩由事件/快照独立记录。
     // 旧网关仍保留原来的输入→settled兼容计数。
@@ -150,6 +177,7 @@ class GatewayRuntime(
     private var endpointOrder: List<String> = emptyList()
     private var endpointCursor = 0
     private var handshakeJob: Job? = null
+    private var hostModeGeneration = 0L
     private var subscribedSessionId: String? = null
     private var previousSubscribedSessionId: String? = null
     private var isInBackground = false
@@ -182,11 +210,17 @@ class GatewayRuntime(
 
     suspend fun pair(encodedPayload: String) = serialized {
         val payload = GatewayPairingPayloadParser.parse(encodedPayload, clock.nowEpochMilliseconds())
-        val existing = preferences.load()
-        val configured = roundOrderLocked(existing)
-        // 显式配对以载荷指定的网关为目标，旧入口保留原相对顺序供后续连接使用。
-        val order = (listOf(payload.publicUrl) + configured).distinct()
-        preferences.updateFields { it.copy(endpoint = payload.publicUrl, endpointCandidates = order) }
+        pairEndpointLocked(payload.publicUrl, payload.pairingCode)
+    }
+
+    suspend fun pairWithCode(endpoint: String, code: String) = serialized {
+        requireWebSocketEndpoint(endpoint)
+        if (!Regex("^[0-9]{6}$").matches(code)) throw GatewayPairingPayloadException("配对码需为六位数字")
+        pairEndpointLocked(endpoint, code)
+    }
+
+    private suspend fun pairEndpointLocked(endpoint: String, code: String) {
+        // 目标尚未证明可配对；收到 paired 之前不能让旧 token 的持久入口指向它。
         connectionGeneration += 1
         runCatching { transport.close() }
         clearConnectionWorkLocked()
@@ -194,11 +228,11 @@ class GatewayRuntime(
         previousSubscribedSessionId = null
         mutableState.value = GatewayRuntimeState(
             gatewayRevision = mutableState.value.gatewayRevision + 1,
-            endpoint = payload.publicUrl,
+            endpoint = endpoint,
             networkAvailable = networkAvailableLocked(),
         )
         // 一次性配对码只交给其签发地址，不能因探测超时而投给历史入口。
-        beginConnectionRoundLocked(listOf(payload.publicUrl), pairingCode = payload.pairingCode)
+        beginConnectionRoundLocked(listOf(endpoint), pairingCode = code)
     }
 
     /**
@@ -308,6 +342,12 @@ class GatewayRuntime(
                     // 回前台是一个自然的重新探测点：从列表首个地址重走一轮。
                     endpointCursor = 0
                     scheduleReconnectLocked(immediate = true)
+                    return@serialized
+                }
+                // 连接保持时后台窗口仍可能错过终态事件；回前台主动对账一次会话状态，
+                // 用网关真值纠正 Working/压缩标记，不靠计时器推断结束。
+                if (mutableState.value.connection == GatewayConnectionState.CONNECTED) {
+                    subscribedSessionId?.let { sendRequestLocked(GatewayRequests.state(it).copy(automaticRefresh = true)) }
                 }
             }
         }
@@ -315,7 +355,8 @@ class GatewayRuntime(
 
     suspend fun sendRequest(request: GatewayRequest): Boolean = serialized { sendRequestLocked(request) }
 
-    suspend fun requestSessions(): Boolean = sendRequest(GatewayRequests.sessions())
+    suspend fun requestSessions(automaticRefresh: Boolean = false): Boolean =
+        sendRequest(GatewayRequests.sessions().copy(automaticRefresh = automaticRefresh))
 
     suspend fun requestHistory(
         sessionId: String,
@@ -327,8 +368,14 @@ class GatewayRuntime(
             turnLimit = 10.takeIf { "history-turns-v1" in mutableState.value.capabilities })
     )
 
-    suspend fun requestState(sessionId: String): Boolean =
-        sendRequest(GatewayRequests.state(sessionId))
+    suspend fun requestState(sessionId: String, automaticRefresh: Boolean = false): Boolean =
+        sendRequest(GatewayRequests.state(sessionId).copy(automaticRefresh = automaticRefresh))
+
+    /** 查询宿主连接模式；应答 host-mode 同步到 [GatewayRuntimeState.hostMode]。 */
+    suspend fun requestHostMode(): Boolean = sendRequest(GatewayRequests.hostMode())
+
+    /** 请求切换 sdk/bridge；网关拒绝时走统一 RequestRejected 终态。 */
+    suspend fun setHostMode(mode: String): Boolean = sendRequest(GatewayRequests.hostModePut(mode))
 
     /** 重载配置（重建会话，PROTOCOL.md §4.20）：应答 session-restarted 后
      *  客户端以 resetLeaf 重拉 history 完成视图重建（与重连 catch-up 同通道）。 */
@@ -443,22 +490,48 @@ class GatewayRuntime(
         return null
     }
 
-    suspend fun subscribe(sessionId: String?): Boolean = serialized {
+    /** 已确认的桥接 sent 说明网关已建立流；只记住重连目标，避免重订阅截断在途事件。 */
+    suspend fun subscribe(sessionId: String?, serverSubscriptionStamp: GatewayBridgeSubscriptionStamp? = null,
+        automaticRefresh: Boolean = false): Boolean = serialized {
         val nextSubscription = sessionId?.takeIf(String::isNotBlank)
         subscribedSessionId = nextSubscription
         val request = if (nextSubscription == null) {
             val previous = previousSubscribedSessionId
             previousSubscribedSessionId = null
-            if (previous == null) true else sendRequestLocked(GatewayRequests.unsubscribe(previous))
+            if (previous == null) true else sendRequestLocked(GatewayRequests.unsubscribe(previous).copy(automaticRefresh = automaticRefresh))
         } else {
             previousSubscribedSessionId = nextSubscription
-            sendRequestLocked(GatewayRequests.subscribe(nextSubscription))
+            if (serverSubscriptionStamp == GatewayBridgeSubscriptionStamp(connectionGeneration, hostModeGeneration) &&
+                mutableState.value.hostMode == "bridge" &&
+                mutableState.value.connection == GatewayConnectionState.CONNECTED) true
+            else sendRequestLocked(GatewayRequests.subscribe(nextSubscription).copy(automaticRefresh = automaticRefresh))
         }
         request
     }
 
-    suspend fun abort(sessionId: String): Boolean =
-        sendRequest(GatewayRequests.abort(sessionId))
+    suspend fun abort(
+        sessionId: String,
+        operationId: String? = null,
+        instanceId: String? = null,
+        epoch: String? = null
+    ): Boolean = sendRequest(GatewayRequests.abort(sessionId, operationId, instanceId, epoch))
+
+    /** 请求网关后台启动原生 Pi；返回 false 表示请求未发出（断线/忙）。 */
+    suspend fun startBridgeSession(sessionId: String, operationId: String): Boolean = serialized {
+        if (mutableState.value.connection != GatewayConnectionState.CONNECTED) return@serialized false
+        sendRequestLocked(GatewayRequests.bridgeStart(sessionId, operationId))
+    }
+
+    /** 查询桥接写回执；返回 false 表示请求未发出（断线/忙），结果帧走正常 Frame 事件。 */
+    suspend fun operationStatus(
+        sessionId: String,
+        operationId: String,
+        instanceId: String? = null,
+        epoch: String? = null
+    ): Boolean = serialized {
+        if (mutableState.value.connection != GatewayConnectionState.CONNECTED) return@serialized false
+        sendRequestLocked(GatewayRequests.operationStatus(sessionId, operationId, instanceId, epoch))
+    }
 
     suspend fun sendMessage(
         text: String,
@@ -468,8 +541,32 @@ class GatewayRuntime(
         /** 新会话的模型预选：随 message 帧携带，pi 在首轮前应用。 */
         model: GatewayModelSelection? = null,
         /** pi streamingBehavior：忙时 steer=注入本轮、followUp=排队下轮。 */
-        mode: String = "followUp"
+        mode: String = "followUp",
+        operationId: String? = null,
+        instanceId: String? = null,
+        epoch: String? = null,
+        nativeNew: Boolean = false,
+        nativeResume: Boolean = false
     ): Boolean = serialized {
+        if (nativeNew && (sessionId != null || cwd.isNullOrBlank() || operationId.isNullOrBlank() ||
+                instanceId != null || epoch != null)) {
+            rejectLocked("message", "bad-request", correlationId = operationId)
+            return@serialized false
+        }
+        if (nativeNew && mutableState.value.hostMode != "bridge") {
+            rejectLocked("message", "mode-switch-blocked", correlationId = operationId)
+            return@serialized false
+        }
+        if (nativeResume && (sessionId.isNullOrBlank() || cwd != null || model != null || nativeNew ||
+                operationId.isNullOrBlank() || instanceId != null || epoch != null)) {
+            rejectLocked("message", "bad-request", sessionId, operationId)
+            return@serialized false
+        }
+        if (nativeResume && (mutableState.value.hostMode != "bridge" ||
+                "bridge-native-resume-v1" !in mutableState.value.capabilities)) {
+            rejectLocked("message", "bridge-unavailable", sessionId, operationId)
+            return@serialized false
+        }
         if (text.isBlank() && images.isEmpty()) return@serialized false
         if (!outgoingImagesAreWithinLimits(images)) {
             rejectLocked("message", ERROR_IMAGE_LIMITS)
@@ -481,7 +578,11 @@ class GatewayRuntime(
         }
         markTurnLocked(sessionId)
         val sent = sendRequestLocked(
-            GatewayRequests.message(text.trim(), images, sessionId, cwd, model, mode)
+            GatewayRequests.message(
+                text.trim(), images, sessionId, cwd, model, mode,
+                operationId = operationId, instanceId = instanceId, epoch = epoch, nativeNew = nativeNew,
+                nativeResume = nativeResume
+            )
         )
         if (!sent) releaseTurnLocked(sessionId)
         sent
@@ -499,7 +600,8 @@ class GatewayRuntime(
                 request.requestType,
                 ERROR_NOT_CONNECTED,
                 request.targetSessionId,
-                request.correlationId
+                request.correlationId,
+                automaticRefresh = request.automaticRefresh,
             )
             return false
         }
@@ -515,7 +617,8 @@ class GatewayRuntime(
                         request.requestType,
                         ERROR_REQUEST_BUSY,
                         request.targetSessionId,
-                        request.correlationId
+                        request.correlationId,
+                        automaticRefresh = request.automaticRefresh,
                     )
                     return false
                 }
@@ -546,7 +649,7 @@ class GatewayRuntime(
         val pendingId = ++requestGeneration
         val transportGeneration = connectionGeneration
         val timeoutJob = scope.launch {
-            delay(requestTimeoutMilliseconds)
+            delay(if (request.createsNativeSession || request.resumesNativeSession) maxOf(requestTimeoutMilliseconds, 60_000L) else requestTimeoutMilliseconds)
             serialized { handleRequestTimeoutLocked(request.responseKind, pendingId, transportGeneration) }
         }
         pendingLanes[request.responseKind] = PendingLane(
@@ -561,7 +664,8 @@ class GatewayRuntime(
                     request.requestType,
                     ERROR_SEND_FAILED,
                     request.targetSessionId,
-                    request.correlationId
+                    request.correlationId,
+                    automaticRefresh = request.automaticRefresh,
                 )
                 false
             }
@@ -723,12 +827,12 @@ class GatewayRuntime(
         // 保留凭据，按已有退避回到首入口；首入口401与明确撤销4003仍停止重连。
         val retryPrimary = failure.httpStatus == 401 && pairingCode == null && endpointCursor > 0
         if (retryPrimary) endpointCursor = 0
-        // 一次性配对码无效/已被用过 ≠ 长期凭据失效：作废 pairingCode，改回 token 继续，
-        // 不能因此把 App 永久钉死在 authentication-required。
+        // 配对目标由用户指定，不能在拒绝后把旧网关的长期凭据交给它。
+        // 保留旧凭据与持久入口，等待重新输入配对码或显式恢复旧连接。
         val pairingRejected = credentialRejected && pairingCode != null
         if (pairingRejected) {
             pairingCode = null
-            if (runCatching { credentials.loadToken() }.getOrNull() == null) reconnectBlocked = true
+            reconnectBlocked = true
         } else if (!retryPrimary) {
             if (failure.httpStatus == 401) runCatching { credentials.deleteToken() }
             if (credentialRejected || !failure.recoverable) reconnectBlocked = true
@@ -750,6 +854,125 @@ class GatewayRuntime(
         if (shouldReconnect) scheduleReconnectLocked(immediate = pairingRejected)
     }
 
+    /**
+     * 维护桥接代际/帧水位：同代际倒退帧直接丢弃；代际变化时重建 normalizer，
+     * 避免新旧实例相同 seq 互相覆盖。返回 false 表示该帧不应继续投影。
+     */
+    private fun acceptBridgeFrameLocked(frame: GatewayFrame): Boolean {
+        if (frame.kind !in setOf("bridge-snapshot", "bridge-offline", "event", "state")) return true
+        val sessionId = frame.sessionId?.takeIf(String::isNotBlank) ?: return true
+        val instanceId = frame.instanceId?.takeIf(String::isNotBlank)
+        val epoch = frame.epoch?.takeIf(String::isNotBlank)
+        if (instanceId != null && epoch != null) {
+            val next = instanceId to epoch
+            val previous = bridgeIdentities[sessionId]
+            if (previous != null && previous != next) {
+                // 只有快照能建立新代际；旧 epoch 的迟到事件和离线帧都必须丢弃，
+                // 不能把它当成“新代际”又切回去。等新快照到达再重建 normalizer 和水位。
+                if (frame.kind != "bridge-snapshot") return false
+                eventNormalizers.remove(sessionId)
+                bridgeEventSeqs.remove(sessionId)
+                bridgeIdentities[sessionId] = next
+            } else if (previous == null) {
+                // 首次代际也只能来自快照；没有快照就到达的事件/离线帧不可信。
+                if (frame.kind != "bridge-snapshot") return false
+                bridgeIdentities[sessionId] = next
+            }
+        }
+        val seq = frame.bridgeSeq
+        if (frame.kind == "bridge-snapshot") {
+            val known = bridgeEventSeqs[sessionId]
+            val last = known?.eventSeq
+            // 同代际更低正文水位是迟到重放，不能把正文回退；等水位是同一实例重连后的
+            // 合法完整快照（断线/显式断开期间无新事件），必须允许并重建 normalizer。
+            if (seq != null && last != null && seq < last) return false
+            // 合法快照代表扩展侧重新给了权威前缀；同代际重连时 normalizer 可能
+            // 已见过 message_start、turn 已推进，不重置就会让快照种子和后续 delta
+            // 落在不同 stream。投影侧同样按快照重置到 0/0。
+            eventNormalizers.remove(sessionId)
+            // 正文前缀可以按快照前进，但状态水位只升不降：订阅 socket 上较早捕获的
+            // 快照可能晚于更高水位的拉式 state 到达，不能把已应用的状态回退。
+            if (seq != null) {
+                bridgeEventSeqs[sessionId] =
+                    BridgeWatermark(seq, maxOf(seq, known?.stateSeq ?: seq))
+            } else {
+                bridgeEventSeqs.remove(sessionId)
+            }
+            return true
+        }
+        if (seq != null && frame.kind == "event") {
+            val last = bridgeEventSeqs[sessionId]
+            if (last?.eventSeq != null && seq <= last.eventSeq) return false
+            bridgeEventSeqs[sessionId] = BridgeWatermark(seq, last?.stateSeq)
+        }
+        // 拉式 state 必须能排定与已消费事件的先后：请求发出后先到的 agent_settled
+        // 会让回包早于终态生成，回来时 seq 更低，这种旧应答不能覆盖运行态/压缩/统计。
+        // 但它只有状态，不代表事件正文已经投影：`state(seq5)` 可能早于订阅上仍在
+        // 途的 `event(seq2)`，因此接受 state 只推进状态水位，绝不推进正文水位，
+        // 否则那条从未投影的正文会被永久丢弃（正文缺失、状态又补不回来）。
+        if (frame.kind == "state") {
+            val identity = bridgeIdentities[sessionId] ?: return true
+            if (instanceId == null || epoch == null || (instanceId to epoch) != identity) return false
+            if (seq == null) return false
+            val known = bridgeEventSeqs[sessionId]
+            if (known?.eventSeq != null && seq < known.eventSeq) return false
+            if (known?.stateSeq != null && seq < known.stateSeq) return false
+            bridgeEventSeqs[sessionId] = BridgeWatermark(known?.eventSeq, maxOf(seq, known?.stateSeq ?: seq))
+        }
+        return true
+    }
+
+    /**
+     * 拉式快照（前台对账 state、重连 catch-up history）的运行态是否可覆盖运行集合。
+     * 判据与接受水位同源：同一桥接代际 + 不早于已消费事件。history 仍要投影正文与
+     * 历史，所以这里只否掉运行态，不整帧丢弃。
+     */
+    private fun bridgePullRunningAuthority(frame: GatewayFrame): Boolean {
+        if (frame.kind !in setOf("state", "history", "sent")) return true
+        val sessionId = frame.sessionId?.takeIf(String::isNotBlank) ?: return true
+        // 从未见过桥接快照的会话：SDK 模式按原合同放行；桥接模式下这条应答没有
+        // 身份可核（订阅前到达、或路由器磁盘回退形状），不具运行态权威，与 Store
+        // 的"桥接模式缺身份即拒绝"对齐，避免两层对同一条应答给出相反结论。
+        val known = bridgeIdentities[sessionId] ?: return mutableState.value.hostMode != "bridge"
+        val instanceId = frame.instanceId?.takeIf(String::isNotBlank) ?: return false
+        val epoch = frame.epoch?.takeIf(String::isNotBlank) ?: return false
+        if ((instanceId to epoch) != known) return false
+        val seq = frame.bridgeSeq ?: return false
+        val watermark = bridgeEventSeqs[sessionId]
+        val last = maxOf(watermark?.eventSeq ?: Int.MIN_VALUE, watermark?.stateSeq ?: Int.MIN_VALUE)
+        return last == Int.MIN_VALUE || seq >= last
+    }
+
+    /**
+     * 同代际快照的状态字段是否已被更高水位的拉式 `state` 覆盖。快照的正文前缀仍要
+     * 投影（partial/tools 种子），但 busy/压缩/模型/统计不能回退。
+     */
+    private fun bridgeSnapshotStatusIsStale(frame: GatewayFrame): Boolean {
+        if (frame.kind != "bridge-snapshot") return false
+        val sessionId = frame.sessionId?.takeIf(String::isNotBlank) ?: return false
+        val seq = frame.bridgeSeq ?: return false
+        // 新代际的 wire seq 从 0/1 重新计数：旧代际的 stateSeq 不能拿来判它过期。
+        val known = bridgeEventSeqs[sessionId] ?: return false
+        if (bridgeIdentities[sessionId] != (frame.instanceId to frame.epoch)) return false
+        val stateSeq = known.stateSeq ?: return false
+        return seq < stateSeq
+    }
+
+    /**
+     * 这条事件正文携带的状态字段（busy/压缩/统计、agent_start/settled 的集合变化）
+     * 是否已被更新的拉式 `state` 覆盖。正文仍要投影，只是不能再改运行态。
+     */
+    private fun bridgeEventStatusIsStale(frame: GatewayFrame): Boolean {
+        if (frame.kind != "event") return false
+        val sessionId = frame.sessionId?.takeIf(String::isNotBlank) ?: return false
+        val seq = frame.bridgeSeq ?: return false
+        val stateSeq = bridgeEventSeqs[sessionId]?.stateSeq ?: return false
+        return seq <= stateSeq
+    }
+
+    /** 当前桥接代际；界面发写请求时绑定，防止迟到写入落到新实例。 */
+    fun bridgeIdentity(sessionId: String): Pair<String, String>? = bridgeIdentities[sessionId]
+
     private suspend fun handleIncomingFrameLocked(transportFrame: GatewayTransportFrame) {
         if (transportFrame.generation != connectionGeneration) {
             rejectLocked("transport", ERROR_STALE_FRAME)
@@ -765,8 +988,25 @@ class GatewayRuntime(
                 rejectLocked("pair", ERROR_PAIR_TOKEN_MISSING)
                 return
             }
-            if (runCatching { credentials.saveToken(token) }.isFailure) {
-                rejectLocked("pair", ERROR_CREDENTIAL_ACCESS)
+            val stored = runCatching {
+                if (pairingCode != null) {
+                    val acceptedEndpoint = checkNotNull(endpoint)
+                    // 两个存储无法原子提交：先撤掉旧 token，再更新入口、保存新 token。
+                    // 中途失败最多需要重配，不能在重启后把旧 token 发往新地址。
+                    credentials.deleteToken()
+                    preferences.updateFields { current ->
+                        current.copy(
+                            endpoint = acceptedEndpoint,
+                            endpointCandidates = (listOf(acceptedEndpoint) + roundOrderLocked(current)).distinct(),
+                        )
+                    }
+                }
+                credentials.saveToken(token)
+            }
+            if (stored.isFailure) {
+                pairingCode = null
+                reconnectBlocked = true
+                failOpenLocked(ERROR_CREDENTIAL_ACCESS)
                 return
             }
             entryHistoryGatewayKey = token to null
@@ -806,6 +1046,8 @@ class GatewayRuntime(
             return
         }
 
+        // 同operation重试可得到“仍在处理”的回放；它不是停止终态，不能消费lane。
+        if (frame.kind == "aborted" && frame.status == "submitted") return
         val correlation = correlateLocked(frame)
         if (!correlation.accepted) return
         if (frame.kind == "error") {
@@ -815,9 +1057,78 @@ class GatewayRuntime(
                 correlation.sessionId,
                 responseCorrelation(frame),
                 serverResponse = true,
+                queuedText = frame.queuedText,
+                queuedDisposition = frame.queuedDisposition,
+                automaticRefresh = correlation.automaticRefresh,
             )
             suspendBackgroundConnectionIfIdleLocked()
             return
+        }
+        if (frame.kind == "host-mode") {
+            if (frame.mode != mutableState.value.hostMode || frame.changed == true) hostModeGeneration += 1
+            mutableState.value = mutableState.value.copy(hostMode = frame.mode)
+            // 桥接代际/水位只对桥接模式有意义。切回 sdk 后若留着它们，SDK 的
+            // state 应答（本来就不带 instanceId/epoch）会被当成"异代际"整帧丢掉，
+            // 该会话的对账永久失效且不报错。
+            // 清空后到新 bridge-snapshot 之间是"无水位"窗口：这期间带身份的
+            // state 应答会被直接当权威（与本批 R1 的"未知代际不投影"取舍一致），
+            // 实际窗口极短——模式切换会重建订阅，新应答的 seq 不会倒退。
+            // eventNormalizers 不在此清：它不含 seq，下一次 bridge-snapshot 会按
+            // 会话重建，且不参与 SDK 事件的投影判定。
+            if (frame.mode != "bridge") {
+                bridgeIdentities.clear()
+                bridgeEventSeqs.clear()
+            }
+        }
+        // 丢弃的 state 应答不会泄漏请求 lane：correlateLocked 已在前面按 kind 消费
+        // 该 lane 并排定后续排队的请求，这里只是不投影、不再做身份/水位校验之外的
+        // 动作。不要在丢弃分支再消费一次，否则会移除已提升为 active 的下一个请求。
+        // （decode 失败、代次不匹配等"没走到 correlate"的路径仍按既有策略等超时
+        // 回收连接，本批不改那层：owner 未授权扩大改动面。）
+        // 快照的正文前缀与状态分开判：闸门会在接受后推进状态水位，先取过期结论。
+        val staleSnapshotStatus = bridgeSnapshotStatusIsStale(frame)
+        if (!acceptBridgeFrameLocked(frame)) return
+        // 正文照常投影，但这条事件的状态字段可能已被更新的拉式 state 覆盖：
+        // `state(seq5)` 先到、订阅上的 `event(seq2)` 后到时，正文必须补、状态不能退。
+        val staleEventStatus = bridgeEventStatusIsStale(frame)
+        // 桥接快照/离线是扩展侧权威活动信号：直接校正运行集合，
+        // 不靠 socket 可达性推断进程死亡（网关已做有限重试）。
+        if (frame.kind == "bridge-snapshot" || frame.kind == "bridge-offline") {
+            frame.sessionId?.takeIf(String::isNotBlank)?.let { sessionId ->
+                val offline = frame.kind == "bridge-offline"
+                // 旧快照的正文前缀照投影，但运行集合保持更新 state 的结论。
+                if (!staleSnapshotStatus) {
+                    updateObservedActivity(
+                        sessionId,
+                        !offline && (frame.isStreaming ?: (frame.busy == true)),
+                        !offline && frame.isCompacting == true
+                    )
+                }
+                val pendingCompact = pendingLanes["compact-started"]?.active?.request
+                if (pendingCompact?.targetSessionId == sessionId && pendingCompact.correlationId != null &&
+                    (offline || (frame.instanceId != null && pendingCompact.targetInstanceId != frame.instanceId) ||
+                        (frame.epoch != null && pendingCompact.targetEpoch != frame.epoch))) {
+                    emitCancelledLocked(pendingCompact, if (offline) "bridge-offline" else "bridge-stale-runtime")
+                    completeLaneLocked("compact-started")
+                }
+                // Tree/改名等实例绑定请求在离线或真实切代时释放；缺身份快照不冒充换代。
+                for ((laneKey, lane) in pendingLanes.toList()) {
+                    val pending = lane.active.request
+                    if (pending.requestType in setOf("tree", "entry-copy", "label-put", "switch-branch", "name", "input-resources", "input-completions", "commands", "worktree-list", "worktree-continue", "refresh-model") &&
+                        pending.targetSessionId == sessionId && pending.targetInstanceId != null &&
+                        (offline || (frame.instanceId != null && pending.targetInstanceId != frame.instanceId) ||
+                            (frame.epoch != null && pending.targetEpoch != frame.epoch))) {
+                        emitCancelledLocked(pending, if (offline) "bridge-offline" else "bridge-stale-runtime")
+                        completeLaneLocked(laneKey)
+                    }
+                }
+                if (offline) {
+                    activeTurnCountsBySession.remove(sessionId)
+                    observedRunningSessions.remove(sessionId)
+                    observedCompactingSessions.remove(sessionId)
+                }
+                publishTurnStateLocked()
+            }
         }
         if (frame.kind == "sent" && unassociatedTurnCount > 0 && !frame.sessionId.isNullOrBlank()) {
             unassociatedTurnCount -= 1
@@ -828,17 +1139,32 @@ class GatewayRuntime(
         if (frame.kind == "sent" && hasPromptDisposition && frame.isStreaming != null && frame.isCompacting != null) {
             // ACK只释放这次输入的乐观等待，不以handled推断整个会话已结束。
             releaseTurnLocked(frame.sessionId)
-            updateObservedActivity(frame.sessionId, frame.isStreaming, frame.isCompacting)
+            if (frame.duplicate != true && bridgePullRunningAuthority(frame)) {
+                updateObservedActivity(frame.sessionId, frame.isStreaming, frame.isCompacting)
+                frame.sessionId?.let { sessionId ->
+                    if (bridgeIdentities[sessionId] != null && frame.bridgeSeq != null) {
+                        val previous = bridgeEventSeqs[sessionId]
+                        bridgeEventSeqs[sessionId] = BridgeWatermark(previous?.eventSeq, maxOf(frame.bridgeSeq, previous?.stateSeq ?: frame.bridgeSeq))
+                    }
+                }
+            }
         }
         val activitySnapshot = hasPromptDisposition && frame.isStreaming != null && frame.isCompacting != null &&
-            frame.kind in setOf("history", "state", "model-set", "branch-switched", "session-restarted", "compact-started", "compact-finished", "session-named")
+            frame.kind in setOf("history", "state", "model-set", "model-refreshed", "branch-switched", "session-restarted", "compact-started", "compact-finished", "session-named") &&
+            // 拉式快照只有在同一桥接代际且不早于已消费事件时才能改运行态：
+            // 旧应答不得把已结束的回合改回 busy，也不得用旧 idle 清掉新回合。
+            bridgePullRunningAuthority(frame)
         if (activitySnapshot) {
             // 重连期间run可能已经落定；权威补拉不能只修UI而留下后台保活假运行。
             updateObservedActivity(frame.sessionId, frame.isStreaming == true, frame.isCompacting == true)
         }
         val nativeType = if (frame.kind == "event") frame.event?.get("type")?.stringValue else null
-        val endedLastBackgroundTurn = nativeType == "agent_settled"
-        if (hasPromptDisposition) frame.sessionId?.let { sessionId ->
+        // 已过期的 settled 不再释放后台保活：它可能属于更早的回合，而更新的 `sent` ACK
+        // 已为下一回合加过一次计数，此时释放会把那一回合误清（正是 R5 禁止的回退形状）。
+        // 代价是旧网关（无 prompt-disposition）在极窄的交错下多留一次计数，直到重连/
+        // bridge-offline 自愈；多留只会延长保活，不会让运行中的回合被误判为已结束。
+        val endedLastBackgroundTurn = nativeType == "agent_settled" && !staleEventStatus
+        if (hasPromptDisposition && !staleEventStatus) frame.sessionId?.let { sessionId ->
             when (nativeType) {
                 "agent_start" -> observedRunningSessions.add(sessionId)
                 "agent_settled" -> { observedRunningSessions.remove(sessionId); observedCompactingSessions.remove(sessionId) }
@@ -846,6 +1172,11 @@ class GatewayRuntime(
                 "compaction_end" -> observedCompactingSessions.remove(sessionId)
             }
             publishTurnStateLocked()
+        }
+        // 桥接状态边界同时携带压缩/流式真值；agent_settled不一定结束紧随其后的手动压缩。
+        if (frame.kind == "event" && frame.instanceId != null && frame.isStreaming != null && frame.isCompacting != null &&
+            !staleEventStatus) {
+            updateObservedActivity(frame.sessionId, frame.isStreaming, frame.isCompacting)
         }
         // 旧网关没有输入处置快照，沿用既有计数；新协议settled不能消费尚未ACK的输入。
         if (endedLastBackgroundTurn && !hasPromptDisposition) releaseTurnLocked(frame.sessionId)
@@ -897,7 +1228,10 @@ class GatewayRuntime(
         }
         emitEventLocked(
             GatewayRuntimeEvent.Frame(safeRaw, safeFrame, correlation.sessionId, normalizedEvents,
-                gatewayRevision = mutableState.value.gatewayRevision),
+                gatewayRevision = mutableState.value.gatewayRevision,
+                bridgeSubscriptionStamp = GatewayBridgeSubscriptionStamp(transportFrame.generation, hostModeGeneration).takeIf {
+                    frame.kind == "sent" && mutableState.value.hostMode == "bridge"
+                }),
             estimatedBytes
         )
         if (activitySnapshot || endedLastBackgroundTurn || nativeType == "compaction_end" || frame.kind in setOf("sent", "aborted", "dequeued")) suspendBackgroundConnectionIfIdleLocked()
@@ -909,6 +1243,10 @@ class GatewayRuntime(
                 rejectLocked("transport", "invalid-compact-state", frame.sessionId)
                 return Correlation(false, null)
             }
+            return Correlation(true, frame.sessionId)
+        }
+        if (frame.kind == "unsubscribed" && frame.reason == "host-mode-changed") {
+            // 网关切换模式后主动结束旧订阅；这是通知，不是客户端 unsubscribe 的回执。
             return Correlation(true, frame.sessionId)
         }
         if (frame.kind in UNCORRELATED_KINDS) {
@@ -934,6 +1272,16 @@ class GatewayRuntime(
             }
             val request = entry.value.active.request
             if (!sessionMatches(request, frame.sessionId)) {
+                rejectLocked(
+                    "transport",
+                    ERROR_SESSION_MISMATCH,
+                    frame.sessionId,
+                    responseCorrelation(frame)
+                )
+                return Correlation(false, null)
+            }
+            if ((request.requestType in setOf("message", "abort", "set-model", "refresh-model", "models", "compact") || request.targetInstanceId != null) && !responseCorrelationMatches(request, frame)) {
+                // 错误帧也必须四元匹配；同 operationId 的错实例/错代际回执不能消费 lane。
                 rejectLocked(
                     "transport",
                     ERROR_SESSION_MISMATCH,
@@ -982,7 +1330,7 @@ class GatewayRuntime(
             }
             if (requestType == "message") releaseTurnLocked(request.targetSessionId)
             completeLaneLocked(entry.key)
-            return Correlation(true, frame.sessionId ?: request.targetSessionId)
+            return Correlation(true, frame.sessionId ?: request.targetSessionId, request.automaticRefresh)
         }
         // sent 按协议必须带真实会话。缺失时不能消费当前发送或绑定新会话。
         if (frame.kind == "sent" && frame.sessionId.isNullOrBlank()) {
@@ -996,7 +1344,8 @@ class GatewayRuntime(
         }
         val lane = pendingLanes[frame.kind]
         if (lane == null) {
-            if (frame.kind in RESPONSE_KINDS_REQUIRING_ACTIVE_REQUEST) {
+            if (frame.kind in RESPONSE_KINDS_REQUIRING_ACTIVE_REQUEST ||
+                (frame.kind in setOf("models", "model-set") && responseCorrelation(frame) != null)) {
                 rejectLocked(
                     frame.kind,
                     ERROR_NO_ACTIVE_REQUEST,
@@ -1086,9 +1435,51 @@ class GatewayRuntime(
         return bytes
     }
 
-    private fun responseCorrelationMatches(request: GatewayRequest, frame: GatewayFrame): Boolean = when (request.requestType) {
+    private fun responseCorrelationMatches(request: GatewayRequest, frame: GatewayFrame): Boolean {
+        if (request.nativeReadOnly) {
+            val id = if (request.requestType == "models") frame.queryId else frame.operationId
+            val entry = ((wireJson.parseToJsonElement(request.payload) as JsonObject)["entryId"] as? JsonPrimitive)?.content
+            return id == request.correlationId && frame.sessionId == request.targetSessionId &&
+                (frame.kind == "error" || frame.nativeRead == true) && frame.instanceId == null && frame.epoch == null &&
+                (entry == null || frame.entryId == entry || (frame.kind == "error" && frame.entryId == null))
+        }
+        if (request.resumesNativeSession) {
+            if (frame.operationId != request.correlationId || frame.sessionId != request.targetSessionId) return false
+            val entry = ((wireJson.parseToJsonElement(request.payload) as JsonObject)["entryId"] as? JsonPrimitive)?.content
+            // 启动前拒绝尚无目标条目回显；SID+操作足以结束该请求，不建立身份。
+            if (frame.kind == "error" && frame.instanceId == null && frame.epoch == null)
+                return entry == null || frame.entryId == null || frame.entryId == entry
+            if (entry != null && frame.entryId != entry) return false
+            val established = frame.sessionId?.let(bridgeIdentities::get) ?: return false
+            return established.first == frame.instanceId && established.second == frame.epoch
+        }
+        if (request.createsNativeSession) {
+            if (frame.operationId != request.correlationId) return false
+            // 启动前拒绝没有 SID；启动后任何回执必须匹配快照已建立的真实身份。
+            if (frame.kind == "error" && frame.sessionId == null) return true
+            val established = frame.sessionId?.let(bridgeIdentities::get) ?: return false
+            return established.first == frame.instanceId && established.second == frame.epoch
+        }
+        if (request.targetInstanceId != null && request.requestType in setOf("input-resources", "input-completions", "commands", "worktree-list")) {
+            return frame.queryId == request.correlationId && frame.sessionId == request.targetSessionId &&
+                frame.instanceId == request.targetInstanceId && frame.epoch == request.targetEpoch
+        }
+        if (request.targetInstanceId != null && request.requestType in setOf("tree", "entry-copy", "label-put", "switch-branch", "name", "worktree-continue")) {
+            val expectedEntry = ((wireJson.parseToJsonElement(request.payload) as JsonObject)["entryId"] as? JsonPrimitive)?.content
+            return frame.operationId == request.correlationId && frame.sessionId == request.targetSessionId &&
+                frame.instanceId == request.targetInstanceId && frame.epoch == request.targetEpoch &&
+                (expectedEntry == null || frame.entryId == expectedEntry)
+        }
+        return when (request.requestType) {
+        "models" -> request.correlationId == null || (frame.queryId == request.correlationId &&
+            frame.sessionId == request.targetSessionId && frame.instanceId == request.targetInstanceId && frame.epoch == request.targetEpoch)
         "worktree-list" -> frame.queryId == request.correlationId && frame.sessionId == request.targetSessionId
-        "worktree-create", "worktree-continue", "worktree-status", "worktree-trust" -> frame.operationId == request.correlationId
+        "message", "abort", "set-model", "refresh-model", "compact" -> request.correlationId == null ||
+            (frame.operationId == request.correlationId && frame.sessionId == request.targetSessionId &&
+                (request.targetInstanceId == null || frame.instanceId == request.targetInstanceId) &&
+                (request.targetEpoch == null || frame.epoch == request.targetEpoch))
+        "worktree-create", "worktree-continue", "worktree-status", "worktree-trust", "bridge-start" -> frame.operationId == request.correlationId
+        "operation-status" -> frame.operationId == request.correlationId && frame.sessionId == request.targetSessionId
         "entry-copy", "label-put" -> frame.entryId == request.correlationId && frame.sessionId == request.targetSessionId
         "dequeue" -> frame.queueRequestId == request.correlationId && frame.sessionId == request.targetSessionId &&
             frame.queued != null && frame.queuedMessages != null && frame.isStreaming != null && frame.isCompacting != null
@@ -1098,18 +1489,28 @@ class GatewayRuntime(
         else -> true
     }
 
+    }
+
     private fun responseCorrelation(frame: GatewayFrame): String? =
         frame.operationId ?: frame.queueRequestId ?: frame.queryId ?: frame.scopeRequestId ?: frame.providerTestId
 
-    private fun explicitResponseCorrelation(request: GatewayRequest, frame: GatewayFrame): String? = when (request.requestType) {
-        "worktree-list" -> frame.queryId
+    private fun explicitResponseCorrelation(request: GatewayRequest, frame: GatewayFrame): String? {
+        if (request.resumesNativeSession || (request.nativeReadOnly && request.requestType != "models")) return frame.operationId
+        if (request.targetInstanceId != null && request.requestType in setOf("commands", "worktree-list")) return frame.queryId
+        if (request.targetInstanceId != null && request.requestType in setOf("tree", "entry-copy", "label-put", "switch-branch", "name", "worktree-continue")) return frame.operationId
+        return when (request.requestType) {
+        "message", "abort", "set-model", "refresh-model", "compact" -> frame.operationId
+        "models", "worktree-list" -> frame.queryId
         "worktree-create", "worktree-continue", "worktree-status", "worktree-trust" -> frame.operationId
+        "bridge-start", "operation-status" -> frame.operationId
         "entry-copy", "label-put" -> frame.entryId
         "dequeue" -> frame.queueRequestId
         "model-scope-put" -> frame.scopeRequestId
         "provider-test" -> frame.providerTestId
         in INPUT_ASSIST_REQUEST_TYPES -> frame.queryId
         else -> null
+    }
+
     }
 
     private fun outgoingImagesAreWithinLimits(images: List<GatewayOutgoingImage>): Boolean {
@@ -1225,6 +1626,7 @@ class GatewayRuntime(
         }
         while (lane.queued.isNotEmpty()) deferredRequests.addLast(lane.queued.removeFirst())
         if (responseKind == "attachment" || lane.active.request.requestType in INPUT_ASSIST_REQUEST_TYPES ||
+            lane.active.request.requestType == "operation-status" ||
             (lane.active.request.requestType == "provider-test" && lane.active.request.correlationId != null)
         ) {
             // §4.22 超时只结束自己：attachment 是只读请求且响应严格三元校验，迟到的
@@ -1371,6 +1773,9 @@ class GatewayRuntime(
         targetSessionId: String? = null,
         correlationId: String? = null,
         serverResponse: Boolean = false,
+        queuedText: String? = null,
+        queuedDisposition: String? = null,
+        automaticRefresh: Boolean = false,
     ) {
         emitEventLocked(
             GatewayRuntimeEvent.RequestRejected(
@@ -1379,6 +1784,9 @@ class GatewayRuntime(
                 targetSessionId,
                 correlationId,
                 serverResponse,
+                queuedText,
+                queuedDisposition,
+                automaticRefresh,
             )
         )
     }
@@ -1388,9 +1796,13 @@ class GatewayRuntime(
             while (deferredRequests.isNotEmpty()) add(deferredRequests.removeFirst())
         }
         val replayKinds = replay.mapTo(mutableSetOf(), GatewayRequest::responseKind)
-        if ("sessions" !in replayKinds) sendRequestLocked(GatewayRequests.sessions())
+        // 连接模式是网关侧持久状态，重连后重新对账，避免 UI 用旧的 sdk/bridge 判定。
+        if ("host-mode" !in replayKinds && "host-mode" in mutableState.value.capabilities) {
+            sendRequestLocked(GatewayRequests.hostMode().copy(automaticRefresh = true))
+        }
+        if ("sessions" !in replayKinds) sendRequestLocked(GatewayRequests.sessions().copy(automaticRefresh = true))
         if ("subscribed" !in replayKinds) {
-            subscribedSessionId?.let { sendRequestLocked(GatewayRequests.subscribe(it)) }
+            subscribedSessionId?.let { sendRequestLocked(GatewayRequests.subscribe(it).copy(automaticRefresh = true)) }
         }
         replay.forEach { sendRequestLocked(it) }
     }
@@ -1461,7 +1873,7 @@ class GatewayRuntime(
         val entryId: String,
         val imageIndex: Int
     )
-    private data class Correlation(val accepted: Boolean, val sessionId: String?)
+    private data class Correlation(val accepted: Boolean, val sessionId: String?, val automaticRefresh: Boolean = false)
 
     private fun GatewayTransportState.Failed.stableErrorCode(): String = when {
         httpStatus == 401 -> ERROR_AUTH_REQUIRED
@@ -1528,11 +1940,17 @@ class GatewayRuntime(
             "websocket-failure"
         )
         private val UNCORRELATED_KINDS = setOf(
-            "event", "hello", "paired", "pong"
+            "event", "hello", "paired", "pong",
+            // extension-status 是服务端主动推送的扩展状态全量快照，没有请求关联。
+            // 显式声明无关联，避免以后收紧响应关联时把它误判成 no-active-request。
+            "extension-status",
+            // 桥接快照与离线通知由订阅连接直接推送，同样没有请求关联。
+            "bridge-snapshot", "bridge-offline"
         )
         private val RESPONSE_KINDS_REQUIRING_ACTIVE_REQUEST = setOf(
             "history", "sent", "subscribed", "unsubscribed", "state", "aborted", "dequeued", "sessions", "model-scope-saved",
-            "input-resources", "input-completions", "entry-copy", "label-put", "provider-test-result"
+            "input-resources", "input-completions", "entry-copy", "label-put", "provider-test-result", "bridge-started",
+            "operation-status"
         )
         private val INPUT_ASSIST_REQUEST_TYPES = setOf("input-resources", "input-completions")
         private val IDEMPOTENT_CONNECTION_STATES = setOf(

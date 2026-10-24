@@ -19,6 +19,30 @@ import kotlin.test.assertTrue
 
 class SharedHistoryStoreTest {
     @Test
+    fun bridgeStreamDiscardKeepsMessagesToolsAndOtherStreams() {
+        val store = SharedHistoryStore()
+        val received = mutableListOf<SharedMviEvent>()
+        store.subscribe(SharedMviEventObserver(received::add))
+        val records = listOf(
+            SessionEvent("s1", 1, 1.0, GatewayEvent(type = "user/message", text = "question")),
+            SessionEvent("s1", 2, 2.0, GatewayEvent(type = "tool/call", callId = "t", name = "read")),
+            SessionEvent("s1", 3, 3.0, GatewayEvent(type = "assistant/message", turn = 3, step = 0, text = "completed")),
+            SessionEvent("s1", 4, 4.0, GatewayEvent(type = "assistant/chunk", turn = 5, step = 0, chunkType = "text-delta", text = "other stream")),
+            SessionEvent("s1", 5, 5.0, GatewayEvent(type = "assistant/chunk", turn = 4, step = 0, chunkType = "text-delta", text = "old prefix")),
+            SessionEvent("s1", 6, 6.0, GatewayEvent(type = "assistant/chunk", turn = 4, step = 0, chunkType = "reasoning-delta", text = "old reasoning")),
+        )
+        records.forEach { assertTrue(store.liveEventReceived(wireJson.encodeToString(it)).accepted) }
+        assertTrue(store.discardStreamChunks("s1", listOf("text-4-0", "reason-4-0")).accepted)
+        val discarded = patch(received.last()).eventPatch!!
+        assertEquals("discard-streams", discarded.kind)
+        assertEquals(records.take(4), discarded.replacementEvents)
+        assertTrue(store.liveEventReceived(wireJson.encodeToString(
+            SessionEvent("s1", 7, 7.0, GatewayEvent(type = "assistant/message", turn = 4, step = 0, text = "final"))
+        )).accepted)
+        assertEquals(7, patch(received.last()).eventPatch!!.record!!.seq)
+    }
+
+    @Test
     fun olderPageDoesNotDedupeAgainstLiveTail() {
         val store = SharedHistoryStore(HistorySyncConfiguration(pagesPerBatch = 1))
         val received = mutableListOf<SharedMviEvent>()

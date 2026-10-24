@@ -29,7 +29,41 @@ data class GatewayFrame(
     val event: JsonValue? = null,
     val code: String? = null,
     val message: String? = null,
+    /** unsubscribed 等帧的可选原因；不是错误正文，不直接展示。 */
+    val reason: String? = null,
     val mode: String? = null,
+    val duplicate: Boolean? = null,
+    /** 已有会话的续聊回执不自动改变当前选择。 */
+    val nativeResume: Boolean? = null,
+    // host-mode / host-mode-put（PROTOCOL §4.30）：网关宿主连接模式。
+    val switchable: Boolean? = null,
+    val changed: Boolean? = null,
+    val reasons: List<String>? = null,
+    // bridge-snapshot / bridge-offline / 桥接会话项（PROTOCOL §4.31–§4.32）。
+    val online: Boolean? = null,
+    val source: String? = null,
+    val runtime: GatewayBridgeRuntime? = null,
+    val instanceId: String? = null,
+    val epoch: String? = null,
+    val pid: Int? = null,
+    val bridgeSeq: Int? = null,
+    val schema: Int? = null,
+    val extensionVersion: String? = null,
+    val busy: Boolean? = null,
+    val pending: Boolean? = null,
+    val pendingMessages: Boolean? = null,
+    val editor: String? = null,
+    val partial: JsonValue? = null,
+    val tools: List<JsonValue>? = null,
+    val queuedText: String? = null,
+    /** abort 成功但队列文字由 Pi 原生语义留给电脑编辑器时置真（PROTOCOL §4.31）。 */
+    val queuedRestoredToDesktop: Boolean? = null,
+    /**
+     * 取队列三态（新网关）：`captured` 手机已拿到文字；`left-on-desktop` 桥接没动
+     * 队列，交给 Pi 原生 abort 交还电脑编辑器；`unknown` 取回动作抛错且无捕获，
+     * 队列是否还在不可知。缺省时退回旧网关的 [queuedRestoredToDesktop]。
+     */
+    val queuedDisposition: String? = null,
     val disposition: String? = null,
     val requestType: String? = null,
     val queueRequestId: String? = null,
@@ -124,6 +158,7 @@ data class GatewayFrame(
     val commands: List<GatewaySlashCommand>? = null,
     // 输入辅助（PROTOCOL §4.24–4.25）：queryId 隔离光标/目录/会话的迟到应答。
     val queryId: String? = null,
+    val nativeRead: Boolean? = null,
     val cwd: String? = null,
     val prefix: String? = null,
     val complete: Boolean? = null,
@@ -133,7 +168,10 @@ data class GatewayFrame(
     // 仅 fetchAttachment 内部消费，帧本体不进 UI 事件队列（避免大 base64 驻留）。
     val imageIndex: Int? = null,
     val mediaType: String? = null,
-    val dataBase64: String? = null
+    val dataBase64: String? = null,
+    // 扩展状态行完整快照（`extension-status` 推送帧，及 subscribed/session-restarted
+    // 应答的可选初始化字段）。空数组 = 清除该会话所有状态。
+    val statuses: List<GatewayStatusEntry>? = null
 ) {
     override fun toString(): String =
         "GatewayFrame(kind=$kind, sessionId=$sessionId, seq=$seq, requestType=$requestType, " +
@@ -141,6 +179,12 @@ data class GatewayFrame(
 }
 
 @Serializable data class GatewayDevice(val id: String, val name: String? = null, val createdAt: Double? = null)
+
+/**
+ * Pi 扩展通过公开 `ctx.ui.setStatus(key, text)` 发布的一条状态行。
+ * 只是显示提示，不表示任务终态（不能推断 isStreaming）。
+ */
+@Serializable data class GatewayStatusEntry(val key: String, val text: String)
 
 @Serializable
 data class GatewayInputCompletion(
@@ -227,6 +271,16 @@ data class GatewayPairingPayload(
 }
 
 /** pi `sessions` 应答项（pi SessionInfo 投影，modified 为 ISO-8601 字符串）。 */
+/** 桥接在线实例身份（PROTOCOL §4.32）；只用于展示与诊断，不参与请求关联。 */
+@Serializable
+data class GatewayBridgeRuntime(
+    val instanceId: String? = null,
+    val epoch: String? = null,
+    val pid: Int? = null
+) {
+    override fun toString(): String = "GatewayBridgeRuntime(instanceId=<redacted>, epoch=<redacted>, pid=$pid)"
+}
+
 @Serializable
 data class GatewaySessionSummary(
     val id: String,
@@ -237,7 +291,11 @@ data class GatewaySessionSummary(
     val modified: String? = null,
     val messageCount: Int? = null,
     val firstMessage: String? = null,
-    val running: Boolean = false
+    val running: Boolean = false,
+    /** 桥接模式下该会话是否有加载了扩展的原生 Pi 实例在线；SDK 模式缺省 null。 */
+    val online: Boolean? = null,
+    val source: String? = null,
+    val runtime: GatewayBridgeRuntime? = null
 ) {
     /** 会话标题：优先 pi 会话名，其次首条消息截断（空会话为 "(no messages)" 时视为 blank）。 */
     val displayTitle: String?
@@ -382,7 +440,7 @@ data class GatewayImageAttachment(
     val thinkingLevels: List<String> = emptyList()
 )
 
-/** 模型目录按 provider 分组（provider 与组内模型均按 id 排序）。 */
+/** 模型目录按 provider 分组；SDK 按 id 排序，桥接保留原生会话范围的次序。 */
 @Serializable data class GatewayModelGroup(val provider: String, val models: List<GatewayModelItem> = emptyList())
 
 /** `models` 应答：只含已配置认证的模型（pi `ModelRuntime.getAvailable()`）。 */
@@ -502,8 +560,13 @@ data class GatewayQueuedMessages(
     val model: GatewayModelRef? = null,
     val thinkingLevel: String? = null,
     val contextUsage: GatewayContextUsage? = null,
-    val queuedMessages: GatewayQueuedMessages? = null
-)
+    val queuedMessages: GatewayQueuedMessages? = null,
+    val pendingMessages: Boolean = false,
+    /** 手机已获提交确认的派发方式；只作提示，不冒充原生当前队列明细。 */
+    val submittedQueueModes: List<String> = emptyList()
+) {
+    val hasQueuedMessages: Boolean get() = pendingMessages || queuedMessages?.isEmpty == false
+}
 
 @Serializable data class GatewayDirectoryItem(val name: String, val path: String, val hidden: Boolean)
 

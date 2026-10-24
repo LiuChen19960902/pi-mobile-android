@@ -6,8 +6,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
@@ -18,17 +23,23 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import com.finecat.pimobile.android.ui.finecat.conversation.FcWorking
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.finecat.pimobile.android.AndroidSharedStateHolder
 import com.finecat.pimobile.android.WorktreeMode
@@ -84,22 +95,32 @@ internal fun FineCatWorktreeSheet(stateHolder: AndroidSharedStateHolder, onOther
         Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
             when (ui.phase) {
                 WorktreePhase.LIST -> {
-                    Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).selectableGroup().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         val modes = if (ui.sourceSessionId == null) listOf(WorktreeMode.NEW, WorktreeMode.EXISTING)
                             else listOf(WorktreeMode.CONTINUE, WorktreeMode.EXISTING, WorktreeMode.NEW)
                         modes.forEach { mode ->
                             val isSelected = ui.mode == mode
+                            val interaction = remember { MutableInteractionSource() }
+                            val focused by interaction.collectIsFocusedAsState()
                             val label = when (mode) {
                                 WorktreeMode.CONTINUE -> "Fork 当前会话"
                                 WorktreeMode.EXISTING -> "打开已有会话"
                                 WorktreeMode.NEW -> "新建空白会话"
                             }
-                            Box(Modifier.weight(1f).background(if (isSelected) colors.surface3 else colors.surface, RoundedCornerShape(999.dp))
-                                .clickable(role = Role.Tab) { stateHolder.worktreeMode(mode) }
-                                .semantics { selected = isSelected }.heightIn(min = 48.dp).testTag("finecat.worktreeMode.$mode"),
+                            Box(Modifier.heightIn(min = 48.dp)
+                                .then(if (focused) Modifier.border(1.dp, colors.ink, RoundedCornerShape(4.dp)) else Modifier)
+                                .selectable(selected = isSelected, interactionSource = interaction,
+                                    indication = null, role = Role.Tab) { stateHolder.worktreeMode(mode) }
+                                .testTag("finecat.worktreeMode.$mode"),
                                 contentAlignment = Alignment.Center) {
-                                Text(label, style = type.xs, fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = if (isSelected) colors.text else colors.text3, maxLines = 1)
+                                Text(label, style = type.sm, fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (isSelected) colors.ink else colors.text3, maxLines = 1,
+                                    modifier = Modifier.drawBehind {
+                                        if (isSelected) drawRoundRect(colors.ink,
+                                            topLeft = Offset(0f, size.height - 4.dp.toPx()),
+                                            size = Size(size.width, 2.dp.toPx()), cornerRadius = CornerRadius(2.dp.toPx()))
+                                    }.padding(vertical = 5.dp))
                             }
                         }
                     }
@@ -137,9 +158,7 @@ internal fun FineCatWorktreeSheet(stateHolder: AndroidSharedStateHolder, onOther
                                     Text(shortWorktreePath(item.path, all.map { it.path }), style = type.xs.copy(fontFamily = FontFamily.Monospace),
                                         color = colors.text3, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
-                                if (isCurrent) WorktreeTag("当前")
-                                if (item.main) WorktreeTag("主工作区")
-                                if (item.missing) Text("目录不存在", style = type.xs, color = colors.err)
+                                if (isCurrent || item.main || item.missing) WorktreeIdentity(isCurrent, item.main, item.missing)
                                 if (enabled) Icon(FineCatIcons.Right, null, tint = colors.text3, modifier = Modifier.size(18.dp))
                             }
                         }
@@ -176,7 +195,7 @@ internal fun FineCatWorktreeSheet(stateHolder: AndroidSharedStateHolder, onOther
                                     Text(listOfNotNull("进行中".takeIf { session.isRunning }, ago.takeIf(String::isNotBlank)).joinToString(" · "),
                                         style = type.xs, color = colors.text3)
                                 }
-                                if (session.id == ui.sourceSessionId) WorktreeTag("当前")
+                                if (session.id == ui.sourceSessionId) WorktreeIdentity(isCurrent = true)
                                 Icon(FineCatIcons.Right, null, tint = colors.text3, modifier = Modifier.size(18.dp))
                             }
                             FcRowDivider()
@@ -214,18 +233,18 @@ internal fun FineCatWorktreeSheet(stateHolder: AndroidSharedStateHolder, onOther
                 else -> {
                     val heading = when (ui.phase) {
                         WorktreePhase.CREATING -> "正在创建…"
-                        WorktreePhase.SWITCHING -> if (ui.action in setOf("select", "open")) "正在确认工作区…" else "正在 Fork 会话…"
+                        WorktreePhase.SWITCHING -> if (ui.action in setOf("select", "open", "resume")) "正在确认工作区…" else "正在 Fork 会话…"
                         WorktreePhase.CONFIRM -> "正在确认操作结果…"
                         WorktreePhase.CREATE_FAILED -> "创建失败"
                         WorktreePhase.TARGET_GONE -> "目标目录已失效"
-                        WorktreePhase.TRUST -> "信任此项目并继续？"
+                        WorktreePhase.TRUST -> if (ui.action == "resume") "信任此目录？" else "信任此项目并继续？"
                         else -> if (ui.createdPath != null) "已创建，切换未完成" else "切换失败"
                     }
                     Text(heading, style = type.body.copy(fontWeight = FontWeight.SemiBold), color = colors.text, modifier = Modifier.padding(vertical = 16.dp))
                     Text(ui.targetPath.orEmpty(), style = type.xs.copy(fontFamily = FontFamily.Monospace), color = colors.text3)
                     ui.error?.let { Text(it, style = type.xs, color = colors.text3, modifier = Modifier.padding(vertical = 12.dp)) }
                     when (ui.phase) {
-                        WorktreePhase.CREATING, WorktreePhase.SWITCHING -> FcWorking(if (ui.phase == WorktreePhase.CREATING) "创建目标工作区" else if (ui.action in setOf("select", "open")) "确认项目信任" else "在目标工作区创建会话副本", Modifier.padding(vertical = 16.dp))
+                        WorktreePhase.CREATING, WorktreePhase.SWITCHING -> FcWorking(if (ui.phase == WorktreePhase.CREATING) "创建目标工作区" else if (ui.action in setOf("select", "open", "resume")) "确认项目信任" else "在目标工作区创建会话副本", Modifier.padding(vertical = 16.dp))
                         WorktreePhase.CONFIRM -> WorktreeButton("重新查询", true, stateHolder::recheckWorktree)
                         WorktreePhase.CREATE_FAILED -> {
                             Text("当前工作区和对话都没变。", style = type.xs, color = colors.text3)
@@ -234,7 +253,8 @@ internal fun FineCatWorktreeSheet(stateHolder: AndroidSharedStateHolder, onOther
                         }
                         WorktreePhase.TRUST -> {
                             Text("允许加载此目录的项目配置、Skills 和扩展。", style = type.xs, color = colors.text3, modifier = Modifier.padding(vertical = 12.dp))
-                            WorktreeButton("信任此项目并继续", ui.action in setOf("select", "open") || blocked == null, { stateHolder.confirmWorktreeTrust() })
+                            WorktreeButton(if (ui.action == "resume") "信任" else "信任此项目并继续",
+                                ui.action in setOf("select", "open", "resume") || blocked == null, { stateHolder.confirmWorktreeTrust() })
                             FcTextButton("取消", onClick = stateHolder::closeWorktree, modifier = Modifier.align(Alignment.CenterHorizontally))
                         }
                         else -> {
@@ -255,10 +275,16 @@ internal fun FineCatWorktreeSheet(stateHolder: AndroidSharedStateHolder, onOther
 }
 
 @Composable
-private fun WorktreeTag(text: String) {
+private fun WorktreeIdentity(isCurrent: Boolean, main: Boolean = false, missing: Boolean = false) {
     val colors = LocalFineCatColors.current
-    Text(text, style = LocalFineCatType.current.xs, color = colors.text3,
-        modifier = Modifier.border(0.5.dp, colors.line, RoundedCornerShape(999.dp)).padding(horizontal = 6.dp, vertical = 2.dp))
+    val labels = listOfNotNull("当前".takeIf { isCurrent }, "主工作区".takeIf { main }, "目录不存在".takeIf { missing })
+    Text(buildAnnotatedString {
+        labels.forEachIndexed { index, label ->
+            if (index > 0) append(" · ")
+            withStyle(SpanStyle(color = when (label) { "当前" -> colors.ink; "目录不存在" -> colors.err; else -> colors.text3 },
+                fontWeight = if (label == "当前") FontWeight.SemiBold else FontWeight.Normal)) { append(label) }
+        }
+    }, style = LocalFineCatType.current.xs, color = colors.text3, maxLines = 1, overflow = TextOverflow.Ellipsis)
 }
 
 @Composable

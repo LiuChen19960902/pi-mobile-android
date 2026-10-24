@@ -245,7 +245,19 @@ data class GatewayRequest(
     val targetSessionId: String? = null,
     val correlationId: String? = null,
     val lanePolicy: GatewayRequestLanePolicy = GatewayRequestLanePolicy.COALESCE_LATEST,
-    val payload: String
+    val payload: String,
+    /** 桥接写目标实例；只用于回执关联，不额外写入 payload。 */
+    val targetInstanceId: String? = null,
+    /** 桥接写目标代际；只用于回执关联，不额外写入 payload。 */
+    val targetEpoch: String? = null,
+    /** 首页创建原生会话，身份必须先由新会话快照建立。 */
+    val createsNativeSession: Boolean = false,
+    /** 已有离线会话按需启动，仍绑定原SID，身份从启动后的快照建立。 */
+    val resumesNativeSession: Boolean = false,
+    /** 原生模式无运行器的只读查询，回执必须显式回显 nativeRead。 */
+    val nativeReadOnly: Boolean = false,
+    /** 本地自动补拉标记：只影响错误展示，不进入 wire，也不改变重试/确认语义。 */
+    val automaticRefresh: Boolean = false
 ) {
     override fun toString(): String =
         "GatewayRequest(requestType=$requestType, responseKind=$responseKind, " +
@@ -258,6 +270,58 @@ data class GatewayRequest(
  * pi 在会话空闲时立即执行、流式时排队，单一模式覆盖"随时可发"的聊天语义。
  */
 object GatewayRequests {
+    /** 只读配置/会话文件；不会为浏览而启动原生Pi。 */
+    fun forNativeRead(request: GatewayRequest, id: String): GatewayRequest {
+        require(request.requestType in setOf("models", "tree", "entry-copy"))
+        require(id.isNotBlank() && id.length <= 128 && request.targetInstanceId == null && request.targetEpoch == null)
+        val original = wireJson.parseToJsonElement(request.payload) as JsonObject
+        val body = buildJsonObject {
+            original.forEach { (key, value) -> put(key, value) }
+            put(if (request.requestType == "models") "queryId" else "operationId", id)
+            put("nativeRead", true)
+        }
+        return request.copy(correlationId = id, nativeReadOnly = true, payload = wireJson.encodeToString(body))
+    }
+
+    /** 明确写动作才启动原SID；成功仍由快照建立身份后验证ACK。 */
+    fun forNativeResume(request: GatewayRequest, operationId: String): GatewayRequest {
+        require(request.requestType in setOf("set-model", "label-put", "switch-branch", "name"))
+        require(request.targetSessionId != null && operationId.isNotBlank() && operationId.length <= 128 && request.targetInstanceId == null && request.targetEpoch == null)
+        val original = wireJson.parseToJsonElement(request.payload) as JsonObject
+        val body = buildJsonObject {
+            original.forEach { (key, value) -> put(key, value) }
+            put("operationId", operationId); put("nativeResume", true)
+        }
+        return request.copy(correlationId = operationId, resumesNativeSession = true, payload = wireJson.encodeToString(body))
+    }
+
+    /** 同一套 Tree/改名请求绑定到原生实例；SDK 请求体和旧关联语义保持不变。 */
+    fun forBridgeSession(request: GatewayRequest, operationId: String, instanceId: String, epoch: String): GatewayRequest {
+        require(request.requestType in setOf("tree", "entry-copy", "label-put", "switch-branch", "name", "worktree-continue"))
+        require(operationId.isNotBlank() && operationId.length <= 128 && instanceId.isNotBlank() && epoch.isNotBlank())
+        val original = wireJson.parseToJsonElement(request.payload) as JsonObject
+        val bound = buildJsonObject {
+            original.forEach { (key, value) -> put(key, value) }
+            put("operationId", operationId); put("instanceId", instanceId); put("epoch", epoch)
+        }
+        return request.copy(correlationId = operationId, targetInstanceId = instanceId, targetEpoch = epoch,
+            payload = wireJson.encodeToString(bound))
+    }
+
+    /** 原生输入查询沿用 queryId，不能与写操作的 operationId 混用。 */
+    fun forBridgeInput(request: GatewayRequest, queryId: String, instanceId: String, epoch: String): GatewayRequest {
+        require(request.requestType in setOf("input-resources", "input-completions", "commands", "worktree-list"))
+        require(request.targetSessionId != null && queryId.isNotBlank() && queryId.length <= 128)
+        require(instanceId.isNotBlank() && epoch.isNotBlank())
+        val original = wireJson.parseToJsonElement(request.payload) as JsonObject
+        val bound = buildJsonObject {
+            original.forEach { (key, value) -> put(key, value) }
+            put("queryId", queryId); put("instanceId", instanceId); put("epoch", epoch)
+        }
+        return request.copy(correlationId = queryId, targetInstanceId = instanceId, targetEpoch = epoch,
+            payload = wireJson.encodeToString(bound))
+    }
+
     fun ping(pingId: String? = null): GatewayRequest =
         request("ping", "pong", correlationId = pingId, lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY) {
             pingId?.let { put("pingId", it) }
@@ -303,7 +367,12 @@ object GatewayRequests {
     }
 
     /** 可用模型目录（只含已配置认证的模型，PROTOCOL.md §4.13）。 */
-    fun models(): GatewayRequest = request("models", "models")
+    fun models(sessionId: String? = null, queryId: String? = null, instanceId: String? = null, epoch: String? = null): GatewayRequest =
+        request("models", "models", targetSessionId = sessionId, correlationId = queryId,
+            targetInstanceId = instanceId, targetEpoch = epoch) {
+            sessionId?.let { put("sessionId", it) }; queryId?.let { put("queryId", it) }
+            instanceId?.let { put("instanceId", it) }; epoch?.let { put("epoch", it) }
+        }
 
     fun modelScope(): GatewayRequest = request("model-scope", "model-scope", lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY)
 
@@ -384,14 +453,37 @@ object GatewayRequests {
         sessionId
     ) { put("sessionId", sessionId) }
 
-    fun abort(sessionId: String): GatewayRequest = request(
+    /** 宿主连接模式（PROTOCOL §4.30）；应答 host-mode 带当前模式。 */
+    fun hostMode(): GatewayRequest = request("host-mode", "host-mode")
+
+    /** 切换 sdk/bridge；有运行中或待消费队列时网关回 mode-switch-blocked。 */
+    fun hostModePut(mode: String): GatewayRequest = request(
+        "host-mode-put",
+        "host-mode",
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
+    ) {
+        put("mode", mode)
+    }
+
+    fun abort(
+        sessionId: String,
+        operationId: String? = null,
+        instanceId: String? = null,
+        epoch: String? = null
+    ): GatewayRequest = request(
         "abort",
         "aborted",
         sessionId,
+        correlationId = operationId?.takeIf { instanceId != null && epoch != null },
+        targetInstanceId = instanceId,
+        targetEpoch = epoch,
         lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
     ) {
         put("sessionId", sessionId)
         put("restoreQueued", true)
+        operationId?.takeIf(String::isNotBlank)?.let { put("operationId", it) }
+        instanceId?.takeIf(String::isNotBlank)?.let { put("instanceId", it) }
+        epoch?.takeIf(String::isNotBlank)?.let { put("epoch", it) }
     }
 
     /** queueRequestId由调用方生成，须非空白且不超过128字符；UI使用UUID。 */
@@ -405,6 +497,39 @@ object GatewayRequests {
         put("queueRequestId", queueRequestId)
     }
 
+    /** 查询桥接写操作是否已被原生实例受理/淘汰；status=unknown 不等于未执行。 */
+    fun bridgeStart(sessionId: String, operationId: String): GatewayRequest = request(
+        "bridge-start",
+        "bridge-started",
+        sessionId,
+        correlationId = operationId,
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
+    ) {
+        require(operationId.isNotBlank() && operationId.length <= 128)
+        put("sessionId", sessionId)
+        put("operationId", operationId)
+    }
+
+    fun operationStatus(
+        sessionId: String,
+        operationId: String,
+        instanceId: String? = null,
+        epoch: String? = null
+    ): GatewayRequest = request(
+        "operation-status",
+        "operation-status",
+        sessionId,
+        correlationId = operationId,
+        lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
+    ) {
+        require(operationId.isNotBlank() && operationId.length <= 128)
+        put("sessionId", sessionId)
+        put("operationId", operationId)
+        // 收据只在原 instance/epoch 上有效；旧界面迟到查询不能落给新实例。
+        instanceId?.takeIf(String::isNotBlank)?.let { put("instanceId", it) }
+        epoch?.takeIf(String::isNotBlank)?.let { put("epoch", it) }
+    }
+
     fun message(
         text: String,
         images: List<GatewayOutgoingImage>,
@@ -413,15 +538,36 @@ object GatewayRequests {
         /** 新会话的模型预选：随帧携带，pi 在首轮前应用（避免默认模型先跑一轮）。 */
         model: GatewayModelSelection? = null,
         /** pi streamingBehavior：空闲时任意（直接跑）；忙时 steer=注入本轮、followUp=排队下轮。 */
-        mode: String = "followUp"
+        mode: String = "followUp",
+        /** 稳定操作 ID：断线重试复用同一个，网关/原生实例据此去重。 */
+        operationId: String? = null,
+        /** 桥接写入目标实例/代际；旧网关忽略，新网关据此拒绝旧界面的迟到写入。 */
+        instanceId: String? = null,
+        epoch: String? = null,
+        nativeNew: Boolean = false,
+        nativeResume: Boolean = false
     ): GatewayRequest = request(
         "message",
         "sent",
         sessionId,
+        correlationId = operationId?.takeIf { nativeNew || nativeResume || (instanceId != null && epoch != null) },
+        targetInstanceId = instanceId,
+        targetEpoch = epoch,
+        createsNativeSession = nativeNew,
+        resumesNativeSession = nativeResume,
         lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
     ) {
+        require(!nativeNew || (sessionId == null && !cwd.isNullOrBlank() && !operationId.isNullOrBlank() &&
+            instanceId == null && epoch == null))
+        require(!nativeResume || (!sessionId.isNullOrBlank() && cwd == null && model == null && !nativeNew &&
+            !operationId.isNullOrBlank() && instanceId == null && epoch == null))
         sessionId?.takeIf(String::isNotBlank)?.let { put("sessionId", it) }
         cwd?.takeIf(String::isNotBlank)?.let { put("cwd", it) }
+        operationId?.takeIf(String::isNotBlank)?.let { put("operationId", it) }
+        instanceId?.takeIf(String::isNotBlank)?.let { put("instanceId", it) }
+        epoch?.takeIf(String::isNotBlank)?.let { put("epoch", it) }
+        if (nativeNew) put("nativeNew", true)
+        if (nativeResume) put("nativeResume", true)
         put("text", text)
         put("mode", mode)
         if (model != null) {
@@ -455,21 +601,35 @@ object GatewayRequests {
     }
 
     /** 切换会话模型（会话级，pi `setModel(model, {persist:false})`，PROTOCOL.md §4.14）。 */
+    fun refreshNativeModel(sessionId: String, operationId: String, instanceId: String, epoch: String): GatewayRequest = request(
+        "refresh-model", "model-refreshed", targetSessionId = sessionId, correlationId = operationId,
+        targetInstanceId = instanceId, targetEpoch = epoch, lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
+    ) {
+        put("sessionId", sessionId); put("operationId", operationId); put("instanceId", instanceId); put("epoch", epoch)
+    }
+
     fun setModel(
         sessionId: String,
         provider: String,
         modelId: String,
-        thinkingLevel: String?
+        thinkingLevel: String?,
+        operationId: String? = null,
+        instanceId: String? = null,
+        epoch: String? = null
     ): GatewayRequest = request(
         "set-model",
         "model-set",
         sessionId,
+        correlationId = operationId,
+        targetInstanceId = instanceId,
+        targetEpoch = epoch,
         lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
     ) {
         put("sessionId", sessionId)
         put("provider", provider)
         put("modelId", modelId)
         thinkingLevel?.takeIf(String::isNotBlank)?.let { put("thinkingLevel", it) }
+        operationId?.let { put("operationId", it) }; instanceId?.let { put("instanceId", it) }; epoch?.let { put("epoch", it) }
     }
 
     /** 会话改名（pi `setSessionName`，PROTOCOL.md §4.15）。 */
@@ -585,13 +745,24 @@ object GatewayRequests {
 
     /** 手动压缩上下文（pi `session.compact()`，PROTOCOL.md §4.16）。
      *  触发即回 `compact-started`；完成/失败经事件流 compaction_end 透传。 */
-    fun compact(sessionId: String): GatewayRequest = request(
+    fun compact(
+        sessionId: String,
+        operationId: String? = null,
+        instanceId: String? = null,
+        epoch: String? = null
+    ): GatewayRequest = request(
         "compact",
         "compact-started",
         sessionId,
+        correlationId = operationId?.takeIf { instanceId != null && epoch != null },
+        targetInstanceId = instanceId,
+        targetEpoch = epoch,
         lanePolicy = GatewayRequestLanePolicy.REJECT_IF_BUSY
     ) {
         put("sessionId", sessionId)
+        operationId?.let { put("operationId", it) }
+        instanceId?.let { put("instanceId", it) }
+        epoch?.let { put("epoch", it) }
     }
 
     // -- provider 管理（pi models.json，PROTOCOL.md §4.17） ---------------------
@@ -737,7 +908,11 @@ object GatewayRequests {
         responseKind: String,
         targetSessionId: String? = null,
         correlationId: String? = null,
+        targetInstanceId: String? = null,
+        targetEpoch: String? = null,
         lanePolicy: GatewayRequestLanePolicy = GatewayRequestLanePolicy.COALESCE_LATEST,
+        createsNativeSession: Boolean = false,
+        resumesNativeSession: Boolean = false,
         content: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit = {}
     ): GatewayRequest {
         val json = buildJsonObject {
@@ -745,12 +920,16 @@ object GatewayRequests {
             content()
         }
         return GatewayRequest(
-            type,
-            responseKind,
-            targetSessionId,
-            correlationId,
-            lanePolicy,
-            wireJson.encodeToString(json)
+            requestType = type,
+            responseKind = responseKind,
+            targetSessionId = targetSessionId,
+            correlationId = correlationId,
+            lanePolicy = lanePolicy,
+            payload = wireJson.encodeToString(json),
+            targetInstanceId = targetInstanceId,
+            targetEpoch = targetEpoch,
+            createsNativeSession = createsNativeSession,
+            resumesNativeSession = resumesNativeSession
         )
     }
 }

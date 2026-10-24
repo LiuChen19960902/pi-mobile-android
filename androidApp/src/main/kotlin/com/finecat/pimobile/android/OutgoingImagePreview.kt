@@ -37,6 +37,13 @@ internal data class OutgoingImagePreview(
     val attachmentIds: List<String>,
     /** UI 渲染数据：内嵌 base64/尺寸来自已准备图片，正式回显前直接解码显示。 */
     val images: List<GatewayImageAttachment>,
+    /**
+     * 同一创建上下文（[newSessionEpoch]）被受理后揭晓的新会话 id：只表示"这个新建页
+     * 延续到了哪个会话"，用于让该页的未确认稿在新会话界面里仍可显式恢复。
+     * 它**不是**本稿的归属：本稿仍是 [sessionId] = null（身份未知、未发送成功），
+     * 不自动重发，也不参与回显匹配。
+     */
+    val continuationSessionId: String? = null,
     /** 发送时草稿文本；失败/未确认恢复草稿用。 */
     val draftText: String,
     /** 恢复草稿用原图快照（MessageSubmission 原图片，非实发新 id 副本）。 */
@@ -47,17 +54,27 @@ internal data class OutgoingImagePreview(
     /** CONFIRMED 起点（elapsedRealtime ms）；未确认收敛计时用。 */
     val sentAtMs: Long = 0L
 ) {
-    /** UI 可见性：已绑定按会话过滤；未绑定只在同一新建对话页显示。 */
+    /**
+     * UI 可见性：已绑定按会话过滤；未绑定（身份未知）只在同一新建对话页显示——
+     * 空白页（selectedSessionId 为 null）或同一创建上下文延续出的会话（自动选中
+     * 的新会话）。这里只决定"恢复入口显示在哪"，不改变本稿的未知归属。
+     */
     fun isVisibleFor(selectedSessionId: String?, currentNewSessionEpoch: Long): Boolean =
         if (sessionId != null) {
             sessionId == selectedSessionId
+        } else if (newSessionEpoch != currentNewSessionEpoch) {
+            false
         } else {
-            selectedSessionId == null && newSessionEpoch == currentNewSessionEpoch
+            selectedSessionId == null || selectedSessionId == continuationSessionId
         }
 }
 
-/** 在途实发的请求身份：与预览列表独立，sent/error/timeout 帧按队头消费。 */
-internal data class AwaitingOutgoingSend(val token: String, val sessionId: String?)
+/**
+ * 在途实发的请求身份：与预览列表独立，sent/error/timeout 帧按队头消费。
+ * [epoch] 是该次发送所在的新建页代次：受理揭晓新会话时用它把"这个创建页延续到了
+ * 哪个会话"记下来，供同页未确认稿继续提供恢复入口。
+ */
+internal data class AwaitingOutgoingSend(val token: String, val sessionId: String?, val epoch: Long)
 
 /**
  * 预览状态机（纯 Kotlin，可单测）：生产由 AndroidSharedStateHolder 驱动，
@@ -68,6 +85,8 @@ internal class OutgoingImagePreviewTracker {
     private val items = mutableListOf<OutgoingImagePreview>()
     val previews: List<OutgoingImagePreview> get() = items.toList()
     private var tokenSequence = 0L
+    /** 进程/实例随机段：operationId 会跨进程进入网关去重表，不能只靠实例内序号。 */
+    private val trackerId = java.util.UUID.randomUUID().toString().replace("-", "").take(12)
 
     /** 在途实发队列（FIFO=实发顺序；runtime 单 message lane + sendInFlight
      *  保证同一时刻至多一个"等待 sent"请求，队头即当前请求身份）。 */
@@ -76,8 +95,15 @@ internal class OutgoingImagePreviewTracker {
     /** token → sent 帧绑定的真实 sessionId；预览被 echo 移除后仍可查询。 */
     private val boundSessionsByToken = mutableMapOf<String, String>()
 
+    /**
+     * token → 该次提交发起前同上下文已明确 FAILED 的旧预览 token 集合。
+     * REL120-03：新消息可靠提交成功后默认放弃这些旧失败稿；按发起时点的 token
+     * 身份判定，不按正文相同猜测，也不受确认期间新失败项影响。
+     */
+    private val failedBeforeSendByToken = mutableMapOf<String, Set<String>>()
+
     /** 请求身份：所有实发（含纯文本/吸附派发，无预览）都分配并进等待队列。 */
-    fun newSendToken(): String = "send-${++tokenSequence}"
+    fun newSendToken(): String = "send-$trackerId-${++tokenSequence}"
 
     /** 建立一条发送中预览（Main 同步调用，先于附件缓存/网络）。仅带图且普通发送。 */
     fun begin(
@@ -103,9 +129,43 @@ internal class OutgoingImagePreviewTracker {
         )
     }
 
+    /**
+     * 记录"本次提交发起前"同上下文已 FAILED 的旧项（发起瞬间快照）。
+     * 同会话按 sessionId 相等；新会话未绑定时按同一新建页代判定，避免串删。
+     */
+    fun rememberFailedBeforeSend(token: String, sessionId: String?, newSessionEpoch: Long) {
+        val failed = items.filter { item ->
+            item.state == OutgoingImagePreviewState.FAILED &&
+                if (sessionId != null) {
+                    item.sessionId == sessionId
+                } else {
+                    item.sessionId == null && item.newSessionEpoch == newSessionEpoch
+                }
+        }.mapTo(mutableSetOf()) { it.sendToken }
+        failedBeforeSendByToken[token] = failed
+        if (failedBeforeSendByToken.size > FAILED_SNAPSHOT_LIMIT) {
+            failedBeforeSendByToken.remove(failedBeforeSendByToken.keys.first())
+        }
+    }
+
+    /**
+     * 该次提交被可靠确认后，清掉它发起前的同上下文 FAILED 旧项及其恢复载荷。
+     * UNCONFIRMED 不动（仍独立对账/恢复）；确认之后新产生的失败不在快照里。
+     * 返回是否移除了预览，调用方据此刷新列表。
+     */
+    fun clearFailedBeforeSend(token: String): Boolean {
+        val failed = failedBeforeSendByToken.remove(token) ?: return false
+        if (failed.isEmpty()) return false
+        val retained = items.filterNot { it.sendToken in failed && it.state == OutgoingImagePreviewState.FAILED }
+        if (retained.size == items.size) return false
+        items.clear()
+        items.addAll(retained)
+        return true
+    }
+
     /** 实发登记：token 进入"等待 sent"队列（sendMessage 调用前，Main 同步）。 */
-    fun trackAwaiting(token: String, sessionId: String?) {
-        awaiting.addLast(AwaitingOutgoingSend(token, sessionId))
+    fun trackAwaiting(token: String, sessionId: String?, newSessionEpoch: Long) {
+        awaiting.addLast(AwaitingOutgoingSend(token, sessionId, newSessionEpoch))
     }
 
     /** 等待队头的请求 token（只读；无预览的纯文本发送也在队里）。 */
@@ -120,6 +180,7 @@ internal class OutgoingImagePreviewTracker {
     fun settleLocalFailure(token: String): OutgoingImagePreview? {
         awaiting.removeAll { it.token == token }
         boundSessionsByToken.remove(token)
+        failedBeforeSendByToken.remove(token)
         return failByToken(token)
     }
 
@@ -148,18 +209,21 @@ internal class OutgoingImagePreviewTracker {
      * 的 FIFO 完成一致，帧内没有任何字段能区分两个新会话请求。
      * 帧 sessionId 缺失或空白时不消费队头；runtime 已拦截，此处保留同样守卫。
      *
-     * SDK已明确受理时完成预览；SDK1.0.4归一图片会移除attachmentId，不能再
-     * 要求同ID回显来证明发送。旧网关未带disposition则保留原匹配等待。
-     * 返回本次发生变化的预览，供调用方刷新列表；sdkAccepted时返回已移除项。
+     * 已收到匹配提交回执时完成预览；SDK 归一图片和原生 Pi 事件均可能不保留
+     * attachmentId，不能要求同 ID 回显。旧网关未带 disposition 则保留原匹配等待。
+     * 返回本次发生变化的预览，供调用方刷新列表；submissionAcknowledged时返回已移除项。
      * 无变化返回null，返回值不表示该项仍保留在列表中。
      */
-    fun consumeSent(frameSessionId: String?, nowMs: Long, sdkAccepted: Boolean = false): OutgoingImagePreview? {
+    fun consumeSent(frameSessionId: String?, nowMs: Long, submissionAcknowledged: Boolean = false): OutgoingImagePreview? {
         val head = awaiting.firstOrNull() ?: return null
         val frameSession = frameSessionId?.takeIf(String::isNotBlank) ?: return null
         if (head.sessionId != null && head.sessionId != frameSession) {
             return null
         }
         awaiting.removeFirst()
+        // 从新建页发起、受理时才揭晓会话的发送：记住"这个创建页延续到了 S"。
+        // 只影响同页未确认稿的恢复入口可见性，不改它们的未知归属。
+        if (head.sessionId == null) noteCreationContextSession(head.epoch, frameSession)
         // 绑定记录保留供发送回写查询（区分自动选中与换会话）；等待队列仅
         // 有限增长（受理即消费），取超出上限丢最旧的有界清理。
         boundSessionsByToken[head.token] = frameSession
@@ -172,7 +236,7 @@ internal class OutgoingImagePreviewTracker {
         if (index < 0) return null
         val preview = items[index]
         // 结束本次本地等待；只按已匹配的token清理，不认领别的消息或图片。
-        if (sdkAccepted) return items.removeAt(index)
+        if (submissionAcknowledged) return items.removeAt(index)
         val confirmed = preview.copy(
             state = OutgoingImagePreviewState.CONFIRMED,
             sentAtMs = nowMs,
@@ -198,6 +262,8 @@ internal class OutgoingImagePreviewTracker {
     fun consumeFailure(asUnconfirmed: Boolean): OutgoingImagePreview? {
         val head = awaiting.removeFirstOrNull() ?: return null
         boundSessionsByToken.remove(head.token)
+        // 本次请求已收敛为失败/未确认，不再有待确认的成功清理。
+        failedBeforeSendByToken.remove(head.token)
         val index = items.indexOfFirst {
             it.sendToken == head.token && it.state == OutgoingImagePreviewState.SENDING
         }
@@ -227,6 +293,20 @@ internal class OutgoingImagePreviewTracker {
         }
         if (index < 0) return null
         return items.removeAt(index)
+    }
+
+    /**
+     * 同一新建上下文里被受理的发送揭晓了新会话 S：给该代次所有未绑定预览记下
+     * "延续会话"，使它们在 S 的界面里仍有显式恢复入口。仍然不绑定归属、不自动
+     * 重发。每个预览各自持有副本，不需要额外的代次表（有表也不参与可见性判定）。
+     */
+    private fun noteCreationContextSession(epoch: Long, sessionId: String) {
+        for (index in items.indices) {
+            val item = items[index]
+            if (item.sessionId == null && item.newSessionEpoch == epoch && item.continuationSessionId != sessionId) {
+                items[index] = item.copy(continuationSessionId = sessionId)
+            }
+        }
     }
 
     /** 查询预览绑定到的真实 sessionId（未绑定/不存在返回 null）；供发送回写
@@ -275,6 +355,7 @@ internal class OutgoingImagePreviewTracker {
         items.clear()
         awaiting.clear()
         boundSessionsByToken.clear()
+        failedBeforeSendByToken.clear()
     }
 
     /**
@@ -321,6 +402,9 @@ internal class OutgoingImagePreviewTracker {
     private companion object {
         /** sent 绑定记录的保留上限（受理即入队、回写查询后即无意义）。 */
         const val BOUND_SESSION_HISTORY_LIMIT = 16
+
+        /** 提交前失败快照的保留上限（正常在确认/失败时消费，只做有界兜底）。 */
+        const val FAILED_SNAPSHOT_LIMIT = 16
 
         /** 当前可见上下文保留的终态预览数（刚失败的发送可恢复）。 */
         const val VISIBLE_RESTORABLE_KEEP = 2

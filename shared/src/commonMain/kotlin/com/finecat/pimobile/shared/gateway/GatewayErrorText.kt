@@ -19,6 +19,20 @@ object GatewayErrorText {
     )
 
     fun request(type: String?, code: String?): String = when (code) {
+        "worktree-trust-required" -> "请先信任目标项目，草稿已保留"
+        "worktree-result-unknown" -> "会话启动未确认，请刷新会话列表"
+        "bridge-stale-runtime" -> "原生会话已变化，请刷新"
+        "model-not-found" -> "此模型已不在原生 Pi 的可用范围"
+        "model-auth-missing" -> "模型未配置认证"
+        "model-refresh-busy" -> "当前会话忙，请空闲后刷新配置"
+        "model-config-refresh-failed" -> "原生模型配置刷新失败，请检查配置"
+        "model-change-failed" -> "模型切换失败，请重试"
+        "model-change-unconfirmed" -> "切换结果未确认，请重新打开核对"
+        "model-change-pending" -> "模型切换尚未结束，请稍后重试"
+        "compaction-busy" -> "正在压缩上下文，请稍候"
+        "compaction-failed" -> "上下文压缩失败，请重试"
+        "compaction-cancelled" -> "上下文压缩已中止"
+        "compaction-unconfirmed" -> "压缩结果未确认，请刷新核对"
         "directory-permission-denied" -> "没有目录访问权限"
         "directory-not-found" -> "目录不存在"
         "directory-not-directory" -> "路径不是目录"
@@ -30,6 +44,30 @@ object GatewayErrorText {
         "history-turn-too-large" -> "历史内容过大，请重新加载"
         "session-not-found" -> "会话不存在，请刷新"
         "session-restart-busy" -> "会话正在运行，请稍后重试"
+        // 桥接模式（PROTOCOL §4.30–§4.32）：只按稳定码给短文案，不透出原生错误。
+        "bridge-offline" -> "原生 Pi 实例不在线"
+        "bridge-unavailable" -> when (type) {
+            "models" -> "模型目录暂不可用，请重试"
+            "input-resources", "input-completions", "commands" -> "请更新网关和桥接扩展"
+            else -> "当前模式不支持此操作"
+        }
+        // 取回排队消息依赖宿主当前输入框的 dequeue 动作；被其他自定义编辑器
+        // 占用、或当前 Pi 版本没有该动作，都是能力受限而非“当前模式不支持”，
+        // 也不影响基础停止，所以文案不把原因归到某一种上。
+        "editor-unavailable" -> if (type == "switch-branch") "会话编辑器暂不可用，请重载原生 Pi" else "输入框被占用或不支持取回排队消息"
+        // 取回动作执行了却没拿到文字：队列可能已被清空，不能说成"没动队列"。
+        "dequeue-unconfirmed" -> "排队消息去向未确认，请在电脑查看"
+        "mode-switch-blocked" -> "会话仍在运行或有排队消息，暂时无法切换"
+        "session-owned" -> "会话已被另一个 Pi 实例持有"
+        "operation-id-conflict" -> "请求内容已变化，请重试"
+        "bridge-start-failed" -> "后台 Pi 启动失败，请查看宿主 tmux"
+        "launch-result-unknown" -> "启动结果未知，请刷新在线状态"
+        "native-start-unconfirmed" -> "原生 Pi 启动未确认，草稿已保留"
+        "native-submit-unconfirmed" -> "消息提交未确认，请先核对会话"
+        "navigation-cancelled" -> "已取消节点跳转"
+        "navigation-failed" -> "节点跳转失败，请重试"
+        "navigation-unconfirmed" -> "跳转结果未确认，请刷新会话树"
+        "busy" -> if (type in setOf("tree", "label-put", "switch-branch", "name")) "请先停止当前任务再操作" else "会话正在运行，请改用追加或排队"
         "provider-not-found" -> "Provider不存在，请刷新"
         "provider-config-read-failed", "scope-read-failed" -> "模型配置读取失败"
         "provider-config-write-failed", "scope-save-failed" -> "保存未确认，请重新打开核对"

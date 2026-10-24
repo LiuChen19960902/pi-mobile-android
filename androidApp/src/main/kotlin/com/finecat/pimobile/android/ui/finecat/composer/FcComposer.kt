@@ -2,6 +2,9 @@ package com.finecat.pimobile.android.ui.finecat.composer
 
 import androidx.compose.animation.core.withInfiniteAnimationFrameMillis
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -43,6 +46,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CornerSize
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -83,6 +87,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextRange
@@ -96,6 +101,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.LayoutDirection
@@ -164,6 +170,7 @@ fun FcComposer(
     directoryBranch: String? = null,
     onDirectoryClick: (() -> Unit)? = null,
     inputAssist: ComposerInputAssist? = null,
+    sendReady: Boolean = true,
 ) {
     val colors = LocalFineCatColors.current
     val radius = LocalFineCatRadius.current
@@ -194,7 +201,22 @@ fun FcComposer(
     }
     // 焦点是瞬时状态：remember 即可，saveable 会在重建后出现假边框
     var focused by remember { mutableStateOf(false) }
-    val shape = RoundedCornerShape(if (showControlsRow) radius.composerExpanded else 999.dp)
+    val expansionProgress by animateFloatAsState(
+        targetValue = if (showControlsRow) 1f else 0f,
+        animationSpec = tween(motion.base, easing = motion.baseEasing),
+        label = "composerExpansion",
+    )
+    val horizontalInset = spacing.s10 + (spacing.s4 - spacing.s10) * expansionProgress
+    val shape = remember(expansionProgress, radius.composerExpanded) {
+        RoundedCornerShape(object : CornerSize {
+            override fun toPx(shapeSize: Size, density: Density): Float {
+                // 胶囊取当前短边的一半；向999dp插值会过早被裁成胶囊。
+                val capsule = shapeSize.minDimension / 2f
+                val expandedCorner = with(density) { radius.composerExpanded.toPx() }
+                return capsule + (expandedCorner - capsule) * expansionProgress
+            }
+        })
+    }
     // dock 的渐变底：底部 62% 实色 bg、向上淡出（CSS .dock linear-gradient）
     val dockBrush = Brush.verticalGradient(0f to Color.Transparent, 0.38f to colors.bg, 1f to colors.bg)
     Column(
@@ -202,8 +224,8 @@ fun FcComposer(
             .fillMaxWidth()
             .background(dockBrush)
             .padding(
-                start = if (showControlsRow) spacing.s4 else spacing.s10,
-                end = if (showControlsRow) spacing.s4 else spacing.s10,
+                start = horizontalInset,
+                end = horizontalInset,
             )
             .padding(bottomGap)
             // 目录行也属于输入区，外部轻点收键盘不能先移除它、吞掉目录点击。
@@ -221,6 +243,7 @@ fun FcComposer(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .testTag("fc.composer.card")
                 // 放在动画裁切之外，保留胶囊四周完整的柔和投影。
                 .dropShadow(
                     shape = shape,
@@ -231,15 +254,22 @@ fun FcComposer(
                         offset = DpOffset(0.dp, 2.dp),
                     ),
                 )
-                .animateContentSize(tween(motion.base, easing = motion.baseEasing))
+                // 背景/裁切/边框使用动画后的尺寸，不能在内侧先跳到目标高度。
                 .clip(shape)
                 .background(colors.surface, shape)
                 .then(if (focused) Modifier.border(1.dp, colors.brandLine, shape) else Modifier)
+                .animateContentSize(
+                    // 边距逐帧改变宽度时连续接续速度，避免反复重启tween拖住高度。
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioNoBouncy,
+                        stiffness = Spring.StiffnessMedium,
+                    ),
+                )
                 .padding(
-                    top = (if (showControlsRow) 9.dp else 5.dp) + homeVerticalInset,
-                    bottom = (if (showControlsRow) 7.dp else 5.dp) + homeVerticalInset,
-                    start = if (showControlsRow) 8.dp else 6.dp,
-                    end = if (showControlsRow) 8.dp else 4.dp,
+                    top = 5.dp + 4.dp * expansionProgress + homeVerticalInset,
+                    bottom = 5.dp + 2.dp * expansionProgress + homeVerticalInset,
+                    start = 6.dp + 2.dp * expansionProgress,
+                    end = 4.dp + 4.dp * expansionProgress,
                 ),
         ) {
             if (!withShots && (preparedImages.isNotEmpty() || preparingPhotoUris.isNotEmpty())) {
@@ -289,7 +319,7 @@ fun FcComposer(
                     inputVisualTransformation = inputAssist?.transformation ?: VisualTransformation.None,
                     onInputKey = inputAssist?.onKey ?: { false },
                     placeholder = placeholder,
-                    minHeight = if (showControlsRow) 47.dp else 22.dp,
+                    minHeight = 22.dp + 25.dp * expansionProgress,
                     minLines = if (showControlsRow) 2 else 1,
                     onFocusChanged = {
                         focused = it
@@ -298,7 +328,7 @@ fun FcComposer(
                     modifier = Modifier
                         .weight(1f)
                         // 展开文字区至少两行，触控和高度随文字行数一起保留。
-                        .padding(start = if (showControlsRow) 8.dp else 4.dp),
+                        .padding(start = 4.dp + 4.dp * expansionProgress),
                 )
                 if (!showControlsRow) {
                     FcSendButton(
@@ -307,6 +337,7 @@ fun FcComposer(
                         onSend = onSend,
                         onStop = onStop,
                         dispatchWhileRunning = dispatchWhileRunning,
+                        sendReady = sendReady,
                         modifier = Modifier.padding(start = 4.dp),
                     )
                 }
@@ -338,6 +369,7 @@ fun FcComposer(
                         onSend = onSend,
                         onStop = onStop,
                         dispatchWhileRunning = dispatchWhileRunning,
+                        sendReady = sendReady,
                     )
                 }
             }
@@ -633,8 +665,10 @@ fun FcSendButton(
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
     dispatchWhileRunning: Boolean = false,
+    sendReady: Boolean = true,
 ) {
     val stopping = sendButtonStops(running, hasText, dispatchWhileRunning)
+    val connectionBlocked = !stopping && !sendReady
     val content = Color.White
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -652,14 +686,17 @@ fun FcSendButton(
                     role = Role.Button,
                     onClick = if (stopping) onStop else onSend,
                 )
-                .semantics { this.contentDescription = description },
+                .semantics {
+                    this.contentDescription = description
+                    this.stateDescription = if (connectionBlocked) "尚未连接" else ""
+                },
             contentAlignment = Alignment.Center,
         ) {
         Box(
             modifier = Modifier
                 .size(32.dp)
                 .scale(if (pressed) 0.92f else 1f)
-                .background(Color.Black, CircleShape),
+                .background(if (connectionBlocked) LocalFineCatColors.current.text3 else Color.Black, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
             if (stopping) {

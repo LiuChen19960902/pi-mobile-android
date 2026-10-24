@@ -13,6 +13,7 @@ Status: implemented
 - 用一个按会话生命周期存活的 `LaunchedEffect(listState, selectedSessionId, density, imeInsets)`，内部 `snapshotFlow { imeInsets.getBottom(density) }` 逐帧监听 IME 高度；每个变化值先 `withFrameNanos`，再以 `onlyIfLastHidden = false` 滚到底。吸底状态、条目数量等用 `rememberUpdatedState` 提供，避免长生命周期 collector 读到旧值。只在吸底时执行，用户翻历史时不抢位置。
 - 不用“`isImeVisible` 边沿 + 末条可见即跳过”：边沿只在动画第一帧触发，那时 layoutInfo 可能还是旧的；“部分可见”也会被当成无需滚动。
 - 流式内容跟随只在末项隐藏时定位，已可见时补尾部差值；Markdown 换行后的高度在后续测量才更新，贴底时观察实际尾部布局。
+- 回底箭头同时要求用户已离开贴底状态且列表还能向后滚。输入区展开、选图区或 IME 压缩视口会让 `canScrollForward` 短暂变真；只看该几何值会在补滚前闪出箭头。沿用持久贴底意图，不用延时掩盖，也不因输入框获焦而禁用用户阅读历史时的回底入口。
 
 ### 先看拓扑，再判断 inset 是否重复
 
@@ -31,6 +32,8 @@ Status: implemented
 ### 输入框
 
 折叠与展开不能各创建一个 `BasicTextField`：首次获得焦点会切换分支、替换编辑控件并中断输入连接。保持同一控件，只调整周边按钮和尺寸。
+
+输入卡背景、圆角裁切与边框放在 `animateContentSize` 外侧，才使用动画中的外框尺寸；放到内侧会先画成目标高度，即使外层还在动画，看起来仍像瞬间切换。阴影留在裁切外。横向边距、内边距与输入区最小高随同一归一化进度变化，圆角在当前短边一半与展开圆角间插值；不把 `999dp` 作为圆角动画目标，否则很快被几何上限裁成胶囊。尺寸连续重定向使用无回弹弹簧，避免逐帧宽度变化反复重启 tween。
 
 ## 考虑过的方案
 

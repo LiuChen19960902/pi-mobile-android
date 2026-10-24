@@ -16,6 +16,8 @@ Status: implemented
 - 历史中的 `custom_message` 与原生压缩条目同为 `role=custom`，要按明确来源区分，不能靠 `customType` 猜。SDK 的 custom 消息是独立条目，不保留原 message 对象引用；同一批次中能证明一一追加顺序时才绑定条目 ID，数量不符就省略身份，不按正文或时间推测。
 - `sent` 回执的 `handled` 只表示本次输入被消费，既不保证产生普通 run，也不保证没有处理器另起 run。Pi SDK 1.0.4 的 `_runAgentPrompt` 在第一个 await 之前同步设置 `_isAgentRunActive`，`isStreaming` 直接读这个标记，不需要也不能伪造 streaming 快照。网关先排空旧事件再同步发送 ACK，防止陈旧快照让 Working 复活。
 
+扩展通过公开 `ctx.ui.setStatus` 发布的纯文本按[通用状态行契约](2026-10-19-extension-status-bridge.md)显示；该显示原语不读取私有状态，也不提供插件专属面板。
+
 ## 考虑过的方案
 
 **对来源明确的扩展做可选增强。** 早期评审允许过“注明来源的可选增强”，Agent 运行条和 `empty-stop-retry` 分支就是这样加入的。开源后无法替所有扩展维护适配，且同名扩展在不同环境里语义不同，因此这一理由不再用于恢复这些功能。
