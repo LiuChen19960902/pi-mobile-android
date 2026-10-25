@@ -54,7 +54,7 @@ pi-mobile-gateway（电脑，Node.js）
 | 电脑 | Ubuntu 26.04.1 / x86_64 / Node.js 24.21.0，已安装 `fd` | 曾在 gateway 0.3.0 的较早快照验证安装、配对、Provider 配置、真实聊天、工具与历史；最新 Tree 动作及手动压缩未在该主机复验 |
 | 电脑 | 纯 Windows（不装 WSL）、macOS、其他 Linux 环境 | 未验证，欢迎反馈 |
 
-版本配套要求：**Android 1.2.2 ↔ gateway 0.5.1（Pi SDK 1.3.0）**。协议在演进，客户端与网关要配套升级。
+版本配套要求：**Android 1.2.2 ↔ gateway 0.5.2（Pi SDK 1.3.0）**。协议在演进，客户端与网关要配套升级。
 
 ## 两种连接模式
 
