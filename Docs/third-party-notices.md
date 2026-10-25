@@ -18,6 +18,12 @@ KMP 架构与部分移动端实现参考了 [dsh-mobile](https://github.com/Clar
 
 许可证全文：[Apache License 2.0](licenses/Apache-2.0.txt)，来源为 [Apache 官方文本](https://www.apache.org/licenses/LICENSE-2.0.txt)。分发 APK 时同时提供本声明、根目录 MIT 许可与此许可全文，保留相关版权声明。
 
+## 网关依赖
+
+| 库 | 版本 | 许可证 | 用途 |
+| --- | --- | --- | --- |
+| [undici](https://github.com/nodejs/undici) | 8.12.2 | [MIT](https://github.com/nodejs/undici/blob/v8.12.2/LICENSE) | 网关的 HTTP 运行时；npm 根覆盖统一 SDK 的解析版本，不包含在 Android APK 中 |
+
 ## 素材与品牌
 
 - 桌面彩色图标按 [Pi 官方 Press Kit](https://pi.dev/press-kit) 的三色 SVG 转为 Android VectorDrawable；来源页面标示 MIT，Pi 项目许可声明为 Copyright (c) 2025 Mario Zechner，见 [上游 LICENSE](https://github.com/earendil-works/pi/blob/main/LICENSE)。图形路径与色值保留，布局适配 Android 图标画布。
