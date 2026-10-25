@@ -399,8 +399,15 @@ object GatewayRequests {
         put("reset", reset)
     }
 
-    fun sessions(): GatewayRequest =
-        request("sessions", "sessions")
+    fun sessions(knownSessions: Map<String, String> = emptyMap()): GatewayRequest =
+        request("sessions", "sessions") {
+            if (knownSessions.isNotEmpty()) put("knownSessions", buildJsonArray {
+                knownSessions.forEach { (id, path) -> add(buildJsonObject {
+                    put("id", id)
+                    put("path", path)
+                }) }
+            })
+        }
 
     /** 历史图片按需取回（PROTOCOL §4.22）：三元寻址，单 lane REJECT_IF_BUSY
      *  保证同一时刻至多一个在途请求（Runtime 的 fetchAttachment 驱动）。 */

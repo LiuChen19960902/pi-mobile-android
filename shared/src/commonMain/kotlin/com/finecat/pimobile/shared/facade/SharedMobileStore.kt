@@ -27,6 +27,8 @@ import kotlin.time.Clock
 data class SharedMobileSnapshot(
     val sessions: List<SessionSummary> = emptyList(),
     val selectedSessionId: String? = null,
+    /** 确认删除的摘要单独保留，当前页仍可查看缓存正文和草稿。 */
+    val deletedSessions: Map<String, SessionSummary> = emptyMap(),
     val conversation: List<ConversationItem> = emptyList(),
     val modelCatalog: GatewayModelCatalog? = null,
     /** 每会话的 pi 会话级状态（model/thinkingLevel/contextUsage…），由 state/model-set 帧更新。 */
@@ -60,6 +62,7 @@ class SharedMobileStore(
     }
 ) {
     private var sessionListState = SessionListState()
+    private val deletedSessions = mutableMapOf<String, SessionSummary>()
     private val eventsBySession = mutableMapOf<String, List<SessionEvent>>()
     private var modelCatalog: GatewayModelCatalog? = null
     private var modelCatalogSessionId: String? = null
@@ -178,6 +181,7 @@ class SharedMobileStore(
     fun acceptFrame(json: String): SharedMobileSnapshot {
         try {
             val frame = GatewayWireDecoder.decode(json)
+            if (frame.kind != "sessions" && frame.sessionId in deletedSessions) return makeSnapshot()
             lastFrameKind = frame.kind
             lastError = null
             // 扩展状态是完整快照：任何带 statuses 的帧（extension-status 推送、
@@ -196,6 +200,12 @@ class SharedMobileStore(
                             wireJson.decodeFromJsonElement(GatewaySessionSummary.serializer(), item.toJsonElement())
                         }.getOrNull()
                     }
+                    sessions.forEach { deletedSessions.remove(it.id) }
+                    val visibleIds = sessions.mapTo(mutableSetOf()) { it.id }
+                    val removed = frame.deletedSessionIds.orEmpty().toSet() - visibleIds
+                    sessionListState.sessions.filter { it.id in removed }.forEach { deletedSessions[it.id] = it }
+                    removed.forEach { sessionStates.remove(it); extensionStatuses.remove(it) }
+                    sessionListState = sessionListState.copy(sessions = sessionListState.sessions.filterNot { it.id in removed })
                     sessionListState = SessionListReducer.reduce(
                         sessionListState,
                         SessionListAction.RemoteSessionsReceived(sessions)
@@ -417,6 +427,7 @@ class SharedMobileStore(
      * 需要把 raw 重新解析一遍，chunk 帧也不会多走一次全量归一。
      */
     fun acceptEventFrame(frame: GatewayFrame, records: List<SessionEvent> = emptyList()): SharedMobileSnapshot {
+        if (frame.sessionId in deletedSessions) return makeSnapshot()
         lastFrameKind = frame.kind
         lastError = null
         applyEventFrame(frame, records)
@@ -482,6 +493,7 @@ class SharedMobileStore(
 
     fun reset(): SharedMobileSnapshot {
         sessionListState = SessionListState()
+        deletedSessions.clear()
         eventsBySession.clear()
         modelCatalog = null
         sessionStates.clear()
@@ -497,6 +509,7 @@ class SharedMobileStore(
      *   已应用的 state）时只合并正文与列表元数据，不翻转运行/压缩/队列状态。
      */
     private fun acceptEvent(record: SessionEvent, statusAuthoritative: Boolean) {
+        if (record.sessionId in deletedSessions) return
         // 压缩状态事件（PiEventNormalizer 归一）：compact/start 置压缩中，
         // compact/end / notice/compact（失败可见行）收尾；start/end 不进对话流。
         when (record.event.type) {
@@ -606,6 +619,7 @@ class SharedMobileStore(
         return SharedMobileSnapshot(
             sessions = sessionListState.sessions,
             selectedSessionId = selected,
+            deletedSessions = deletedSessions.toMap(),
             conversation = selected?.let { ConversationProjector.make(eventsBySession[it].orEmpty()) }.orEmpty(),
             modelCatalog = modelCatalog,
             sessionStates = sessionStates.toMap(),

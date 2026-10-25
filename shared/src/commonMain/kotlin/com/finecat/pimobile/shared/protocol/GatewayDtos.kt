@@ -69,6 +69,8 @@ data class GatewayFrame(
     val queueRequestId: String? = null,
     // sessions 应答：pi SessionInfo 投影
     val items: List<JsonValue>? = null,
+    /** 网关核验过文件缺失且没有实例持有；缺省不能从列表缺项推断。 */
+    val deletedSessionIds: List<String>? = null,
     // history 应答：pi 渲染消息 + 条目游标
     val messages: List<JsonValue>? = null,
     val entryIds: List<String>? = null,

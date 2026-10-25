@@ -171,6 +171,7 @@ fun FcComposer(
     onDirectoryClick: (() -> Unit)? = null,
     inputAssist: ComposerInputAssist? = null,
     sendReady: Boolean = true,
+    sendEnabled: Boolean = true,
 ) {
     val colors = LocalFineCatColors.current
     val radius = LocalFineCatRadius.current
@@ -338,6 +339,7 @@ fun FcComposer(
                         onStop = onStop,
                         dispatchWhileRunning = dispatchWhileRunning,
                         sendReady = sendReady,
+                        enabled = sendEnabled,
                         modifier = Modifier.padding(start = 4.dp),
                     )
                 }
@@ -370,6 +372,7 @@ fun FcComposer(
                         onStop = onStop,
                         dispatchWhileRunning = dispatchWhileRunning,
                         sendReady = sendReady,
+                        enabled = sendEnabled,
                     )
                 }
             }
@@ -666,9 +669,10 @@ fun FcSendButton(
     modifier: Modifier = Modifier,
     dispatchWhileRunning: Boolean = false,
     sendReady: Boolean = true,
+    enabled: Boolean = true,
 ) {
     val stopping = sendButtonStops(running, hasText, dispatchWhileRunning)
-    val connectionBlocked = !stopping && !sendReady
+    val connectionBlocked = !enabled || (!stopping && !sendReady)
     val content = Color.White
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -683,12 +687,17 @@ fun FcSendButton(
                 .size(48.dp)
                 .clickable(
                     interactionSource = interaction, indication = null,
+                    enabled = enabled,
                     role = Role.Button,
                     onClick = if (stopping) onStop else onSend,
                 )
                 .semantics {
                     this.contentDescription = description
-                    this.stateDescription = if (connectionBlocked) "尚未连接" else ""
+                    this.stateDescription = when {
+                        !enabled -> "不可发送"
+                        connectionBlocked -> "尚未连接"
+                        else -> ""
+                    }
                 },
             contentAlignment = Alignment.Center,
         ) {

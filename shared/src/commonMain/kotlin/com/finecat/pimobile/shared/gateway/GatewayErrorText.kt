@@ -43,6 +43,7 @@ object GatewayErrorText {
         "history-cursor-invalid" -> "历史位置已变化，请重新加载"
         "history-turn-too-large" -> "历史内容过大，请重新加载"
         "session-not-found" -> "会话不存在，请刷新"
+        "session-deleted" -> "会话已在电脑端删除"
         "session-restart-busy" -> "会话正在运行，请稍后重试"
         // 桥接模式（PROTOCOL §4.30–§4.32）：只按稳定码给短文案，不透出原生错误。
         "bridge-offline" -> "原生 Pi 实例不在线"

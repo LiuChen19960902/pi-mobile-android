@@ -34,6 +34,35 @@ import kotlinx.coroutines.test.resetMain
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AndroidSharedStateHolderTest {
+    @Test fun deletedSessionKeepsDraftAndAttachmentsAndBlocksCommandAndRegularSend() {
+        val holder = newPreviewHolder()
+        try {
+            holder.wirePayload = """{"kind":"sessions","items":[{"id":"deleted","cwd":"/synthetic/project","name":"Old title"}]}"""
+            holder.submitWirePayload()
+            holder.selectSession("deleted")
+            val image = preparedTestImage()
+            holder.setPreparedImagesForTest(listOf(image), uris = listOf("content://synthetic/image"))
+            holder.wirePayload = """{"kind":"sessions","items":[],"deletedSessionIds":["deleted"]}"""
+            holder.submitWirePayload()
+            for (draft in listOf("keep my draft", "/compact")) {
+                holder.messageDraft = draft
+                holder.sendComposerDraft()
+                assertTrue(holder.selectedSessionDeleted)
+                assertFalse(holder.canSend)
+                assertEquals(draft, holder.messageDraft)
+                assertEquals(listOf(image), holder.preparedImages)
+                assertEquals("会话已在电脑端删除", holder.transientNotice)
+                assertTrue(holder.snapshot.sessions.isEmpty())
+                assertTrue(holder.outgoingPreviews.isEmpty())
+                assertEquals("/synthetic/project", holder.currentSessionDirectory)
+            }
+            holder.selectSession("another")
+            holder.selectSession("deleted")
+            assertEquals("/compact", holder.messageDraft)
+            assertTrue(holder.selectedSessionDeleted)
+        } finally { holder.close() }
+    }
+
     @Test
     fun nativeHomeAndOfflineSessionCanReadModelsWithoutAnInstance() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))

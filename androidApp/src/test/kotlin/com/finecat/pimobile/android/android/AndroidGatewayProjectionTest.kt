@@ -20,6 +20,44 @@ import org.junit.Test
  * pi 条目游标分页（messages/entryIds/oldestEntryId）。
  */
 class AndroidGatewayProjectionTest {
+    @Test fun confirmedDeletionPreservesCachedHistoryAcrossReselectAndCatchUp() {
+        var requests = 0
+        val projection = AndroidGatewayProjection { _, _, _ -> requests++ }
+        try {
+            fun accept(raw: String) = projection.acceptFrame(raw, GatewayWireDecoder.decode(raw), "deleted")
+            accept("""{"kind":"sessions","items":[{"id":"deleted","name":"Cached"}]}""")
+            projection.selectSession("deleted")
+            accept("""{"kind":"history","sessionId":"deleted","messages":[{"role":"user","content":"cached question"},{"role":"assistant","content":"cached answer"}],"entryIds":["u","a"],"hasMore":false}""")
+            val cached = projection.snapshot().conversation
+            assertTrue(cached.isNotEmpty())
+            // 重连补拉先清显示缓冲；删除证明晚到时仍须恢复先前可见正文。
+            projection.catchUpSelectedHistoryAfterReconnect()
+            assertTrue(projection.snapshot().conversation.isEmpty())
+            accept("""{"kind":"sessions","items":[],"deletedSessionIds":["deleted"]}""")
+            projection.selectSession("another")
+            val requestCount = requests
+            projection.selectSession("deleted")
+            projection.catchUpSelectedHistoryAfterReconnect()
+            assertEquals(requestCount, requests)
+            assertEquals(cached, projection.snapshot().conversation)
+            assertEquals("deleted", projection.snapshot().selectedSessionId)
+            assertTrue(projection.snapshot().sessions.isEmpty())
+            assertFalse(projection.snapshot().selectedHistoryIsLoading)
+            assertNull(projection.snapshot().selectedHistoryError)
+            accept("""{"kind":"sessions","items":[{"id":"deleted","name":"Restored"}]}""")
+            assertEquals(requestCount + 1, requests)
+            assertEquals(cached, projection.snapshot().conversation)
+            accept("""{"kind":"history","sessionId":"deleted","messages":[{"role":"user","content":"restored question"}],"entryIds":["r"],"hasMore":false}""")
+            assertTrue(projection.snapshot().conversation.isNotEmpty())
+            assertFalse(projection.snapshot().conversation == cached)
+            val restored = projection.snapshot().conversation
+            accept("""{"kind":"sessions","items":[],"deletedSessionIds":["deleted"]}""")
+            projection.historyTimedOut("deleted")
+            assertEquals(restored, projection.snapshot().conversation)
+            assertNull(projection.snapshot().selectedHistoryError)
+        } finally { projection.close() }
+    }
+
     @Test fun nativeCompactBoundaryUpdatesRingAndDrawerWithoutASecondRun() {
         val projection = AndroidGatewayProjection()
         try {

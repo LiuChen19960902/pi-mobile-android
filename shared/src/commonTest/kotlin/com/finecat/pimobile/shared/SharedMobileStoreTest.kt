@@ -12,6 +12,29 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SharedMobileStoreTest {
+    @Test fun confirmedDeletionRemovesOnlyTheListedSessionAndPreservesSelectionAndBody() {
+        val store = SharedMobileStore()
+        store.acceptFrame("""{"kind":"sessions","items":[{"id":"gone","name":"Cached title"},{"id":"kept"}]}""")
+        store.selectSession("gone")
+        store.acceptLiveEvents(listOf(SessionEvent("gone", 1, 1.0, GatewayEvent(type = "user/message", text = "cached text"))))
+        val before = store.snapshot().conversation
+        // 旧网关、临时空列表和普通 not-found 均不能推断永久删除。
+        store.acceptFrame("""{"kind":"sessions","items":[]}""")
+        store.acceptFrame("""{"kind":"error","sessionId":"gone","code":"session-not-found"}""")
+        assertEquals(2, store.snapshot().sessions.size)
+        val removed = store.acceptFrame("""{"kind":"sessions","items":[],"deletedSessionIds":["gone"]}""")
+        assertEquals(listOf("kept"), removed.sessions.map { it.id })
+        assertEquals("gone", removed.selectedSessionId)
+        assertEquals("Cached title", removed.deletedSessions.getValue("gone").title)
+        assertEquals(before, removed.conversation)
+        store.acceptLiveEvents(listOf(SessionEvent("gone", 2, 2.0, GatewayEvent(type = "turn/start"))))
+        assertEquals(listOf("kept"), store.snapshot().sessions.map { it.id })
+        store.acceptFrame("""{"kind":"sessions","items":[{"id":"gone"}],"deletedSessionIds":["gone"]}""")
+        assertTrue(store.snapshot().deletedSessions.isEmpty())
+        store.reset()
+        assertTrue(store.snapshot().deletedSessions.isEmpty())
+    }
+
     @Test fun nativeResumeReceiptCannotSelectAnOldSessionFromTheNewConversationPage() {
         val store = SharedMobileStore()
         store.selectSession("old")

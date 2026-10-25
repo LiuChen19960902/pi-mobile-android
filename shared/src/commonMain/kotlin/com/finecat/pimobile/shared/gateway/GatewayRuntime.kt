@@ -34,6 +34,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
 
 enum class GatewayConnectionState {
@@ -180,6 +181,9 @@ class GatewayRuntime(
     private var hostModeGeneration = 0L
     private var subscribedSessionId: String? = null
     private var previousSubscribedSessionId: String? = null
+    private val knownSessionPaths = linkedMapOf<String, String>()
+    private var sessionPresenceCursor = 0
+    private val deletedSessionIds = mutableSetOf<String>()
     private var isInBackground = false
     private var connectionGeneration = 0L
     private var requestGeneration = 0L
@@ -220,6 +224,9 @@ class GatewayRuntime(
     }
 
     private suspend fun pairEndpointLocked(endpoint: String, code: String) {
+        knownSessionPaths.clear()
+        sessionPresenceCursor = 0
+        deletedSessionIds.clear()
         // 目标尚未证明可配对；收到 paired 之前不能让旧 token 的持久入口指向它。
         connectionGeneration += 1
         runCatching { transport.close() }
@@ -347,6 +354,7 @@ class GatewayRuntime(
                 // 连接保持时后台窗口仍可能错过终态事件；回前台主动对账一次会话状态，
                 // 用网关真值纠正 Working/压缩标记，不靠计时器推断结束。
                 if (mutableState.value.connection == GatewayConnectionState.CONNECTED) {
+                    sendRequestLocked(GatewayRequests.sessions().copy(automaticRefresh = true))
                     subscribedSessionId?.let { sendRequestLocked(GatewayRequests.state(it).copy(automaticRefresh = true)) }
                 }
             }
@@ -589,6 +597,11 @@ class GatewayRuntime(
     }
 
     private suspend fun sendRequestLocked(request: GatewayRequest): Boolean {
+        if (request.targetSessionId in deletedSessionIds && request.requestType != "unsubscribe") {
+            rejectLocked(request.requestType, "session-deleted", request.targetSessionId, request.correlationId,
+                automaticRefresh = request.automaticRefresh)
+            return false
+        }
         if (request.requestType == "dequeue" &&
             pendingLanes["sent"]?.active?.request?.targetSessionId == request.targetSessionId &&
             pendingLanes["sent"] != null) {
@@ -644,8 +657,26 @@ class GatewayRuntime(
     }
 
     private suspend fun sendAsActiveLocked(original: GatewayRequest): Boolean {
+        if (original.targetSessionId in deletedSessionIds && original.requestType != "unsubscribe") {
+            rejectLocked(original.requestType, "session-deleted", original.targetSessionId, original.correlationId,
+                automaticRefresh = original.automaticRefresh)
+            return false
+        }
         // 在真正发送时处理，覆盖先前已排队及重连重放的history请求。
-        val request = historyPagingRequest(original)
+        val request = historyPagingRequest(original).let {
+            if (it.requestType == "sessions" && "session-presence-v1" in mutableState.value.capabilities) {
+                // 单帧有预算；轮转核对全部已见会话，且当前页面优先，不能永久漏掉旧条目。
+                val entries = knownSessionPaths.entries.toList()
+                val start = if (entries.isEmpty()) 0 else sessionPresenceCursor % entries.size
+                val batch = (entries.drop(start) + entries.take(start)).take(2048).associate { entry -> entry.key to entry.value }.toMutableMap()
+                sessionPresenceCursor = if (entries.isEmpty()) 0 else (start + 2048) % entries.size
+                subscribedSessionId?.let { id -> knownSessionPaths[id]?.let { path ->
+                    if (id !in batch && batch.size == 2048) batch.remove(batch.keys.last())
+                    batch[id] = path
+                } }
+                GatewayRequests.sessions(batch).copy(automaticRefresh = it.automaticRefresh)
+            } else it
+        }
         val pendingId = ++requestGeneration
         val transportGeneration = connectionGeneration
         val timeoutJob = scope.launch {
@@ -676,6 +707,14 @@ class GatewayRuntime(
         val lane = pendingLanes.remove(responseKind) ?: return
         lane.active.timeoutJob.cancel()
         if (responseKind == "attachment") releasePendingAttachmentFetchLocked()
+        // 已删除目标的排队请求属于本地拒绝，不能冒充发送失败回收整条连接。
+        while (lane.queued.firstOrNull()?.let {
+            it.targetSessionId in deletedSessionIds && it.requestType != "unsubscribe"
+        } == true) {
+            val removed = lane.queued.removeFirst()
+            rejectLocked(removed.requestType, "session-deleted", removed.targetSessionId, removed.correlationId,
+                automaticRefresh = removed.automaticRefresh)
+        }
         val queued = lane.queued.removeFirstOrNull() ?: return
         // 正常响应已经确定 active 请求结束；下一请求必须沿用当前 socket 串行发送。
         // generation 回收只留给 timeout/transport failure，否则 hello 后的重复快照会形成重连闭环。
@@ -1048,8 +1087,44 @@ class GatewayRuntime(
 
         // 同operation重试可得到“仍在处理”的回放；它不是停止终态，不能消费lane。
         if (frame.kind == "aborted" && frame.status == "submitted") return
+        val responseRequest = if (frame.kind == "error") {
+            pendingLanes.values.firstOrNull { it.active.request.requestType == frame.requestType }?.active?.request
+        } else pendingLanes[frame.kind]?.active?.request
         val correlation = correlateLocked(frame)
         if (!correlation.accepted) return
+        val confirmedDeleted = if (frame.kind == "sessions" && frame.items != null &&
+            "session-presence-v1" in mutableState.value.capabilities) {
+            frame.deletedSessionIds.orEmpty().filter { it in knownSessionPaths }.toSet()
+        } else emptySet()
+        if (frame.kind == "sessions") {
+            val summaries = frame.items.orEmpty().mapNotNull { item -> runCatching {
+                wireJson.decodeFromJsonElement(com.finecat.pimobile.shared.protocol.GatewaySessionSummary.serializer(), item.toJsonElement())
+            }.getOrNull() }
+            // 正向重新发现优先于同帧冲突的删除字段。
+            val restoredSelected = subscribedSessionId?.takeIf { id ->
+                id in deletedSessionIds && summaries.any { it.id == id }
+            }
+            deletedSessionIds += confirmedDeleted - summaries.map { it.id }.toSet()
+            summaries.forEach { item ->
+                deletedSessionIds.remove(item.id)
+                item.path?.takeIf(String::isNotBlank)?.let { knownSessionPaths[item.id] = it }
+            }
+            deletedSessionIds.forEach { id ->
+                knownSessionPaths.remove(id)
+                activeTurnCountsBySession.remove(id)
+                observedRunningSessions.remove(id)
+                observedCompactingSessions.remove(id)
+            }
+            publishTurnStateLocked()
+            restoredSelected?.let { sendRequestLocked(GatewayRequests.subscribe(it).copy(automaticRefresh = true)) }
+        } else if ((frame.sessionId ?: correlation.sessionId) in deletedSessionIds) {
+            // lane 已经消费回执；仍须把终态交给门面释放发送 token，不能静默吞掉。
+            responseRequest?.let {
+                rejectLocked(it.requestType, "session-deleted", correlation.sessionId, it.correlationId,
+                    serverResponse = true, automaticRefresh = it.automaticRefresh)
+            }
+            return
+        }
         if (frame.kind == "error") {
             rejectLocked(
                 frame.requestType ?: "gateway",
@@ -1201,9 +1276,10 @@ class GatewayRuntime(
         }
         val safeFrame = when (frame.kind) {
             "paired" -> frame.copy(token = null)
+            "sessions" -> frame.copy(deletedSessionIds = confirmedDeleted.filter { it in deletedSessionIds })
             else -> frame
         }
-        val rawWasCleaned = frame.kind == "paired"
+        val rawWasCleaned = frame.kind == "paired" || frame.kind == "sessions"
         val safeRaw = if (rawWasCleaned) wireJson.encodeToString(safeFrame) else transportFrame.text
         val estimatedBytes = if (rawWasCleaned) {
             safeRaw.length.toLong() * 2 + FRAME_OBJECT_OVERHEAD_BYTES

@@ -1,6 +1,9 @@
 package com.finecat.pimobile.android.ui.finecat
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
@@ -25,6 +28,28 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class FineCatAppDeviceTest {
+
+    @Test fun deletedSessionKeepsCachedConversationAndDraftWithDisabledSend() {
+        lateinit var holder: AndroidSharedStateHolder
+        rule.activityRule.scenario.onActivity { activity ->
+            holder = androidx.lifecycle.ViewModelProvider(activity)[AndroidGatewayViewModel::class.java].stateHolder
+            holder.debugUseFineCatUi = true
+        }
+        runBlocking { holder.loadFixtureAndAwaitForTest() }
+        rule.runOnIdle {
+            holder.messageDraft = "synthetic draft"
+            holder.wirePayload = """{"kind":"sessions","items":[],"deletedSessionIds":["android-demo"]}"""
+            holder.submitWirePayload()
+        }
+        rule.onNodeWithTag("finecat.sessionDeleted").assertIsDisplayed()
+        rule.onNodeWithContentDescription("发送").assertIsNotEnabled()
+        rule.runOnIdle {
+            org.junit.Assert.assertEquals("synthetic draft", holder.messageDraft)
+            org.junit.Assert.assertEquals("android-demo", holder.snapshot.selectedSessionId)
+            org.junit.Assert.assertTrue(holder.snapshot.conversation.isNotEmpty())
+            org.junit.Assert.assertTrue(holder.snapshot.sessions.isEmpty())
+        }
+    }
 
     @get:Rule
     val rule = createAndroidComposeRule<MainActivity>()

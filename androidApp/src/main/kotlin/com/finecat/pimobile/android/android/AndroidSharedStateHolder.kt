@@ -203,7 +203,7 @@ class AndroidSharedStateHolder(
     internal val supportsWorktrees: Boolean get() = "worktree-v1" in gatewayState.capabilities &&
             (gatewayState.hostMode != "bridge" || "bridge-workspace-v1" in gatewayState.capabilities)
     internal val currentSessionDirectory: String? get() = snapshot.selectedSessionId?.let { id ->
-        continuedSessionCwds[id] ?: snapshot.sessions.firstOrNull { it.id == id }?.cwd
+        continuedSessionCwds[id] ?: snapshot.sessions.firstOrNull { it.id == id }?.cwd ?: snapshot.deletedSessions[id]?.cwd
     }
 
     var selectedDirectoryPath: String? by mutableStateOf(null)
@@ -1160,7 +1160,7 @@ class AndroidSharedStateHolder(
             appGraph.gatewayScope.launch {
                 projectionActor.selectSession(sessionId, afterPublish)
                 if (trajectoryIsActive) publishTrajectory()
-                if (gatewayState.connection == GatewayConnectionState.CONNECTED) {
+                if (gatewayState.connection == GatewayConnectionState.CONNECTED && sessionId !in snapshot.deletedSessions) {
                     appGraph.gatewayRuntime.subscribe(sessionId)
                     // 会话级清单：切会话即重拉（归属键防串）。
                     slashCommands = null
@@ -3526,6 +3526,7 @@ class AndroidSharedStateHolder(
     }
 
     fun sendMessage() {
+        if (selectedSessionDeleted) { showTransientNotice("会话已在电脑端删除"); return }
         val appGraph = graph ?: return
         if (selectedSessionRecalling()) {
             showTransientNotice("正在撤回，请稍候")
@@ -3582,6 +3583,11 @@ class AndroidSharedStateHolder(
         onSettled: (sent: Boolean) -> Unit = {}
     ) {
         val appGraph = graph ?: return
+        if (submission.sessionId in snapshot.deletedSessions) {
+            showTransientNotice("会话已在电脑端删除")
+            onSettled(false)
+            return
+        }
         // 这里是一切实发（新发/吸附派发）的唯一出口：记时刻给停止键防误触用。
         markPromptSent()
         // 本地预览与实发 id 在 Main 同步建立：先于 gatewayScope 排队、附件缓存写盘
@@ -4602,13 +4608,17 @@ class AndroidSharedStateHolder(
             (worktreeUi.phase in setOf(WorktreePhase.CREATING, WorktreePhase.SWITCHING) ||
                 (worktreeUi.phase == WorktreePhase.CONFIRM && worktreeUi.open))
 
+    val selectedSessionDeleted: Boolean
+        get() = (pendingSelectedSessionId ?: snapshot.selectedSessionId) in snapshot.deletedSessions
+
     val canSend: Boolean
         get() = gatewayState.connection == GatewayConnectionState.CONNECTED &&
-            !worktreeBlocksComposer &&
+            !worktreeBlocksComposer && !selectedSessionDeleted &&
             !selectedSessionStopping() && !selectedSessionRecalling() &&
             (messageDraft.isNotBlank() || preparedImages.isNotEmpty()) && !sendInFlight && dispatchInFlight == null && pendingComposerSends.isEmpty()
 
     fun sendComposerDraft(requireDirectory: Boolean = false, requireConnection: Boolean = false) {
+        if (selectedSessionDeleted) { showTransientNotice("会话已在电脑端删除"); return }
         if (worktreeBlocksComposer) {
             showTransientNotice("工作区切换未确认，草稿已保留")
             return

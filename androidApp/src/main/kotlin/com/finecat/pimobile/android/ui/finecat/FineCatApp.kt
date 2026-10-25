@@ -273,6 +273,7 @@ private fun FineCatAppContent(
     FineCatTheme(darkTheme = isFineCatDark(stateHolder.appearanceMode)) {
         val snapshot = stateHolder.snapshot
         val selectedSession = snapshot.sessions.firstOrNull { it.id == snapshot.selectedSessionId }
+            ?: snapshot.deletedSessions[snapshot.selectedSessionId]
         val sessionState = snapshot.selectedSessionId?.let { snapshot.sessionStates[it] }
         val isStreaming = sessionState?.isStreaming == true
         val connected = stateHolder.gatewayState.connection == GatewayConnectionState.CONNECTED
@@ -848,7 +849,11 @@ private fun FineCatAppContent(
                         }
                     },
                 )
-                if (sessionState?.isCompacting == true) {
+                if (stateHolder.selectedSessionDeleted) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).testTag("finecat.sessionDeleted")) {
+                        FcStatusTag(text = "会话已在电脑端删除", style = FcTagStyle.Wait)
+                    }
+                } else if (sessionState?.isCompacting == true) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1235,6 +1240,7 @@ private fun FineCatAppContent(
                     ),
                     homeStyle = showHome,
                     sendReady = showHome || connected,
+                    sendEnabled = !stateHolder.selectedSessionDeleted,
                     showDirectory = true,
                     directory = displayedCwd,
                     directoryBranch = stateHolder.worktreeLocation?.takeIf { stateHolder.supportsWorktrees && it.cwd == displayedCwd && it.repoRoot != null }?.let { location ->
