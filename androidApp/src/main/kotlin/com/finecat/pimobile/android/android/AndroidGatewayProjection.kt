@@ -85,6 +85,9 @@ internal class AndroidGatewayProjection(
     // entryId→seq 索引已删除：只写无人读（全仓零引用），会话清理漏删即线性增长。
     // 如需该索引，重建时必须同步进 clearSessionBuffers。
     private val conversationItems = mutableMapOf<String, List<ConversationItem>>()
+    /** 最新页重拉会先清缓冲；宿主删除随后才被确认时仍能保留用户刚看过的正文。 */
+    private val historyReloadBackups = mutableMapOf<String, List<ConversationItem>>()
+    private val restoringDeletedSessions = mutableSetOf<String>()
     private val conversationLastSequences = mutableMapOf<String, Int>()
     /** 桥接实例代际：instanceId+epoch。变化时先丢弃旧代际实时投影，等新快照重建。 */
     private val bridgeGenerations = mutableMapOf<String, String>()
@@ -116,25 +119,28 @@ internal class AndroidGatewayProjection(
     private val conversationSubscription = conversationStore.subscribe(::acceptConversationMviEvent)
 
     fun snapshot(): SharedMobileSnapshot {
+        val deleted = controlSnapshot.selectedSessionId in controlSnapshot.deletedSessions
         return controlSnapshot.copy(
             sessions = controlSnapshot.sessions.map { session ->
                 session.copy(hasFailure = !session.isRunning && session.id in failedSessionIds)
             },
-            conversation = controlSnapshot.selectedSessionId?.let(::conversationFor).orEmpty(),
-            selectedHistoryHasMore = controlSnapshot.selectedSessionId?.let(historyHasMore::get) == true,
+            conversation = controlSnapshot.selectedSessionId?.let {
+                if (deleted || it in restoringDeletedSessions) historyReloadBackups[it].orEmpty() else conversationFor(it)
+            }.orEmpty(),
+            selectedHistoryHasMore = !deleted && controlSnapshot.selectedSessionId?.let(historyHasMore::get) == true,
             selectedHistoryEarliestSequence = controlSnapshot.selectedSessionId
                 ?.let(historyEvents::get)?.firstOrNull()?.seq,
             selectedHistoryNextCursor = controlSnapshot.selectedSessionId
                 ?.let(historySessionStates::get)?.nextCursor,
-            selectedHistoryIsLoading = controlSnapshot.selectedSessionId
+            selectedHistoryIsLoading = !deleted && controlSnapshot.selectedSessionId
                 ?.let(historySessionStates::get)?.isLoading == true,
-            selectedHistoryIsLoadingOlder = controlSnapshot.selectedSessionId
+            selectedHistoryIsLoadingOlder = !deleted && controlSnapshot.selectedSessionId
                 ?.let(historySessionStates::get)?.isLoadingOlder == true,
             selectedHistoryLoadedEventCount = controlSnapshot.selectedSessionId
                 ?.let(historySessionStates::get)?.progress?.loaded ?: 0,
             selectedHistoryTotalEventCount = controlSnapshot.selectedSessionId
                 ?.let(historySessionStates::get)?.progress?.total,
-            selectedHistoryError = controlSnapshot.selectedSessionId?.let(historyFailures::get),
+            selectedHistoryError = if (deleted) null else controlSnapshot.selectedSessionId?.let(historyFailures::get),
             lastFrameKind = lastFrameKind ?: controlSnapshot.lastFrameKind,
             lastError = lastError ?: controlSnapshot.lastError
         )
@@ -186,6 +192,7 @@ internal class AndroidGatewayProjection(
         preserveLive: Boolean = false,
         preserveFailure: Boolean = false
     ) {
+        if (sessionId in controlSnapshot.deletedSessions) return
         if (!older) {
             if (historySessionStates[sessionId]?.isLoading == true) {
                 pendingLatestReloads[sessionId] = PendingLatestReload(resetLeaf, preserveLive, preserveFailure)
@@ -195,6 +202,7 @@ internal class AndroidGatewayProjection(
         }
         val local = historyEvents[sessionId].orEmpty()
         if (!older && !preserveLive) {
+            conversationFor(sessionId).takeIf { it.isNotEmpty() }?.let { historyReloadBackups[sessionId] = it }
             // 全新加载 = pi 语义下的重新同步：先清空，避免合成 seq 与旧缓冲重复。
             clearSessionBuffers(sessionId, preserveFailure)
         }
@@ -257,6 +265,8 @@ internal class AndroidGatewayProjection(
         normalizedEvents: List<SessionEvent> = emptyList()
     ): SharedMobileSnapshot {
         if (frame.kind == "paired") return reset()
+        if (frame.kind != "sessions" && (frame.sessionId ?: correlatedSessionId) in controlSnapshot.deletedSessions) return snapshot()
+        val previouslyDeleted = controlSnapshot.deletedSessions.keys
         lastFrameKind = frame.kind
         lastError = null
         when (frame.kind) {
@@ -314,6 +324,25 @@ internal class AndroidGatewayProjection(
             }
             else -> controlSnapshot = mobileStore.acceptFrame(rawJson)
         }
+        if (frame.kind == "sessions") {
+            (previouslyDeleted - controlSnapshot.deletedSessions.keys).forEach { id ->
+                if (id == controlSnapshot.selectedSessionId) {
+                    restoringDeletedSessions += id
+                    startHistory(id, older = false, preserveLive = true)
+                } else historyReloadBackups.remove(id)
+            }
+            controlSnapshot.deletedSessions.keys.forEach { id ->
+                if (id !in previouslyDeleted) {
+                    conversationFor(id).takeIf { it.isNotEmpty() }?.let { historyReloadBackups[id] = it }
+                    historyStore.cancelled(id)
+                }
+                // 取消加载态，不清正文缓冲；后续迟到的历史/事件也不能复活删除项。
+                historySessionStates.remove(id)
+                historyFailures.remove(id)
+                pendingLatestReloads.remove(id)
+                if (historyPendingSessionId == id) historyPendingSessionId = null
+            }
+        }
         return snapshot()
     }
 
@@ -338,6 +367,8 @@ internal class AndroidGatewayProjection(
         pendingLatestReloads.clear()
         historyPendingSessionId = null
         conversationItems.clear()
+        historyReloadBackups.clear()
+        restoringDeletedSessions.clear()
         conversationLastSequences.clear()
         bridgeGenerations.clear()
         bridgeLastSequences.clear()
@@ -481,6 +512,8 @@ internal class AndroidGatewayProjection(
         val partial = bridgeSnapshotPartials[sessionId]
         if (partial != null) seedBridgeStream(sessionId, partial)
         else bridgeSeededStreamKeys.remove(sessionId)
+        historyReloadBackups.remove(sessionId)
+        restoringDeletedSessions.remove(sessionId)
         flushPendingLatestReload(sessionId)
     }
 

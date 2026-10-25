@@ -49,6 +49,126 @@ import kotlin.test.assertTrue
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GatewayRuntimeIntegrationTest {
+    @Test fun deletedQueuedReadDoesNotRecycleTheConnectionOrCancelAnotherMessage() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val events = mutableListOf<GatewayRuntimeEvent>()
+        backgroundScope.launch { runtime.events.collect { events += it } }
+        connectHello(transport, runtime, """{"kind":"hello","capabilities":["sessions","session-presence-v1"]}""")
+        transport.receive("""{"kind":"sessions","items":[{"id":"gone","path":"/isolated/gone.jsonl"}]}""")
+        runCurrent()
+        runtime.requestState("kept")
+        runtime.requestState("gone")
+        assertTrue(runtime.sendMessage("still running", emptyList(), "kept"))
+        val closeCount = transport.closeCount
+        runtime.requestSessions()
+        transport.receive("""{"kind":"sessions","items":[],"deletedSessionIds":["gone"]}""")
+        runCurrent()
+        transport.receive("""{"kind":"state","sessionId":"kept","isStreaming":true,"isCompacting":false}""")
+        runCurrent()
+        assertEquals(closeCount, transport.closeCount)
+        assertEquals(GatewayConnectionState.CONNECTED, runtime.state.value.connection)
+        assertEquals(1, transport.sentTypes.count { it == "state" })
+        assertTrue(runtime.state.value.shouldKeepAliveInBackground)
+        assertTrue(events.none { it is GatewayRuntimeEvent.RequestCancelled && it.requestType == "message" })
+    }
+
+    @Test fun terminalReceiptAfterDeletionStillSettlesTheInFlightMessage() = runTest {
+        for (kind in listOf("sent", "error")) {
+            val transport = FakeTransport()
+            val runtime = newRuntime(transport)
+            val events = mutableListOf<GatewayRuntimeEvent>()
+            backgroundScope.launch { runtime.events.collect { events += it } }
+            connectHello(transport, runtime, """{"kind":"hello","capabilities":["sessions","session-presence-v1"]}""")
+            transport.receive("""{"kind":"sessions","items":[{"id":"gone","path":"/isolated/gone.jsonl"}]}""")
+            runCurrent()
+            assertTrue(runtime.sendMessage("recoverable", emptyList(), "gone"))
+            runtime.requestSessions()
+            transport.receive("""{"kind":"sessions","items":[],"deletedSessionIds":["gone"]}""")
+            runCurrent()
+            transport.receive(if (kind == "sent") """{"kind":"sent","sessionId":"gone","disposition":"started"}"""
+                else """{"kind":"error","requestType":"message","sessionId":"gone","code":"session-not-found"}""")
+            runCurrent()
+            val rejected = events.filterIsInstance<GatewayRuntimeEvent.RequestRejected>()
+                .single { it.requestType == "message" && it.reason == "session-deleted" }
+            assertTrue(rejected.serverResponse)
+            assertEquals("gone", rejected.targetSessionId)
+            assertTrue(runtime.sendMessage("next session remains usable", emptyList(), "kept"))
+        }
+    }
+
+    @Test fun presenceChecksRotateLargeListsWithoutPermanentlyLosingOldSessions() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val hello = """{"kind":"hello","capabilities":["sessions","session-presence-v1"]}"""
+        connectHello(transport, runtime, hello)
+        val items = (0..2048).joinToString(",") { """{"id":"s$it","path":"/isolated/s$it.jsonl"}""" }
+        transport.receive("""{"kind":"sessions","items":[$items]}""")
+        runCurrent()
+        fun knownIds(): Set<String> {
+            val values = wireJson.parseToJsonElement(transport.sentPayloads.last()).jsonObject.getValue("knownSessions") as kotlinx.serialization.json.JsonArray
+            return values.map { it.jsonObject.getValue("id").jsonPrimitive.content }.toSet()
+        }
+        runtime.requestSessions()
+        val first = knownIds()
+        assertEquals(2048, first.size)
+        transport.receive("""{"kind":"sessions","items":[]}""")
+        runCurrent()
+        runtime.requestSessions()
+        val second = knownIds()
+        assertEquals((0..2048).map { "s$it" }.toSet(), first + second)
+        transport.receive("""{"kind":"sessions","items":[],"deletedSessionIds":["s0"]}""")
+        runCurrent()
+        runtime.pairWithCode("wss://another.example/ws/mobile", "000000")
+        runCurrent()
+        transport.opened()
+        transport.receive(hello)
+        runCurrent()
+        assertFalse(transport.sentPayloads.last().contains("knownSessions"))
+        assertTrue(runtime.sendMessage("new gateway", emptyList(), "s0"))
+    }
+
+    @Test fun sessionDeletionRequiresCapabilityAndKnownPathAndBlocksWritesUntilRediscovered() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val frames = mutableListOf<GatewayRuntimeEvent.Frame>()
+        backgroundScope.launch { runtime.events.collect { if (it is GatewayRuntimeEvent.Frame) frames += it } }
+        connectHello(transport, runtime, """{"kind":"hello","capabilities":["sessions","session-presence-v1"]}""")
+        transport.receive("""{"kind":"sessions","items":[{"id":"gone","path":"/isolated/sessions/gone.jsonl"}]}""")
+        runCurrent()
+        runtime.subscribe("gone")
+        transport.receive("""{"kind":"subscribed","sessionId":"gone"}""")
+        runCurrent()
+        runtime.requestSessions()
+        assertTrue(transport.sentPayloads.last().contains("knownSessions"))
+        transport.receive("""{"kind":"sessions","items":[],"deletedSessionIds":["gone","not-known"]}""")
+        runCurrent()
+        assertEquals(listOf("gone"), frames.last().frame.deletedSessionIds)
+        assertFalse(runtime.sendMessage("keep this draft", emptyList(), "gone"))
+        runtime.requestSessions()
+        transport.receive("""{"kind":"sessions","items":[{"id":"gone","path":"/isolated/sessions/gone.jsonl"}]}""")
+        runCurrent()
+        assertTrue(runtime.sendMessage("restored", emptyList(), "gone"))
+        assertEquals(2, transport.sentTypes.count { it == "subscribe" })
+    }
+
+    @Test fun oldGatewayCannotConfirmDeletionAndForegroundRefreshesSessionPresence() = runTest {
+        val transport = FakeTransport()
+        val runtime = newRuntime(transport)
+        val frames = mutableListOf<GatewayRuntimeEvent.Frame>()
+        backgroundScope.launch { runtime.events.collect { if (it is GatewayRuntimeEvent.Frame) frames += it } }
+        connectHello(transport, runtime)
+        transport.receive("""{"kind":"sessions","items":[{"id":"s","path":"/isolated/s.jsonl"}],"deletedSessionIds":["s"]}""")
+        runCurrent()
+        assertEquals(emptyList<String>(), frames.last().frame.deletedSessionIds)
+        assertTrue(runtime.sendMessage("run", emptyList(), "s"))
+        runtime.applicationDidEnterBackground()
+        runtime.applicationDidBecomeActive()
+        runCurrent()
+        assertEquals(2, transport.sentTypes.count { it == "sessions" })
+        assertFalse(transport.sentPayloads.last { it.contains("\"type\":\"sessions\"") }.contains("knownSessions"))
+    }
+
     @Test
     fun automaticHostModeAndResubscribeFailuresStayAutomatic() = runTest {
         val transport = FakeTransport()

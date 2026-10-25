@@ -40,6 +40,7 @@ import kotlinx.serialization.json.jsonObject
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -66,6 +67,37 @@ import org.junit.Test
  * 不触 ~/.pi、真实模型与非回环网络。仓库缺失或无 node 时跳过。
  */
 class GatewayConformanceTest {
+    @Test fun sessionPresenceConfirmsRealFileRemovalAcrossTheProductionWire() = runBlocking {
+        val fixture = startFixtureProcess()
+        val runtime = buildRuntime()
+        val frames = CopyOnWriteArrayList<GatewayRuntimeEvent.Frame>()
+        val projection = connectProjection(runtime, frames)
+        try {
+            runtime.applicationDidBecomeActive()
+            runtime.pair(fixture.info.pairingText)
+            awaitState(runtime) { it.connection == GatewayConnectionState.CONNECTED }
+            assertTrue("session-presence-v1" in runtime.state.value.capabilities)
+            val first = awaitFrame(frames) { it.frame.kind == "sessions" && it.frame.items?.isNotEmpty() == true }
+            val item = first.frame.items!!.map { it.toJsonElement().jsonObject }
+                .single { it["id"]?.jsonPrimitive?.content == fixture.info.fixtureSessionId }
+            val path = File(item.getValue("path").jsonPrimitive.content)
+            // 文件由此 fixture 进程创建；没打开 SDK 句柄，不触碰任何用户会话。
+            assertTrue(path.canonicalPath.startsWith(File(System.getProperty("java.io.tmpdir")).canonicalPath + "/"))
+            assertTrue(path.delete())
+            assertTrue(runtime.requestSessions())
+            val removed = awaitFrame(frames) { it.frame.deletedSessionIds?.contains(fixture.info.fixtureSessionId) == true }
+            assertTrue(removed.frame.items.orEmpty().none { it.toJsonElement().jsonObject["id"]?.jsonPrimitive?.content == fixture.info.fixtureSessionId })
+            withTimeout(5_000) { while (projection.snapshot().sessions.any { it.id == fixture.info.fixtureSessionId }) delay(25) }
+            assertFalse(runtime.sendMessage("must not recreate", emptyList(), fixture.info.fixtureSessionId))
+            assertFalse(path.exists())
+        } finally {
+            runtime.disconnect()
+            projection.close()
+            fixture.process.destroy()
+            fixture.process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
 
     @Test
     fun nativeBranchResponseUsesTheAndroidQueueWireShape() {
