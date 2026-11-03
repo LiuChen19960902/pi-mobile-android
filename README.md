@@ -191,3 +191,5 @@ KMP 架构与部分移动端实现参考了 [dsh-mobile](https://github.com/Clar
 首页签名「探索未至之境」引用自 [DeepSeek](https://www.deepseek.com/)。我很钦佩 DeepSeek，也喜欢这句话所表达的求索精神，因此把它用作个人签名，向他们致意。Pi Mobile 基于 pi 构建；签名表达的是作者个人的欣赏与认同，不代表 DeepSeek 官方参与或认可本项目。
 
 本项目是社区客户端，与 pi 官方无关。
+
+> 本行由 dsh-superagent 端到端验证添加，可随时删除。
