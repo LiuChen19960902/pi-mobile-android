@@ -152,6 +152,7 @@ import com.finecat.pimobile.android.ui.finecat.conversation.FcStep
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatSteps
 import com.finecat.pimobile.android.ui.finecat.conversation.mergeFineCatProcessEntries
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatWorkingGroupId
+import com.finecat.pimobile.android.ui.finecat.conversation.fineCatWorkingText
 import com.finecat.pimobile.android.ui.finecat.conversation.FcStepsBlock
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatEntryHasVisibleBody
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatEntryGap
@@ -533,7 +534,11 @@ private fun FineCatAppContent(
         val runningForFooter = isStreaming ||
             sessionState?.isCompacting == true ||
             sessionState?.queuedMessages?.isEmpty == false
-        val showWorkingRow = !showHome && runningForFooter
+        // 断线时运行态是陈旧快照；继续显示 Working 会把“未知”伪装成“仍在跑”。
+        val workingText = if (showHome) null else fineCatWorkingText(connected, runningForFooter)
+        val showWorkingRow = workingText != null
+        // 输入区与尾部同口径：断线时不把陈旧流式/压缩态呈现为可停止的运行中。
+        val composerRunning = connected && (isStreaming || sessionState?.isCompacting == true)
         // 有消息可承载时，「加载更早消息…」嵌在最旧那条（列表首项）的 keyed item 内部，
         // 列表首项因此始终是稳定的消息 key：迟到 older 应答撤掉提示时不再连带移除首个
         // item（第9轮观测的锚点位移）。只有完全没有消息时它才作为独立 item 兜底。
@@ -853,7 +858,7 @@ private fun FineCatAppContent(
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).testTag("finecat.sessionDeleted")) {
                         FcStatusTag(text = "会话已在电脑端删除", style = FcTagStyle.Wait)
                     }
-                } else if (sessionState?.isCompacting == true) {
+                } else if (connected && sessionState?.isCompacting == true) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1020,10 +1025,10 @@ private fun FineCatAppContent(
                                 }
                             }
                         }
-                        if (showWorkingRow) {
+                        if (workingText != null) {
                             item(key = "working") {
                                 FcWorking(
-                                    text = "Working",
+                                    text = workingText,
                                     modifier = Modifier.testTag("finecat.working"),
                                 )
                             }
@@ -1259,10 +1264,10 @@ private fun FineCatAppContent(
                         }
                     },
                     onTextChange = { stateHolder.messageDraft = it },
-                    running = isStreaming || sessionState?.isCompacting == true,
+                    running = composerRunning,
                     // 流式中带草稿点发送 = 吸附待派发（门面 capturePendingDispatch）；
                     // 压缩中 pi 会拒 prompt，保持方点停止语义。
-                    dispatchWhileRunning = isStreaming && sessionState?.isCompacting != true,
+                    dispatchWhileRunning = connected && isStreaming && sessionState.isCompacting != true,
                     expanded = composerFocused || stateHolder.messageDraft.isNotEmpty(),
                     withShots = stateHolder.photosTrayOpen,
                     modelName = modelDisplayName(effectiveModel) ?: "选择模型",

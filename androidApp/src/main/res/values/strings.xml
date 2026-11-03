@@ -6,4 +6,10 @@
     <string name="gateway_active_notification_title">Pi Agent 正在运行</string>
     <string name="gateway_active_notification_text">保持 Gateway 连接，直到当前回合完成</string>
     <string name="gateway_disconnect_action">断开</string>
+    <string name="session_turn_notification_channel">会话完成</string>
+    <string name="session_turn_notification_channel_description">App 在后台时，Agent 一轮结束的提醒</string>
+    <string name="session_turn_notification_completed">Agent 已完成本轮</string>
+    <string name="session_turn_notification_aborted">本轮已停止</string>
+    <string name="session_turn_notification_public_title">Pi Mobile</string>
+    <string name="session_turn_notification_public_text">会话已完成</string>
 </resources>

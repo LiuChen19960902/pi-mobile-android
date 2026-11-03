@@ -12,6 +12,7 @@ import com.finecat.pimobile.android.platform.AndroidNetworkMonitor
 import com.finecat.pimobile.android.platform.AndroidRecentPhotos
 import com.finecat.pimobile.android.platform.OkHttpGatewayTransport
 import com.finecat.pimobile.android.platform.RecentPhotosProvider
+import com.finecat.pimobile.android.platform.SessionTurnNotifier
 import com.finecat.pimobile.shared.gateway.GatewayRuntime
 import com.finecat.pimobile.shared.protocol.GatewayFrame
 import com.finecat.pimobile.shared.protocol.GatewayWireDecoder
@@ -65,6 +66,14 @@ class AndroidAppGraph(
         requestTimeoutMilliseconds = requestTimeoutOverride ?: 30_000L,
         frameDecoder = frameDecoderOverride ?: GatewayWireDecoder::decode
     )
+    /** 进程前台状态由 PiAndroidApplication 的 onStart/onStop 即时更新；通知只在后台发。 */
+    @Volatile
+    var isAppInForeground: Boolean = true
+
+    val sessionTurnNotifier = SessionTurnNotifier(application) {
+        isAppInForeground
+    }
+
     val stateHolder: AndroidSharedStateHolder by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         AndroidSharedStateHolder(graph = this)
     }
