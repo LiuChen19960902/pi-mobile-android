@@ -110,6 +110,13 @@ internal fun fineCatWorkingGroupId(entries: List<ConversationDisplayEntry>, isSt
         fineCatEntryHasVisibleBody(it) || (it is ConversationDisplayEntry.Message && it.item.isError)
     } as? ConversationDisplayEntry.Process)?.id else null
 
+/** 对话尾部运行提示。断线时本地运行态是陈旧快照，不能继续伪装成 Working。 */
+internal fun fineCatWorkingText(connected: Boolean, running: Boolean): String? = when {
+    !running -> null
+    connected -> "Working"
+    else -> "连接中断，状态待恢复"
+}
+
 /** 在回合分组前合并没有可见正文隔开的步骤，保留空消息的定位和时间戳。 */
 internal fun mergeFineCatProcessEntries(entries: List<ConversationDisplayEntry>): List<ConversationDisplayEntry> {
     val result = mutableListOf<ConversationDisplayEntry>()

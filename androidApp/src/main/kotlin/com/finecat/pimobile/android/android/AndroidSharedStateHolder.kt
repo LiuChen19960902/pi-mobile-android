@@ -24,6 +24,7 @@ import com.finecat.pimobile.android.platform.AndroidImagePreprocessor
 import com.finecat.pimobile.android.platform.AndroidPreparedImage
 import com.finecat.pimobile.android.platform.BoundedLruCache
 import com.finecat.pimobile.android.platform.RecentPhotosProvider
+import com.finecat.pimobile.android.platform.TurnCompletionNoticeFactory
 import com.finecat.pimobile.android.ui.finecat.ProviderEditorDraft
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -1136,6 +1137,7 @@ class AndroidSharedStateHolder(
     }
 
     fun selectSession(sessionId: String) {
+        graph?.sessionTurnNotifier?.cancel(sessionId)
         prepareComposerForNavigation(sessionId)
         if (sessionId != snapshot.selectedSessionId) clearTreeActions()
         sessionControlsRefresh.reset()
@@ -4820,6 +4822,13 @@ class AndroidSharedStateHolder(
         // 预览移除”的双气泡闪现；不能在 gateway collector 线程读写非线程安全的 Tracker。
         if (frame.kind == "event") {
             handleOutgoingEcho(correlatedSessionId, normalizedEvents)
+            // 只认 agent_settled 归一出的 turn/end；通知出口自己判断前后台，
+            // 这里不依赖当前选中会话（后台时也可能在看别的会话或已锁屏）。
+            appGraph?.let { graph ->
+                TurnCompletionNoticeFactory.from(frame, normalizedEvents, snapshot.sessions)?.let {
+                    graph.sessionTurnNotifier.notify(it)
+                }
+            }
             // 回合落定后重拉首页 history：run 结束时 pi 的 agent.prompt 已返回，
             // 本轮 message_end 的 appendMessage 均已同步落盘（agent_settled 最后
             // 发出）。强退重开的手机此前 history 可能取到 user 落盘前的旧快照

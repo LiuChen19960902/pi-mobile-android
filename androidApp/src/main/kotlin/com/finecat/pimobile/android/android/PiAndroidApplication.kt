@@ -58,11 +58,14 @@ class PiAndroidApplication : Application(), DefaultLifecycleObserver {
     }
 
     override fun onStart(owner: LifecycleOwner) {
+        graph.isAppInForeground = true
         graph.diagnostics.lifecycle(GatewayLifecycleEvent.FOREGROUND)
         graph.gatewayRuntime.applicationDidBecomeActive()
     }
 
     override fun onStop(owner: LifecycleOwner) {
+        // 先落前台判定：turn/end 可能紧接着 onStop 到达，不能等异步 collector 再识别后台。
+        graph.isAppInForeground = false
         graph.diagnostics.lifecycle(GatewayLifecycleEvent.BACKGROUND)
         graph.gatewayScope.launch { graph.gatewayRuntime.applicationDidEnterBackground() }
     }
