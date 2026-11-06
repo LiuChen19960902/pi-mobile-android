@@ -149,13 +149,13 @@ class FineCatTimelineRegressionDeviceTest {
             waitUntil { stateHolder.snapshot.conversation.any { it.text == "旧文本消息" } }
             waitUntil { !stateHolder.snapshot.selectedHistoryIsLoading }
 
-            // 触发更早分页且不回应 → 列表顶部出现「加载更早消息…」行
+            // 触发更早分页且不回应 → 列表顶部出现加载点阵浮层
             onMain { stateHolder.loadOlderHistory() }
             waitUntil { stateHolder.snapshot.selectedHistoryIsLoadingOlder }
             waitUntil { transport.sentTypes.count { it == "history" } >= 2 }
         }
         compose.waitUntil(5_000) {
-            compose.onAllNodesWithText("加载更早消息…").fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithTag("finecat.loadingOlder").fetchSemanticsNodes().isNotEmpty()
         }
 
         // 带图消息经真实事件帧到达：帧顶层 entryId 即 §4.22 取图寻址身份
@@ -170,7 +170,7 @@ class FineCatTimelineRegressionDeviceTest {
 
         val request = transport.payloadsOfType("attachment").last()
         assertEquals(SESSION, request.getValue("sessionId").jsonPrimitive.content)
-        // loading 行（列表 index 0）在场也不能把取图寻址错映射到别条
+        // 加载点阵在场也不能把取图寻址错映射到别条
         assertEquals(ENTRY_ID, request.getValue("entryId").jsonPrimitive.content)
         assertEquals(0, request.getValue("imageIndex").jsonPrimitive.int)
 

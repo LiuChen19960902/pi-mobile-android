@@ -154,6 +154,43 @@ internal fun mergeFineCatProcessEntries(entries: List<ConversationDisplayEntry>)
     return result
 }
 
+/**
+ * 展示条目最前面那段「空正文助手消息 + 步骤组」的长度，含步骤组才算，否则为 0。
+ * 条目分页（桥接会话、单轮超限回退、旧网关）可能把页切在操作组中间，这一段的组头
+ * 还在更旧的页里，现在显示只会得到残缺的「N 个操作」，更旧页落地后又只变数字。
+ * 步骤组之后紧跟的空助手消息同属这一段（一并隐藏无可见差异）；带错误标记的空助手消息
+ * 会中断扫描，其后的组照常显示。
+ */
+internal fun fineCatLeadingProcessRunLength(entries: List<ConversationDisplayEntry>): Int {
+    var end = 0
+    var hasProcess = false
+    for (entry in entries) {
+        val emptyAssistant = entry is ConversationDisplayEntry.Message &&
+            entry.item.kind == ConversationItemKind.ASSISTANT &&
+            entry.item.text.isBlank() && entry.item.images.isEmpty() && !entry.item.isError
+        when {
+            entry is ConversationDisplayEntry.Process -> { hasProcess = true; end += 1 }
+            emptyAssistant -> end += 1
+            else -> break
+        }
+    }
+    return if (hasProcess) end else 0
+}
+
+/**
+ * 页顶缺头的操作组是否先隐藏等待补全。拉取失败、没有游标、已连续拉满 [maxPages] 页、
+ * 当前这一次等待已停滞（[stalled]）时不再隐藏，已加载的内容照常显示，不会因为补全失败
+ * 或请求丢失而消失。[stalled] 只针对当前页顶，页顶变化（新页落地）后由调用方清除。
+ */
+internal fun fineCatHoldsLeadingGroup(
+    runLength: Int,
+    hasCursor: Boolean,
+    hasError: Boolean,
+    pagesFetched: Int,
+    maxPages: Int,
+    stalled: Boolean = false,
+): Boolean = runLength > 0 && hasCursor && !hasError && !stalled && pagesFetched < maxPages
+
 /** 保留空正文的原条目/key，但不让它消耗消息间隔。 */
 internal fun fineCatEntryHasVisibleBody(entry: ConversationDisplayEntry): Boolean =
     entry !is ConversationDisplayEntry.Message ||

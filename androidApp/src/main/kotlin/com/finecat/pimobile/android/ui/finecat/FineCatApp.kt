@@ -62,7 +62,11 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.withFrameMillis
+import androidx.compose.ui.semantics.contentDescription
+import com.finecat.pimobile.android.ui.PiSpinner
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
@@ -150,6 +154,8 @@ import com.finecat.pimobile.android.ui.finecat.conversation.FcJumpButton
 import com.finecat.pimobile.android.ui.finecat.conversation.FcMarkdownText
 import com.finecat.pimobile.android.ui.finecat.conversation.FcStep
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatSteps
+import com.finecat.pimobile.android.ui.finecat.conversation.fineCatHoldsLeadingGroup
+import com.finecat.pimobile.android.ui.finecat.conversation.fineCatLeadingProcessRunLength
 import com.finecat.pimobile.android.ui.finecat.conversation.mergeFineCatProcessEntries
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatWorkingGroupId
 import com.finecat.pimobile.android.ui.finecat.conversation.fineCatWorkingText
@@ -188,6 +194,61 @@ import com.finecat.pimobile.shared.projection.ConversationItemKind as Projection
 // 但 detail 是调用前 eager 构造的实参，仍有少量 detail 字符串求值（这些调用点都在
 // 协程/回调体里，不在 composition 或 snapshotFlow 内）。
 private const val JUMP_PROBE_TAG = "FineCatJumpProbe"
+
+/** 补全被分页切断的操作组时，更早页的条目数：比常规页大，减少往返次数。 */
+private const val GROUP_COMPLETION_PAGE_LIMIT = 100
+
+/** 一次补全最多连续拉这么多页；超过后放弃隐藏，照常显示已加载的部分。 */
+private const val GROUP_COMPLETION_MAX_PAGES = 8
+
+/** 补全这么久没有任何进展（请求丢失、断线、后台挂起）就放弃隐藏，照常显示已加载的部分。 */
+private const val GROUP_COMPLETION_STALL_MS = 15_000L
+
+/** 到顶加载点阵的最短展示时长：再快的回包也驻留这么久，避免一闪而过。 */
+private const val BOUNDARY_LOADING_MIN_DWELL_MS = 1_000L
+
+/**
+ * 让 [active] 为真的区间至少展示 [minMillis]：[active] 一旦变假仍保持返回真直到满时长。
+ * 用帧时钟计时，与动画同源，真机是实时，Compose 测试里是可控的虚拟时间。
+ * [resetKey] 变化（如切会话）时丢弃驻留状态，不把上一个对象的展示带到下一个。
+ */
+@Composable
+private fun rememberMinimumDwell(active: Boolean, minMillis: Long, resetKey: Any?): Boolean {
+    var shown by remember(resetKey) { mutableStateOf(active) }
+    var shownAtMs by remember(resetKey) { mutableLongStateOf(-1L) }
+    LaunchedEffect(resetKey, active) {
+        if (active) {
+            shown = true
+            if (shownAtMs < 0) shownAtMs = withFrameMillis { it }
+            return@LaunchedEffect
+        }
+        if (!shown) return@LaunchedEffect
+        val start = if (shownAtMs >= 0) shownAtMs else withFrameMillis { it }
+        while (withFrameMillis { it } - start < minMillis) Unit
+        shown = false
+        shownAtMs = -1L
+    }
+    return active || shown
+}
+
+/** 离顶估算距离不足这么多个视口高度就预取下一页：快速滑动到尽头前，下一页已落地接住。 */
+private const val HISTORY_PREFETCH_VIEWPORTS = 2f
+
+/**
+ * 视口顶是否已进入「离已加载内容顶不足 [HISTORY_PREFETCH_VIEWPORTS] 个视口」的预取区。
+ * LazyColumn 只知道可见项高度，用其平均值估算未可见的前序项；没有可见项视为贴着边界。
+ * 平均高度封顶为半个视口：视口里只有一个超高回合（长输出、长代码块）时，不封顶会把前序
+ * 距离放大一个数量级而错过预取。封顶只会偏向早预取（多拉一页，prepend 后自然停止），
+ * 并保证离顶不超过 4 个回合时必在预取区内。
+ */
+private fun LazyListState.isInHistoryPrefetchZone(): Boolean {
+    val visible = layoutInfo.visibleItemsInfo
+    if (visible.isEmpty()) return true
+    val viewportPx = (layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset).toFloat()
+    val averageItemPx = (visible.sumOf { it.size } / visible.size.toFloat()).coerceAtMost(viewportPx * 0.5f)
+    val distancePx = firstVisibleItemIndex * averageItemPx + firstVisibleItemScrollOffset
+    return distancePx <= viewportPx * HISTORY_PREFETCH_VIEWPORTS
+}
 
 private fun probeJumpObservation(
     stage: String,
@@ -428,8 +489,51 @@ private fun FineCatAppContent(
         // 每个会话一份列表状态：切会话不沿用旧会话的滚动位置（旧 UI remember(selectedSessionId) 同口径）。
         val listState = remember(snapshot.selectedSessionId) { LazyListState() }
 
-        val displayEntries = remember(snapshot.conversation) {
+        val mergedEntries = remember(snapshot.conversation) {
             mergeFineCatProcessEntries(makeConversationDisplayEntries(snapshot.conversation))
+        }
+        // 页顶的操作组缺头（组头在更旧的页里）时先不显示，自动补拉直到组头到位，让「N 个操作」
+        // 连同它的上下文一次出现。拉取失败、没有游标、超过页数上限时不再隐藏，避免内容消失。
+        val leadingGroupRun = if (snapshot.selectedHistoryHasMore) fineCatLeadingProcessRunLength(mergedEntries) else 0
+        var groupCompletionPages by remember(snapshot.selectedSessionId) { mutableIntStateOf(0) }
+        // 最旧条目 id 随每个落地的更早页变化，作为「补全有进展」的标记。
+        val completionProgress = snapshot.conversation.firstOrNull()?.id
+        // 记下在哪个页顶上停滞过：页顶变了（新页落地）这条记录自然失效，补全重新武装。
+        var stalledAtProgress by remember(snapshot.selectedSessionId) { mutableStateOf<String?>(null) }
+        val completingLeadingGroup = fineCatHoldsLeadingGroup(
+            runLength = leadingGroupRun,
+            hasCursor = snapshot.selectedHistoryNextCursor != null,
+            hasError = snapshot.selectedHistoryError != null,
+            pagesFetched = groupCompletionPages,
+            maxPages = GROUP_COMPLETION_MAX_PAGES,
+            stalled = stalledAtProgress != null && stalledAtProgress == completionProgress,
+        )
+        val displayEntries = remember(mergedEntries, completingLeadingGroup, leadingGroupRun) {
+            if (completingLeadingGroup) mergedEntries.drop(leadingGroupRun) else mergedEntries
+        }
+        LaunchedEffect(
+            completingLeadingGroup,
+            snapshot.selectedSessionId,
+            completionProgress,
+            snapshot.selectedHistoryNextCursor,
+            snapshot.selectedHistoryIsLoading,
+            snapshot.selectedHistoryIsLoadingOlder,
+            selectedView,
+            connected,
+        ) {
+            if (!completingLeadingGroup || selectedView != 0 || !connected) return@LaunchedEffect
+            if (snapshot.selectedHistoryIsLoading || snapshot.selectedHistoryIsLoadingOlder) return@LaunchedEffect
+            if (stateHolder.loadOlderHistory(limit = GROUP_COMPLETION_PAGE_LIMIT)) groupCompletionPages += 1
+        }
+        // 兜底：补全卡住时不让缺头的组一直隐藏。只在对话页且已连接时计时，每次发出请求或有进展
+        // 都重新计时；到点只对当前页顶放弃隐藏，之后慢页落地、页顶变化会自动重新武装。
+        LaunchedEffect(completingLeadingGroup, completionProgress, groupCompletionPages, selectedView, connected) {
+            if (!completingLeadingGroup || selectedView != 0 || !connected) return@LaunchedEffect
+            delay(GROUP_COMPLETION_STALL_MS)
+            stalledAtProgress = completionProgress
+        }
+        LaunchedEffect(leadingGroupRun == 0) {
+            if (leadingGroupRun == 0) groupCompletionPages = 0
         }
         val stepsByGroup = remember(displayEntries) {
             displayEntries.filterIsInstance<ConversationDisplayEntry.Process>()
@@ -527,7 +631,7 @@ private fun FineCatAppContent(
         // LazyColumn 行集合：初始贴底与尾部跟随都要算末行下标，与 DSL 共用同一批
         // 布尔量，避免两处条件漂移。
         val historyError = snapshot.selectedHistoryError
-        val showHistoryLoadingRow = !showHome && snapshot.selectedHistoryIsLoadingOlder
+        val showHistoryLoadingRow = !showHome && (snapshot.selectedHistoryIsLoadingOlder || completingLeadingGroup)
         val showHistoryErrorRow = !showHome && historyError != null
         // 负责人真机需求（C10）：空闲时不再显示三个点及“等待你的下一步”。
         // 流式/压缩或队列未投递完时仍显示运行状态，不把排队/压缩误报为落定。
@@ -539,9 +643,9 @@ private fun FineCatAppContent(
         val showWorkingRow = workingText != null
         // 输入区与尾部同口径：断线时不把陈旧流式/压缩态呈现为可停止的运行中。
         val composerRunning = connected && (isStreaming || sessionState?.isCompacting == true)
-        // 有消息可承载时，「加载更早消息…」嵌在最旧那条（列表首项）的 keyed item 内部，
-        // 列表首项因此始终是稳定的消息 key：迟到 older 应答撤掉提示时不再连带移除首个
-        // item（第9轮观测的锚点位移）。只有完全没有消息时它才作为独立 item 兜底。
+        // 有消息时，到顶等待加载由列表外的盲文点阵浮层表达（不占布局高度，到顶才显示，
+        // 至少驻留 BOUNDARY_LOADING_MIN_DWELL_MS），不嵌进首项，出现收起都不改变首项高度
+        // 或移除首个 item。只有完全没有消息时才用独立 item 兜底（showStandaloneLoadingRow）。
         val oldestEntryId = displayEntries.firstOrNull()?.id
         val showStandaloneLoadingRow = showHistoryLoadingRow && oldestEntryId == null
         val listItemCount = if (showHome) {
@@ -618,8 +722,11 @@ private fun FineCatAppContent(
             }
         }
 
-        // Only real user scrolling requests an older page; short viewports need no
-        // automatic fill. Pulling at the top also works when ten turns fit on screen.
+        // 预取：用户手势（拖动与其后的惯性）朝更早方向滚动，且视口顶进入离顶不足两屏的预取区，
+        // 就拉下一页，让惯性一路有内容接住而不撞已加载边界。嵌套滚动只接收手势派发的位移，
+        // 程序化贴底/跳转不经过这里，不会静默自动加载。按像素而非回合数，回合高矮悬殊时提前量
+        // 才稳定。loadOlderHistory 自带 hasMore/loading/去重守卫，每帧重复调用安全；
+        // prepend 把距离推远而自然停止连预。到顶（含撞顶）同属预取区，不另设兜底分支。
         val historyScroll = remember(listState, snapshot.selectedSessionId) {
             object : NestedScrollConnection {
                 override fun onPostScroll(
@@ -627,9 +734,7 @@ private fun FineCatAppContent(
                     available: Offset,
                     source: NestedScrollSource,
                 ): Offset {
-                    // 只处理详情内部消费后真正传到列表顶部的剩余拖动。
-                    if (source == NestedScrollSource.UserInput && available.y > 0 &&
-                        !listState.canScrollBackward) {
+                    if (consumed.y + available.y > 0 && listState.isInHistoryPrefetchZone()) {
                         stateHolder.loadOlderHistory()
                     }
                     return Offset.Zero
@@ -639,8 +744,8 @@ private fun FineCatAppContent(
                     consumed: androidx.compose.ui.unit.Velocity,
                     available: androidx.compose.ui.unit.Velocity,
                 ): androidx.compose.ui.unit.Velocity {
-                    // A user fling can reach the top after the finger has lifted.
-                    if (available.y > 0 && !listState.canScrollBackward) stateHolder.loadOlderHistory()
+                    // 惯性期间的位移走 onPostScroll；这里只补抬手结束时子级没有消化的残余朝更早速度。
+                    if (available.y > 0 && listState.isInHistoryPrefetchZone()) stateHolder.loadOlderHistory()
                     return androidx.compose.ui.unit.Velocity.Zero
                 }
             }
@@ -953,21 +1058,18 @@ private fun FineCatAppContent(
                             } == true
                             val bottomGap = if (lastVisible != null && nextHasTimeSeparator) 24 else
                                 fineCatEntryGap(lastVisible, nextVisible, 24)
-                            Column(modifier = Modifier.fillMaxWidth().padding(bottom = bottomGap.dp)) {
+                            val roundKey = displayRoundKey(round)
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = bottomGap.dp)
+                                    .testTag("finecat.round.$roundKey"),
+                            ) {
                                 // 时间分隔行（原型 `.tsep`）：只画在回合的首个显示回合顶部，
                                 // 规则与文案见 FcTimeSeparators.kt；时间未知的回合不画。
-                                val roundKey = displayRoundKey(round)
                                 timeSeparators[roundKey]?.let { label ->
                                     FcTimeSeparator(
                                         text = label,
                                         modifier = Modifier.testTag("finecat.tsep.$roundKey"),
                                     )
-                                }
-                                // 加载提示嵌在最旧一条消息的内容上方，与消息同属一个稳定
-                                // keyed item，不再单独占一行；id 唯一故只会命中首项。
-                                // 按成员匹配最旧 displayEntry，不假定它处于回合首项。
-                                if (showHistoryLoadingRow && round.any { it.id == oldestEntryId }) {
-                                    HistoryOlderLoadingText()
                                 }
                                 round.forEachIndexed { entryIndex, entry ->
                                     // 空正文不产生间隔；保留它的Box/offset/key用于原滚动定位。
@@ -1034,6 +1136,24 @@ private fun FineCatAppContent(
                             }
                         }
                         }
+                    }
+                    // 到顶等待加载时的盲文点阵：浮层不占布局高度，出现/收起不抬高首个回合，也不挡
+                    // 正文。只在真正到顶时显示，预取多在更远处完成而不会出现；一旦出现至少驻留
+                    // BOUNDARY_LOADING_MIN_DWELL_MS，避免回包太快造成一闪。
+                    val boundaryLoadingActive = showHistoryLoadingRow && oldestEntryId != null &&
+                        !listState.canScrollBackward
+                    if (rememberMinimumDwell(boundaryLoadingActive, BOUNDARY_LOADING_MIN_DWELL_MS, snapshot.selectedSessionId)) {
+                        PiSpinner(
+                            color = colors.text3,
+                            fontSize = LocalFineCatType.current.sm.fontSize,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 8.dp)
+                                .background(colors.surface, RoundedCornerShape(999.dp))
+                                .padding(horizontal = 12.dp, vertical = 4.dp)
+                                .semantics { contentDescription = "加载更早消息" }
+                                .testTag("finecat.loadingOlder"),
+                        )
                     }
                     if (showHome) {
                         // 原型1B：纯色画布，Pi标志与签名整体居中；不足放置时仍隐藏装饰。
@@ -1652,8 +1772,8 @@ private fun PendingDispatchBar(
 }
 
 /**
- * 「加载更早消息…」提示行。非空 displayEntries 时嵌在最旧消息的 item 顶部，仅在列表
- * 没有任何消息时作为独立 item 兜底；两处共用本函数以保证文字、颜色与间距等价。
+ * 「加载更早消息…」提示行。仅用于列表完全没有消息时的独立 item 兜底；非空时改用列表外的
+ * 盲文点阵浮层（finecat.loadingOlder，带最短驻留），不占布局高度，避免抬高首项造成位置跳变。
  */
 @Composable
 private fun HistoryOlderLoadingText() {
