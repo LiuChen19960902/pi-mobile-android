@@ -82,11 +82,13 @@ class AndroidSharedStateHolder(
     private var runtimeCollection: Job? = null
     private val projection = AndroidGatewayProjection(store) { sessionId, beforeEntryId, resetLeaf ->
         graph?.let { appGraph ->
+            val pageLimit = resolveHistoryPageLimit(olderPageLimitOverride, sessionId, beforeEntryId, HISTORY_PAGE_MESSAGE_LIMIT)
+            if (beforeEntryId != null) olderPageLimitOverride = null
             appGraph.gatewayScope.launch {
                 appGraph.gatewayRuntime.requestHistory(
                     sessionId = sessionId,
                     beforeEntryId = beforeEntryId,
-                    limit = HISTORY_PAGE_MESSAGE_LIMIT,
+                    limit = pageLimit,
                     resetLeaf = resetLeaf
                 )
             }
@@ -272,6 +274,12 @@ class AndroidSharedStateHolder(
     var createdDirectoryPathToReveal: String? by mutableStateOf(null)
         private set
     var historyPagingSessionIds: Set<String> by mutableStateOf(emptySet())
+
+    /**
+     * (会话, 条目数)：下一次该会话更早页请求的条目数覆盖值。请求发出时在投影回调里取走；
+     * [loadOlderHistory] 在投影处理返回后兜底清空，请求被 store 静默忽略时不残留到下一次。
+     */
+    private var olderPageLimitOverride: Pair<String, Int>? = null
         private set
 
     var trajectoryNodes: List<TrajectoryNode> by mutableStateOf(emptyList())
@@ -2532,19 +2540,29 @@ class AndroidSharedStateHolder(
         }
     }
 
-    fun loadOlderHistory() {
-        val sessionId = snapshot.selectedSessionId ?: return
-        snapshot.selectedHistoryNextCursor ?: return
+    /**
+     * [limit] 仅在这一次更早页请求上覆盖条目数，用于一次补全被分页切断的操作组。
+     * 返回是否已受理：守卫不满足（无游标、无更早、在途、无连接）时为 false，调用方据此不计一次尝试。
+     */
+    fun loadOlderHistory(limit: Int? = null): Boolean {
+        val sessionId = snapshot.selectedSessionId ?: return false
+        snapshot.selectedHistoryNextCursor ?: return false
         if (
             !snapshot.selectedHistoryHasMore ||
             snapshot.selectedHistoryIsLoading ||
             sessionId in historyPagingSessionIds
-        ) return
-        val appGraph = graph ?: return
+        ) return false
+        val appGraph = graph ?: return false
         historyPagingSessionIds = historyPagingSessionIds + sessionId
+        olderPageLimitOverride = limit?.let { sessionId to it }
         appGraph.gatewayScope.launch {
-            projectionActor.loadHistory(sessionId, older = true)
+            try {
+                projectionActor.loadHistory(sessionId, older = true)
+            } finally {
+                olderPageLimitOverride = null
+            }
         }
+        return true
     }
 
     fun setTrajectoryActive(active: Boolean) {
@@ -5494,6 +5512,17 @@ class AndroidSharedStateHolder(
 }
 
 enum class AttachmentLoadState { IDLE, LOADING, LOADED, FAILED, DEFERRED }
+
+/**
+ * 一次 history 请求的条目数：覆盖值只对「同一会话的更早页请求」生效；最新页请求
+ * （[beforeEntryId] 为空）和其它会话一律用 [default]。
+ */
+internal fun resolveHistoryPageLimit(
+    override: Pair<String, Int>?,
+    sessionId: String,
+    beforeEntryId: String?,
+    default: Int,
+): Int = override?.takeIf { beforeEntryId != null && it.first == sessionId }?.second ?: default
 
 /**
  * 新会话落点目录的解析口径（唯一真源）：首页「工作区」行显示它，首条 message 帧

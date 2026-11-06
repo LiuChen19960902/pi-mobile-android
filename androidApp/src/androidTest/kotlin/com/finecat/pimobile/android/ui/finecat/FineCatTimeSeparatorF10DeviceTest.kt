@@ -150,15 +150,10 @@ class FineCatTimeSeparatorF10DeviceTest {
         assertEquals("prepend 前（仅新页）分隔回合下标", PREPEND_BEFORE_INDICES, before.indices())
         assertEquals("prepend 前分隔文案", PREPEND_BEFORE_LABELS, before.labels())
 
-        // 翻旧页：扫描时滚到顶可能已自动触发；没触发再走产品入口 loadOlderHistory
+        // 翻旧页：扫描用的是程序化滚动，不是用户手势，不会触发预取；走产品入口 loadOlderHistory
         val holder = holder!!
-        runBlocking {
-            runCatching { waitUntil { transport.payloadsOfType("history").size >= 2 } }
-        }
-        if (transport.payloadsOfType("history").size < 2) {
-            onMain { holder.loadOlderHistory() }
-            runBlocking { waitUntil { transport.payloadsOfType("history").size >= 2 } }
-        }
+        onMain { holder.loadOlderHistory() }
+        runBlocking { waitUntil { transport.payloadsOfType("history").size >= 2 } }
         val older = transport.payloadsOfType("history")[1]
         assertEquals(
             "翻页请求必须带最旧条目游标",

@@ -19,7 +19,7 @@ Status: implemented
 - 宣告 `history-turns-v1` 的网关按完整轮分页，首批 10 轮：从真实 user 到最终 assistant 为一轮，toolUse 不结束一轮，steer 仍在轮内，aborted / error 结束一轮，最新未完成的一轮可见。字节预算按整轮执行，不能在 `capHistoryPage` 再次截开一轮。旧网关按原始条目计数，工具结果和元数据也占名额，一页不等于一屏气泡。
 - 服务端游标可能指向不渲染的元数据，客户端优先使用服务端 `nextCursor`，不用首个可见条目代替。
 - 网关转换后若某页没有任何 wire 消息，沿同一活动链跳过纯元数据页，不能把空页的 `hasMore=false` 当成链头。客户端收到全是隐藏消息的页时仍有游标，分页门槛用 `selectedHistoryNextCursor`，不要求已有可见事件。
-- 只有用户在顶部实际向上滚动才请求更早的页；短内容也能触发，不自动灌满视口。
+- 用户手势朝更早方向滚动且离顶估算距离不足两屏（`HISTORY_PREFETCH_VIEWPORTS`）即预取更早的页，惯性不撞已加载边界；程序化滚动不触发。到顶仍在加载时在列表外显示盲文点阵，至少驻留 1 秒，不占布局高度。见[边界手感修复](../bug-fix/2026-11-04-history-boundary-scroll-jank.md)。条目分页切断操作组时，缺头的组先隐藏并自动补拉，见[操作组补全](../bug-fix/2026-11-06-history-partial-operation-group.md)。
 
 ### 单轮过大
 
