@@ -45,3 +45,4 @@ Pi SDK 1.3.0 的 `SessionManager.forkFrom` 复制完整树且保持 entry ID。�
 - [手机状态与草稿归属](../../../../androidApp/src/main/kotlin/com/finecat/pimobile/android/android/AndroidSharedStateHolder.kt)：`receiveWorktreeFrame`、`sendWorktreeRequest`。
 - [工作区面板](../../../../androidApp/src/main/kotlin/com/finecat/pimobile/android/ui/finecat/FineCatWorktreeSheet.kt)、[门面回归](../../../../androidApp/src/test/kotlin/com/finecat/pimobile/android/android/WorktreeStateTest.kt)和[跨仓回归](../../../../androidApp/src/test/kotlin/com/finecat/pimobile/android/GatewayConformanceTest.kt)。
 - [网关协议](https://github.com/LiuChen19960902/pi-mobile-gateway/blob/main/PROTOCOL.md)：`worktree-v1`；运行时 `continueWorkspace`、`worktreeStatus`，`worktrees.test.ts` 的真实 SDK、Git 与内置 read 工具回归。
+- [起始目录已删除时目录面板的逃生](../bug-fix/2026-11-03-directory-picker-deleted-cwd-escape.md)：「选择其他目录…」进入的面板在 cwd 失效时的错误态与逃生。

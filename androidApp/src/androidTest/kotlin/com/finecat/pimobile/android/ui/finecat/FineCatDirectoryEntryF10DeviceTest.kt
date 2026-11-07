@@ -49,6 +49,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -59,8 +60,9 @@ import org.junit.runner.RunWith
 /**
  * 目录入口的设备回归，验证新会话工作目录与失败恢复。
  *
- * 目录选择只决定**新会话**的 cwd；已有会话/轨迹/tree 的目录副行只读（不开选择器、
- * 不给"改本会话目录"）；目录读取失败、创建失败都保留原状态；新浏览器关闭保留最后成功位置，回根清空选择；不得只改显示串伪造 cwd。
+ * 目录选择只决定**新会话**的 cwd；会话内 composer 目录入口打开选择器（继续/fork/新建见 worktree 决定），
+ * 但不改写旧会话 cwd；三视图标题的目录副行只读。目录读取失败、创建失败都保留原状态；起始目录已失效时
+ * 错误态给上一级/主目录逃生；新浏览器关闭保留最后成功位置，回根清空选择；不得只改显示串伪造 cwd。
  *
  * 判据：真实 wire 帧（`directories`/`message` 的 path/cwd/sessionId）+ holder 回读
  * （selectedSessionId、newSessionDirectoryPath、旧会话 cwd、草稿）。实测写成
@@ -99,24 +101,29 @@ class FineCatDirectoryEntryF10DeviceTest {
 
     // ------------------------------------------------------------------ 用例
 
-    /** 目录统一放到composer；三视图标题不再重复，已有会话目录保持只读。 */
+    /** 会话内 composer 目录入口打开选择器并浏览会话 cwd；三视图标题副行仍只读，旧会话 cwd 不改写。 */
     @Test
-    fun existingSession_directoryOnlyInComposer_notRepeatedInThreeHeaders() {
+    fun existingSession_directoryClickOpensSheet_headersStayReadOnly() {
         connectWithOldSession()
         assertTrue(hasTag("finecat.composerDirectory"))
         compose.onNodeWithTag("finecat.composerDirectory").performTouchInput { click() }
+        runBlocking { waitUntil { transport.payloadsOfType("directories").isNotEmpty() } }
+        assertEquals(OLD_CWD, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        answerDirectoriesInSession(OLD_CWD, emptyList())
+        assertTrue(hasTag("finecat.dirSheet"))
+        compose.onNodeWithTag("finecat.sheetDone").performClick()
         compose.waitForIdle()
-        assertEquals(0, transport.payloadsOfType("directories").size)
+        assertFalse(hasTag("finecat.dirSheet"))
         val views = listOf("chat" to null, "tree" to "tree")
         views.forEach { (name, segment) ->
             segment?.let { compose.onNodeWithContentDescription(it).performClick() }
             compose.waitForIdle()
             assertTrue("$name 不重复显示头部目录", subLineCandidates().isEmpty())
-            assertFalse(hasTag("finecat.dirSheet"))
             assertEquals(OLD_CWD, oldSessionCwd())
             assertEquals(OLD, holder.snapshot.selectedSessionId)
         }
-        assertEquals(0, transport.payloadsOfType("directories").size)
+        assertEquals(1, transport.payloadsOfType("directories").size)
+        assertEquals(0, transport.payloadsOfType("message").size)
     }
 
     /** 首页 → 输入框上方目录入口 → 选 new-proj → 发首条：message 帧带新 cwd、无 sessionId；新会话归属以网关帧为准。 */
@@ -252,6 +259,94 @@ class FineCatDirectoryEntryF10DeviceTest {
         answerDirectories(NEW_CWD, emptyList())
         assertEquals(null, holder.directoryError)
         assertEquals(DRAFT, holder.messageDraft)
+    }
+
+    /** 会话 cwd 已被删除：浏览失败保留错误与重试，同时给上一级/主目录逃生；逃出后正常浏览，不改写旧会话。 */
+    @Test
+    fun deletedSessionCwd_directoryError_canEscapeToParentAndHome() {
+        connectWithOldSession()
+        compose.onNodeWithTag("finecat.composerDirectory").performTouchInput { click() }
+        runBlocking { waitUntil { transport.payloadsOfType("directories").isNotEmpty() } }
+        assertEquals(OLD_CWD, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        transport.receive("""{"kind":"error","code":"directory-not-found","requestType":"directories"}""")
+        runBlocking { waitUntil { holder.directoryError == "目录不存在" } }
+        compose.waitForIdle()
+        // 全局弹窗先收起，面板内错误与逃生入口仍在
+        compose.onNode(hasAnyAncestor(isDialog()) and hasText("好")).performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("目录不存在").assertExists()
+        compose.onNodeWithText("重试").assertExists()
+        compose.onNodeWithTag("finecat.dirUp").assertExists()
+        compose.onNodeWithTag("finecat.dirHome").assertExists()
+
+        // 上一级按请求路径字符串推导，不需要服务端 crumbs
+        val beforeUp = transport.payloadsOfType("directories").size
+        compose.onNodeWithTag("finecat.dirUp").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeUp } }
+        assertEquals(HOME, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        answerDirectoriesInSession(HOME, listOf("new-proj"))
+        assertEquals(null, holder.directoryError)
+        compose.onNodeWithTag("finecat.dirItem.new-proj").assertExists()
+
+        // 子目录浏览失败时仍保留最后成功位置；用主目录逃生：请求不带 path，网关缺省回 home
+        assertEquals(HOME, holder.directoryPath)
+        val beforeChild = transport.payloadsOfType("directories").size
+        compose.onNodeWithTag("finecat.dirItem.new-proj").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeChild } }
+        assertEquals(NEW_CWD, transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        transport.receive("""{"kind":"error","code":"directory-not-found","requestType":"directories"}""")
+        runBlocking { waitUntil { holder.directoryError == "目录不存在" } }
+        compose.waitForIdle()
+        compose.onNode(hasAnyAncestor(isDialog()) and hasText("好")).performClick()
+        compose.waitForIdle()
+        val beforeHome = transport.payloadsOfType("directories").size
+        compose.onNodeWithTag("finecat.dirHome").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeHome } }
+        assertNull("主目录请求不带 path", transport.payloadsOfType("directories").last()["path"])
+        // 主目录请求也失败时，面板重试与最后一次实际请求对齐（仍是 home），不退回失效子目录
+        transport.receive("""{"kind":"error","code":"bad-request","requestType":"directories"}""")
+        runBlocking { waitUntil { holder.directoryError != null } }
+        compose.waitForIdle()
+        compose.onNode(hasAnyAncestor(isDialog()) and hasText("好")).performClick()
+        compose.waitForIdle()
+        val beforeRetry = transport.payloadsOfType("directories").size
+        compose.onNodeWithText("重试").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > beforeRetry } }
+        assertNull("重试与主目录请求对齐", transport.payloadsOfType("directories").last()["path"])
+        answerDirectoriesInSession(HOME, listOf("new-proj"))
+        assertEquals(null, holder.directoryError)
+        assertEquals(OLD_CWD, oldSessionCwd())
+        assertEquals(OLD, holder.snapshot.selectedSessionId)
+        assertEquals(0, transport.payloadsOfType("message").size)
+    }
+
+    /** 根目录浏览失败没有可逃生的父级：上一级不出现，主目录入口仍在。 */
+    @Test
+    fun rootDirectoryFailure_noParentRow_homeEscapeRemains() {
+        connectWithOldSession()
+        goHomeWithDraft()
+        browseToHomeParent()
+        listOf("/home", "/").forEach { path ->
+            val before = transport.payloadsOfType("directories").size
+            compose.onNodeWithTag("finecat.dirUp").performClick()
+            runBlocking { waitUntil { transport.payloadsOfType("directories").size > before } }
+            answerDirectories(path, emptyList())
+        }
+        compose.onNodeWithTag("finecat.sheetDone").performClick()
+        compose.waitForIdle()
+        assertEquals(null, holder.fineCatNewSessionDirectoryPath)
+        // 从根重新打开：根请求失败后 current 为空，上一级必须隐藏
+        val before = transport.payloadsOfType("directories").size
+        compose.onNodeWithTag("finecat.composerDirectory").performClick()
+        runBlocking { waitUntil { transport.payloadsOfType("directories").size > before } }
+        assertEquals("/", transport.payloadsOfType("directories").last()["path"]?.jsonPrimitive?.contentOrNull)
+        transport.receive("""{"kind":"error","code":"directory-not-found","requestType":"directories"}""")
+        runBlocking { waitUntil { holder.directoryError == "目录不存在" } }
+        compose.waitForIdle()
+        compose.onNode(hasAnyAncestor(isDialog()) and hasText("好")).performClick()
+        compose.waitForIdle()
+        assertFalse("根目录失败没有上一级", hasTag("finecat.dirUp"))
+        compose.onNodeWithTag("finecat.dirHome").assertExists()
     }
 
     /** 目录读取失败：面板内错误行+重试；状态与草稿不变；重试发出新的 directories 请求。 */
@@ -398,17 +493,26 @@ class FineCatDirectoryEntryF10DeviceTest {
         assertEquals("完成不重置选择", NEW_CWD, holder.fineCatNewSessionDirectoryPath)
     }
 
-    private fun answerDirectories(path: String, children: List<String>) {
+    private fun directoriesFrame(path: String, children: List<String>): String {
         val parts = path.trim('/').split('/').filter { it.isNotEmpty() }
         val paths = listOf("/") + parts.runningReduce { a, b -> "$a/$b" }.map { "/$it" }
         val crumbs = paths.joinToString(",") { "{\"name\":\"${it.substringAfterLast('/').ifEmpty { "/" }}\",\"path\":\"$it\",\"hidden\":false}" }
         val entries = children.joinToString(",") { "{\"name\":\"$it\",\"path\":\"${path.trimEnd('/')}/$it\",\"hidden\":false}" }
-        transport.receive(
-            "{\"kind\":\"directories\",\"path\":\"$path\",\"home\":\"$HOME\",\"crumbs\":[$crumbs],\"entries\":[$entries]}",
-        )
+        return "{\"kind\":\"directories\",\"path\":\"$path\",\"home\":\"$HOME\",\"crumbs\":[$crumbs],\"entries\":[$entries]}"
+    }
+
+    private fun answerDirectories(path: String, children: List<String>) {
+        transport.receive(directoriesFrame(path, children))
         runBlocking { waitUntil { holder.directoryPath == path && !holder.directoryIsLoading } }
         compose.waitForIdle()
         compose.waitUntil(5_000) { holder.fineCatNewSessionDirectoryPath == path.takeUnless { it == "/" } }
+    }
+
+    /** 会话模式不回写首页选择目录，只等浏览位置生效。 */
+    private fun answerDirectoriesInSession(path: String, children: List<String>) {
+        transport.receive(directoriesFrame(path, children))
+        runBlocking { waitUntil { holder.directoryPath == path && !holder.directoryIsLoading } }
+        compose.waitForIdle()
     }
 
     // ------------------------------------------------------------------ 回读
