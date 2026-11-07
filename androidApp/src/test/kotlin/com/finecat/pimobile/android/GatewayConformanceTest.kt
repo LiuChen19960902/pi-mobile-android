@@ -1248,6 +1248,7 @@ class GatewayConformanceTest {
             assertTrue(runtime.sendRequest(GatewayRequests.directories(null)))
             val (homeIndex, homeFrame) = awaitNewFrame(frames, 0) { it.frame.kind == "directories" }
             val home = homeFrame.frame.home ?: error("directories 帧缺少 home")
+            assertEquals("缺省 path 应落在 home", home, homeFrame.frame.path)
             val crumbs = homeFrame.frame.crumbs.orEmpty()
             assertTrue("crumbs 至少含根与当前目录", crumbs.size >= 2)
 

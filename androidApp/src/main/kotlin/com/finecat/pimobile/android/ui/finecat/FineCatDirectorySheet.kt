@@ -49,7 +49,8 @@ internal fun FineCatDirectorySheet(
     val colors = LocalFineCatColors.current
     val type = LocalFineCatType.current
     val current = stateHolder.directoryPath
-    var requestedPath by remember { mutableStateOf(initialPath ?: stateHolder.fineCatNewSessionDirectoryPath ?: "/") }
+    // null 表示主目录请求（不带 path），与 holder 的 requestedDirectoryPath 同义。
+    var requestedPath by remember { mutableStateOf<String?>(initialPath ?: stateHolder.fineCatNewSessionDirectoryPath ?: "/") }
     var confirmWhenReady by remember { mutableStateOf(false) }
     val loading = stateHolder.directoryIsLoading
     val error = stateHolder.directoryError
@@ -71,6 +72,12 @@ internal fun FineCatDirectorySheet(
         requestedPath = path
         stateHolder.browseDirectories(path)
     }
+    fun browseHome() {
+        if (stateHolder.directoryIsLoading) return
+        // 缺省 path 由网关回 home；成功后 current 接管显示，失败仍留在错误态。
+        requestedPath = null
+        stateHolder.browseDirectories(null)
+    }
     FcSheet(
         visible = true,
         onDismiss = { finishSelection() },
@@ -88,7 +95,7 @@ internal fun FineCatDirectorySheet(
         ) {
             Icon(FineCatIcons.Folder, null, tint = colors.text3, modifier = Modifier.size(14.dp))
             Text(
-                text = current ?: requestedPath,
+                text = current ?: requestedPath ?: "主目录",
                 style = type.xs.copy(fontFamily = FontFamily.Monospace),
                 color = colors.text3,
                 maxLines = 2,
@@ -107,7 +114,9 @@ internal fun FineCatDirectorySheet(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(it, style = type.xs, color = colors.err, modifier = Modifier.weight(1f))
-                FcTextButton(text = "重试", onClick = { browse(requestedPath) })
+                // 与全局弹窗同源：重试最后一次实际请求，主目录失败不退回失效旧路径。
+                FcTextButton(text = "重试", onClick = { val path = requestedPath; if (path != null) browse(path) else browseHome() })
+                FcTextButton(text = "主目录", onClick = { browseHome() }, modifier = Modifier.testTag("finecat.dirHome"))
             }
         }
         if (loading) {
@@ -117,9 +126,14 @@ internal fun FineCatDirectorySheet(
         Column(
             modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
         ) {
-            if (current != null && current != "/") {
-                val parent = stateHolder.directoryCrumbs.dropLast(1).lastOrNull()?.path
+            // 起始目录已失效时没有服务端 crumbs，用请求路径字符串推出上一级，避免困在错误态。
+            val parent = if (current != null && current != "/") {
+                stateHolder.directoryCrumbs.dropLast(1).lastOrNull()?.path
                     ?: current.trimEnd('/').substringBeforeLast('/').ifEmpty { "/" }
+            } else if (current == null && error != null) {
+                directoryErrorParentPath(requestedPath ?: "")
+            } else null
+            if (parent != null) {
                 DirectoryRow(
                     name = "上一级", parent = true, enabled = !loading,
                     onClick = { browse(parent) },
@@ -128,7 +142,7 @@ internal fun FineCatDirectorySheet(
             }
             val entries = stateHolder.directoryEntries.filter { it.name != ".git" }
             entries.forEachIndexed { index, item ->
-                if (index > 0 || (current != null && current != "/")) FcRowDivider()
+                if (index > 0 || parent != null) FcRowDivider()
                 val count = stateHolder.snapshot.sessions.count { session ->
                     session.cwd == item.path || session.cwd?.startsWith(item.path + "/") == true
                 }
@@ -161,6 +175,14 @@ internal fun FineCatDirectorySheet(
         }
 
     }
+}
+
+/** 浏览失败时按请求路径字符串推上一级；根目录与非绝对路径没有可逃生的父级。 */
+internal fun directoryErrorParentPath(requestedPath: String): String? {
+    if (!requestedPath.startsWith("/")) return null
+    val trimmed = requestedPath.trimEnd('/')
+    if (trimmed.isEmpty()) return null
+    return trimmed.substringBeforeLast('/', "").ifEmpty { "/" }
 }
 
 @Composable
